@@ -1,0 +1,74 @@
+{
+  "name": "webrtc-server",
+  "version": "0.1.0",
+  "description": "Complete WebRTC stack for Node.js servers with browser-compatible API.",
+  "type": "module",
+  "main": "index.js",
+  "exports": "./index.js",
+  "files": [
+    "index.js",
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "webrtc",
+    "wrtc",
+    "rtcpeerconnection",
+    "rtcdatachannel",
+    "sfu",
+    "mcu",
+    "ice",
+    "ice-lite",
+    "dtls",
+    "srtp",
+    "sctp",
+    "rtp",
+    "rtcp",
+    "simulcast",
+    "datachannel",
+    "whip",
+    "whep",
+    "vp8",
+    "vp9",
+    "av1",
+    "h264",
+    "opus",
+    "dtmf",
+    "streaming",
+    "broadcasting",
+    "recording",
+    "conferencing",
+    "real-time",
+    "rfc-9443"
+  ],
+  "author": {
+    "name": "colocohen"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/webrtc-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/webrtc-server/issues"
+  },
+  "homepage": "https://github.com/colocohen/webrtc-server#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "sdp-transform": "^3.0.0",
+    "flat-ranges": "^2.1.0",
+    "lemon-tls": "^0.2.0",
+    "media-processing": "^0.1.0",
+    "rtp-packet": "^0.1.0",
+    "turn-server": "^0.2.0"
+  }
+}
