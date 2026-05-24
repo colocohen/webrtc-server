@@ -262,7 +262,25 @@ function applyRemoteDescription(state, parsed) {
     if (firstWithCreds.icePwd)      state.remoteIcePwd      = firstWithCreds.icePwd;
     if (firstWithCreds.fingerprint) state.remoteFingerprint = firstWithCreds.fingerprint;
     if (firstWithCreds.setup && !state.dtlsRole) {
-      state.dtlsRole = SDP.resolveSetup(firstWithCreds.setup) === 'active' ? 'client' : 'server';
+      console.log('[tc] setup decision — mode:', state.mode, 'remote setup:', firstWithCreds.setup);
+      // An ICE-lite peer is always the ICE-controlled agent: it never
+      // initiates connectivity checks, it only responds. It must therefore
+      // also be the DTLS *server* (a=setup:passive) and let the full,
+      // controlling peer be the DTLS *client* (a=setup:active) that sends
+      // the ClientHello. Choosing 'client'/active for a lite peer inverts
+      // the roles — the lite peer would be expected to drive DTLS but, being
+      // ICE-controlled, can't drive the underlying connection, so the
+      // handshake deadlocks (ICE never progresses, no STUN checks flow).
+      //
+      // resolveSetup() echoes the offer's a=setup (actpass → active), which
+      // is correct for a normal full-ICE answerer but wrong for a lite peer.
+      // Force 'server' in lite mode regardless of what the remote offered.
+      if (state.mode === 'lite') {
+        state.dtlsRole = 'server';
+      } else {
+        state.dtlsRole = SDP.resolveSetup(firstWithCreds.setup) === 'active' ? 'client' : 'server';
+      }
+      console.log('[tc] → dtlsRole set to:', state.dtlsRole);
     }
   }
 

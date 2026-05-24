@@ -703,7 +703,15 @@ function buildAnswerMedia(offerMedia, config) {
       type: config.dtls.fingerprint.algorithm || 'sha-256',
       hash: config.dtls.fingerprint.value,
     } : null,
-    setup: resolveSetup(offerMedia.setup),
+    // Prefer the caller-pinned DTLS role (config.dtls.setup) when present —
+    // this is the role negotiated/decided in connection_manager.js (e.g.
+    // 'passive' for an ICE-lite peer, which must be the DTLS server and let
+    // the full controlling peer drive DTLS). Only fall back to echoing the
+    // offer via resolveSetup() when no role was pinned. This mirrors
+    // createOffer (which uses `dtls.setup || 'actpass'`); the answer path
+    // previously ignored config.dtls.setup and always called resolveSetup,
+    // which forced 'active' for an actpass offer and inverted the lite role.
+    setup: (config.dtls && config.dtls.setup) ? config.dtls.setup : resolveSetup(offerMedia.setup),
 
     // MID
     mid: offerMedia.mid,

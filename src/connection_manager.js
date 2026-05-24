@@ -423,8 +423,13 @@ function ConnectionManager(config) {
       var remoteSetup = state.parsedRemoteSdp &&
                         state.parsedRemoteSdp.media[0] &&
                         state.parsedRemoteSdp.media[0].setup;
+      var chosenSetup = setupForRole() || SDP.resolveSetup(remoteSetup);
+      console.log('[cm] prepareForCreateAnswer — state.dtlsRole:', state.dtlsRole,
+                  'setupForRole():', setupForRole(),
+                  'remoteSetup:', remoteSetup,
+                  '→ chosen setup:', chosenSetup);
       cb(null, {
-        setup:          setupForRole() || SDP.resolveSetup(remoteSetup),
+        setup:          chosenSetup,
         liteCandidates: (state.mode === 'lite' && iceAgent)
           ? iceAgent.localCandidates : null,
       });
@@ -982,6 +987,16 @@ function ConnectionManager(config) {
       isServer: isServer,
       maxVersion: 'DTLSv1.2',
       rejectUnauthorized: false,
+      // WebRTC mandates mutual authentication: both peers exchange
+      // fingerprints via SDP and both verify the peer cert against
+      // it (RFC 8827 §6.5). In TLS, a server only receives a client
+      // certificate if it explicitly requests one — without this
+      // flag, getPeerCertificate() returns empty on the server side
+      // and fingerprint verification fails with "peer presented no
+      // certificate". rejectUnauthorized stays false because we do
+      // fingerprint-based verification ourselves (verifyDtlsFingerprint),
+      // not CA-based — WebRTC certs are self-signed.
+      requestCert: isServer,
       cipherSuites: [0xC02B, 0xC02C, 0xC02F, 0xC030],
     });
 
