@@ -424,10 +424,10 @@ function ConnectionManager(config) {
                         state.parsedRemoteSdp.media[0] &&
                         state.parsedRemoteSdp.media[0].setup;
       var chosenSetup = setupForRole() || SDP.resolveSetup(remoteSetup);
-      console.log('[cm] prepareForCreateAnswer — state.dtlsRole:', state.dtlsRole,
-                  'setupForRole():', setupForRole(),
-                  'remoteSetup:', remoteSetup,
-                  '→ chosen setup:', chosenSetup);
+      _diag('[cm] prepareForCreateAnswer — state.dtlsRole:', state.dtlsRole,
+            'setupForRole():', setupForRole(),
+            'remoteSetup:', remoteSetup,
+            '→ chosen setup:', chosenSetup);
       cb(null, {
         setup:          chosenSetup,
         liteCandidates: (state.mode === 'lite' && iceAgent)

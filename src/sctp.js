@@ -157,6 +157,14 @@ var SCTP_HEADER_OVERHEAD     = 12;   // common header
 var DATA_CHUNK_OVERHEAD      = 16;   // chunk header (4) + DATA metadata (12)
 var DEFAULT_MAX_MESSAGE_SIZE = 262144;
 
+// SCTP-8: receive-window accounting. We advertise a dynamic a_rwnd equal
+// to (maxReceiveBufferSize − bytes currently held in reassembly/reorder),
+// matching pion's getMyReceiverWindowCredit() and usrsctp/Linux. 1 MB is
+// pion's default and lifts the receive-direction throughput ceiling far
+// above the old fixed 64 KB (which capped browser→server to ~64KB/RTT —
+// crippling on high-RTT/TURN paths). Overridable via config.maxReceiveBufferSize.
+var DEFAULT_MAX_RECEIVE_BUFFER = 1024 * 1024;
+
 
 /* ========================= CRC32c ========================= */
 
@@ -232,6 +240,10 @@ function SctpAssociation(config) {
   var pmtu                    = config.pmtu                    || DEFAULT_PMTU;
   var maxMessageSize          = config.maxMessageSize          || DEFAULT_MAX_MESSAGE_SIZE;
 
+  // SCTP-8: receive buffer size that backs the advertised a_rwnd. See
+  // myReceiverWindowCredit(). Matches pion's Config.MaxReceiveBufferSize.
+  var maxReceiveBufferSize    = config.maxReceiveBufferSize    || DEFAULT_MAX_RECEIVE_BUFFER;
+
   // SCTP-11: cookie lifetime guards against COOKIE-ECHO replay attacks.
   // Default 60s matches libwebrtc and Linux kernel SCTP. Configure via
   // opts.cookieLifetimeS — set higher for laggy networks where the
@@ -279,6 +291,12 @@ function SctpAssociation(config) {
   }
   if (maxMessageSize < 1) {
     throw new RangeError('SctpAssociation: maxMessageSize must be >= 1');
+  }
+  // pion + RFC 4960: the advertised receive window must be at least one
+  // MTU (pion enforces a_rwnd >= 1500). A tiny buffer would stall the
+  // receive direction, so we reject it at construction.
+  if (maxReceiveBufferSize < 1500) {
+    throw new RangeError('SctpAssociation: maxReceiveBufferSize must be >= 1500');
   }
 
   // Association state
@@ -452,7 +470,14 @@ function SctpAssociation(config) {
     pathFailures:               0,
     rttSamples:                 0,
     chunksAbandoned:            0,   // SCTP-6: chunks dropped due to PR-SCTP limits
+    chunksBundled:              0,   // SCTP-13: DATA chunks packed into multi-chunk packets
+    bundledPackets:             0,   // SCTP-13: packets that carried >1 chunk
   };
+
+  // SCTP-13: set while a coalesced transmit pass is queued on the microtask
+  // queue (see scheduleTransmit). Prevents scheduling more than one pass
+  // per tick so a same-tick send() burst bundles into one transmit.
+  var _transmitScheduled = false;
 
   /* ─── SCTP-6: PR-SCTP state ───
    *
@@ -804,7 +829,7 @@ function SctpAssociation(config) {
     // Send INIT-ACK
     var initAckBody = Buffer.alloc(20 + 4 + cookie.length);
     initAckBody.writeUInt32BE(localVerificationTag, 0);
-    initAckBody.writeUInt32BE(DEFAULT_A_RWND, 4);
+    initAckBody.writeUInt32BE(maxReceiveBufferSize, 4);
     initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
     initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
     initAckBody.writeUInt32BE(localTsn, 12);
@@ -2253,13 +2278,33 @@ function SctpAssociation(config) {
       } catch (e) {}
     }
 
-    // SCTP-8: try to transmit as many of the just-queued (and any older
-    // pending) chunks as rwnd allows. Pre-SCTP-8 this was a direct emit
-    // inside the fragment loop; rwnd enforcement requires a separate
-    // pass that respects the budget across multiple chunks.
+    // SCTP-13: coalesced transmit. Instead of transmitting inline on every
+    // send(), schedule a single transmit pass on the microtask queue. A
+    // burst of send() calls in the same tick therefore all land in
+    // sendQueue *before* the one pass runs, so transmitPending() can bundle
+    // them into full packets (RFC 4960 §6.10) — the whole point of adaptive
+    // bundling. A microtask runs at the end of the current synchronous
+    // stack, before any I/O or timers, so a lone send() still goes out this
+    // same tick: zero real added latency, no Nagle-style waiting.
+    scheduleTransmit();
+  }
+
+  // SCTP-13: microtask-coalesced transmit trigger. Collapses a same-tick
+  // burst of sendData() calls into one transmitPending() pass so chunks
+  // bundle. Idempotent within a tick via the _transmitScheduled flag.
+  function scheduleTransmit() {
+    if (_transmitScheduled) return;
+    _transmitScheduled = true;
+    queueMicrotask(flushTransmit);
+  }
+
+  // Run the pending transmit pass now (also called synchronously by close()
+  // so queued data leaves before SHUTDOWN). Safe to call when nothing is
+  // scheduled — it just runs a transmitPending() pass.
+  function flushTransmit() {
+    _transmitScheduled = false;
     var wasNoInFlight = (inFlightCount === 0);
     transmitPending();
-
     if (wasNoInFlight && inFlightCount > 0) startT3Timer();
   }
 
@@ -2286,6 +2331,62 @@ function SctpAssociation(config) {
     var effectiveWindow = Math.min(cwnd, remoteRwnd);
     var probeAllowed    = (outstandingBytes === 0 && effectiveWindow === 0 && inFlightCount === 0);
     var now = Date.now();
+
+    // ── Opportunistic chunk bundling (RFC 4960 §6.10) ──
+    // Rather than emit one UDP datagram per DATA chunk, we pack as many
+    // window-eligible chunks as fit under the PMTU into a single packet,
+    // then emit that. This is what usrsctp/libwebrtc do at output time.
+    //
+    // It is NOT Nagle: we never *wait* for more data. We bundle only what
+    // is already queued at this instant — so a lone send() still goes out
+    // immediately (one chunk, one packet, zero added latency), while a
+    // burst that has piled up in sendQueue (same-tick sends coalesced via
+    // scheduleTransmit(), or a backlog released when a SACK opens the
+    // window) rides out in full packets. Adaptivity is intrinsic to "how
+    // much is queued right now", with no timer and no mode switch.
+    //
+    // Mechanics (option-b): each entry.packet is a complete standalone wire
+    // packet [common header(12) | chunk(padded to 4)]. entry.packet stays
+    // intact (retransmit re-emits it as-is). To bundle we take each chunk's
+    // bytes = entry.packet.subarray(12) — already 4-byte padded, so chunks
+    // concatenate with correct alignment — under ONE fresh common header,
+    // and recompute the CRC32C over the whole datagram.
+    //
+    // maxChunksBytes = pmtu - 12 (common header). We flush the current
+    // bundle when the next chunk wouldn't fit, then start a new bundle.
+    var maxChunksBytes = pmtu - SCTP_HEADER_OVERHEAD;
+    var bundle    = [];     // entries pending flush into one packet
+    var bundleLen = 0;      // bytes of chunk-data currently bundled
+
+    function flushBundle() {
+      if (bundle.length === 0) return;
+      if (bundle.length === 1) {
+        // Single chunk — emit its standalone packet untouched (byte-for-
+        // byte identical to the non-bundled path; no concat, no CRC redo).
+        ev.emit('packet', bundle[0].packet);
+      } else {
+        var parts = new Array(bundle.length + 1);
+        var header = Buffer.allocUnsafe(SCTP_HEADER_OVERHEAD);
+        header.writeUInt16BE(localPort,              0);
+        header.writeUInt16BE(remotePort,             2);
+        header.writeUInt32BE(remoteVerificationTag,  4);
+        header.writeUInt32LE(0,                      8);   // checksum placeholder
+        parts[0] = header;
+        for (var b = 0; b < bundle.length; b++) {
+          // chunk bytes = everything past the common header; already
+          // 4-byte padded, so chunks concatenate correctly aligned.
+          parts[b + 1] = bundle[b].packet.subarray(SCTP_HEADER_OVERHEAD);
+        }
+        var pkt = Buffer.concat(parts);
+        pkt.writeUInt32LE(crc32c(pkt), 8);                 // CRC over whole datagram
+        ev.emit('packet', pkt);
+        sctpStats.chunksBundled += bundle.length;
+        sctpStats.bundledPackets++;
+      }
+      bundle    = [];
+      bundleLen = 0;
+    }
+
     for (var i = inFlightCount; i < sendQueue.length; i++) {
       var entry = sendQueue[i];
       // Invariant: entry.inFlight === false here.
@@ -2297,8 +2398,64 @@ function SctpAssociation(config) {
       entry.sentAt      = now;     // first-transmit timestamp (RTT via Karn)
       outstandingBytes += entry.payloadLen;
       inFlightCount++;
-      ev.emit('packet', entry.packet);
+
+      var chunkLen = entry.packet.length - SCTP_HEADER_OVERHEAD;
+      // An already-MTU-sized fragment can't share a packet: flush the
+      // current bundle, then emit it solo (its own standalone packet).
+      if (chunkLen > maxChunksBytes) {
+        flushBundle();
+        ev.emit('packet', entry.packet);
+        continue;
+      }
+      // Won't fit alongside the current bundle → flush and start fresh.
+      if (bundleLen + chunkLen > maxChunksBytes) flushBundle();
+      bundle.push(entry);
+      bundleLen += chunkLen;
     }
+    flushBundle();   // emit the final partial bundle
+  }
+
+  /* SCTP-8: pion-style receive-window credit (getMyReceiverWindowCredit).
+   *
+   * We advertise (maxReceiveBufferSize − bytesHeldInReassembly) instead of
+   * a fixed window, so the peer is told to slow down when our reassembly /
+   * reorder buffers fill and to resume as they drain. This is the exact
+   * shape pion uses, and mirrors usrsctp/Linux (minus Linux's optional
+   * >>1 halving — we advertise the full remaining space like pion).
+   *
+   * CRITICAL SAFETY PROPERTY: this is recomputed from the LIVE buffer
+   * contents on every SACK, NOT tracked as a running counter. A running
+   * counter that mis-decrements is the classic a_rwnd bug (window stuck at
+   * 0 forever → total receive stall) that the Linux kernel fixed in
+   * ef2820a7. Deriving from ground truth each time makes that class of bug
+   * structurally impossible: if the buffers are empty, the window is full,
+   * period.
+   *
+   * Because this stack delivers messages synchronously (the 'data' event),
+   * assembled messages don't linger — held bytes are normally ~0, so the
+   * window sits near maxReceiveBufferSize and throughput is unconstrained.
+   * It only shrinks during active fragmentation or SSN-reordering, which is
+   * exactly when flow control should engage. A useful side effect: the
+   * pendingMsgs / fragStore overflow paths become effectively unreachable
+   * with a compliant peer, because the advertised window closes before the
+   * reorder buffer can fill (fixing the silent-drop-on-overflow hazard).
+   *
+   * Cost: O(total buffered fragments/messages), which is bounded
+   * (MAX_FRAGS_PER_STREAM / MAX_PENDING_MSGS_PER_STREAM) and normally zero.
+   * Called once per SACK (delayed-ACK batched), not per chunk.
+   */
+  function myReceiverWindowCredit() {
+    var held = 0;
+    var fk = Object.keys(fragStore);
+    for (var i = 0; i < fk.length; i++) {
+      fragStore[fk[i]].forEach(function (f) { held += f.payload.length; });
+    }
+    var pk = Object.keys(pendingMsgs);
+    for (var j = 0; j < pk.length; j++) {
+      pendingMsgs[pk[j]].forEach(function (m) { held += m.payload.length; });
+    }
+    if (held >= maxReceiveBufferSize) return 0;
+    return maxReceiveBufferSize - held;
   }
 
   function sendSack() {
@@ -2319,10 +2476,11 @@ function SctpAssociation(config) {
     var body = Buffer.alloc(bodyLen);
 
     body.writeUInt32BE(lastCumulativeTsn, 0);
-    // Advertised receive window: how much room we have buffered. We use
-    // a fixed advertised window for now (proper rwnd accounting is
-    // SCTP-8 in the roadmap, requires per-chunk byte tracking).
-    body.writeUInt32BE(DEFAULT_A_RWND, 4);
+    // Advertised receive window: maxReceiveBufferSize minus what we're
+    // currently holding un-delivered (pion getMyReceiverWindowCredit).
+    // Dynamic, so it shrinks under reassembly/reorder pressure and the
+    // peer applies real flow control. Was a fixed DEFAULT_A_RWND (64 KB).
+    body.writeUInt32BE(myReceiverWindowCredit(), 4);
     body.writeUInt16BE(gaps.length, 8);
     body.writeUInt16BE(dups.length, 10);
 
@@ -2877,7 +3035,7 @@ function SctpAssociation(config) {
 
     var body = Buffer.alloc(20);
     body.writeUInt32BE(localVerificationTag, 0);
-    body.writeUInt32BE(DEFAULT_A_RWND, 4);
+    body.writeUInt32BE(maxReceiveBufferSize, 4);
     body.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
     body.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
     body.writeUInt32BE(localTsn, 12);
@@ -3257,6 +3415,13 @@ function SctpAssociation(config) {
       return;
     }
 
+    // SCTP-13: flush any microtask-coalesced transmit NOW, so data queued
+    // in this same tick is actually in-flight before we begin the SHUTDOWN
+    // drain (attemptShutdownTransition only advances once the queue is
+    // empty; unsent-but-queued data would otherwise wait a microtask that
+    // races the shutdown path).
+    flushTransmit();
+
     // Active close. Per RFC 4960 §9.2 we transition through
     // SHUTDOWN_PENDING (drain) then SHUTDOWN_SENT (awaiting ack). With
     // SCTP-1's send queue in place, the drain is real:
@@ -3276,6 +3441,7 @@ function SctpAssociation(config) {
   Object.defineProperty(this, 'role', { get: function() { return role; } });
   Object.defineProperty(this, 'pmtu',           { get: function() { return pmtu; } });
   Object.defineProperty(this, 'maxMessageSize', { get: function() { return maxMessageSize; } });
+  Object.defineProperty(this, 'maxReceiveBufferSize', { get: function() { return maxReceiveBufferSize; } });
   // SCTP-6: lets the upper layer probe whether PR-SCTP options will take
   // effect. False until INIT/INIT-ACK exchange completes; consult after 'open'.
   Object.defineProperty(this, 'peerSupportsForwardTsn', { get: function() { return peerSupportsForwardTsn; } });
@@ -3290,6 +3456,8 @@ function SctpAssociation(config) {
       chunksSent:          sctpStats.chunksSent,
       chunksRetransmitted: sctpStats.chunksRetransmitted,
       chunksAbandoned:     sctpStats.chunksAbandoned,
+      chunksBundled:       sctpStats.chunksBundled,
+      bundledPackets:      sctpStats.bundledPackets,
       fastRetransmits:     sctpStats.fastRetransmits,
       rtoExpiries:         sctpStats.rtoExpiries,
       pathFailures:        sctpStats.pathFailures,
@@ -3319,6 +3487,10 @@ function SctpAssociation(config) {
   this.send         = sendData;      // send(streamId, payload, ppid, opts?)
   this.close        = close;         // close()        — graceful 3-way SHUTDOWN
   this.resetStreams = resetStreams;  // SCTP-7: dc.close() backing primitive
+
+  // SCTP-8: current advertised receive-window credit (bytes). Exposed for
+  // diagnostics — lets the upper layer / tests observe flow-control state.
+  this.getReceiverWindowCredit = myReceiverWindowCredit;
 
   this.on   = function(name, fn) { ev.on(name, fn); };
   this.off  = function(name, fn) { ev.off(name, fn); };

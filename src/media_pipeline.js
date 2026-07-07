@@ -29,6 +29,14 @@ import {
   JitterBuffer, parse as parseRtp,
 } from 'rtp-packet';
 
+// Debug logging gate (mirrors api.js / connection_manager.js). '[onRtp …]'
+// and '[mp-diag]' lines are per-packet / per-layer diagnostics that flood
+// stdout at video frame rates. Off by default — set WEBRTC_DEBUG=1.
+var _DBG = (typeof process !== 'undefined' &&
+            process.env &&
+            (process.env.WEBRTC_DEBUG === '1' ||
+             process.env.WEBRTC_DEBUG === 'true'));
+
 
 /**
  * Video codec registry.
@@ -1706,7 +1714,7 @@ function createVideoReceivePipeline(opts) {
     //   byte 2-3: sequence number (big-endian)
     //   byte 4-7: timestamp
     //   byte 8-11: SSRC
-    if (_diagOnRtpCount < 30) {
+    if (_DBG && _diagOnRtpCount < 30) {
       _diagOnRtpCount++;
       var hdrBytes = rtpBuf && rtpBuf.length >= 12
         ? Array.from(rtpBuf.slice(0, 12)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join(' ')
@@ -1964,7 +1972,7 @@ function createVideoReceiveSimulcastPipeline(opts) {
       isPrimary: isPrimary,
     });
 
-    if (typeof console !== 'undefined') {
+    if (_DBG && typeof console !== 'undefined') {
       console.log('[mp-diag] simulcast pipeline: added ' +
                   (isPrimary ? 'PRIMARY' : 'secondary') +
                   ' layer ssrc=' + ssrc + ' rid=' + (rid || '(unknown)'));
@@ -1992,7 +2000,7 @@ function createVideoReceiveSimulcastPipeline(opts) {
       // association so getStats/diagnostics can pair the RTX SSRC with its
       // primary rid. The actual NACK/RTX-recovery path is a separate gap
       // (see note in session-level TODO).
-      if (typeof console !== 'undefined') {
+      if (_DBG && typeof console !== 'undefined') {
         console.log('[mp-diag] simulcast pipeline: noted RTX ssrc=' + info.ssrc +
                     ' for rid=' + (info.rid || '(unknown)') +
                     ' (receive-side RTX not yet wired)');

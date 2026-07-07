@@ -226,6 +226,13 @@ class MediaTransport extends EventEmitter {
     o.lastPacketAt = Date.now();
     // Most recent sent RTP seq — diagnostic aid for NACK gap analysis.
     o.lastSentSeq = (rtpPacket[2] << 8) | rtpPacket[3];
+    // Most recent sent RTP timestamp + the wall-clock instant it left.
+    // The RTCP timer extrapolates from this pair (ts + elapsed×clockRate)
+    // to produce the SR rtpTimestamp that corresponds to the SR's own
+    // NTP timestamp (RFC 3550 §6.4.1) — required for receiver-side A/V
+    // sync (RtpToNtpEstimator / StreamSynchronization in libwebrtc).
+    o.lastSentRtpTimestamp = rtpPacket.readUInt32BE(4);
+    o.lastSentAt           = o.lastPacketAt;
 
     if (!state._diagSendRtpCount) state._diagSendRtpCount = 0;
     state._diagSendRtpCount++;
@@ -284,6 +291,25 @@ class MediaTransport extends EventEmitter {
 
       var rtxPacket = rtx.wrap(origPkt);
       if (!rtxPacket) continue;
+
+      // Re-stamp per-transport header extensions on the retransmission.
+      // The stored packet carries the transport-cc seq + abs-send-time
+      // from its ORIGINAL transmission; transport-wide seq numbers are
+      // per-packet on the transport — every packet, retransmissions
+      // included, gets a fresh seq (draft-holmer-rmcat-transport-wide-cc,
+      // libwebrtc RTPSenderEgress). Re-using the old seq makes the
+      // receiver's TWCC feedback report a stale/duplicate seq exactly
+      // during loss episodes, poisoning the send-side BWE at the worst
+      // possible moment. stamp() overwrites the existing extension ids
+      // in place (new Buffer), so the RTX wrap's preserved copies are
+      // simply replaced. Also record the send for TWCC pairing, same as
+      // the primary path in sendRtp.
+      rtxPacket = state.headerStamper.stamp(rtxPacket);
+      state.bandwidthEstimator.recordSend(
+        state.headerStamper.lastTransportCcSeq(),
+        Date.now(),
+        rtxPacket.length
+      );
 
       var rtxSrtp = srtp.encryptRtp(rtxPacket);
       if (!rtxSrtp) continue;
@@ -647,7 +673,10 @@ class MediaTransport extends EventEmitter {
           // streams to us.
           var ngKeys = Object.keys(state.nackGenerators);
           for (var ng = 0; ng < ngKeys.length; ng++) {
-            state.nackGenerators[ngKeys[ng]].updateRtt(rttMs);
+            // Entries are null for streams that resolved to "no NACK
+            // negotiated" (audio) — see _handleIncomingRtpInner.
+            var _gen = state.nackGenerators[ngKeys[ng]];
+            if (_gen) _gen.updateRtt(rttMs);
           }
 
           // Notify external subscribers (typically media-pipeline jitter
@@ -905,6 +934,16 @@ class MediaTransport extends EventEmitter {
     var seqDiff = seq - s.highestSeq;
     if (seqDiff > 32768)  seqDiff -= 65536;
     else if (seqDiff < -32768) seqDiff += 65536;
+    // Extended seq of THIS packet — computed against the PRE-update
+    // highest so late/reordered/RTX-recovered arrivals resolve to their
+    // own extSeq, not to the current high-water mark. NackGenerator's
+    // observePacket contract requires the arriving packet's extSeq (it
+    // does _missing.delete(extSeq) + records it in its received set).
+    // The previous code passed the extended-HIGHEST after the update,
+    // so recovered/late packets never cleared their own _missing entry
+    // → repeated NACKs for already-recovered seqs → list growth →
+    // spurious PLI escalation under loss.
+    var extSeq = (s.cycles * 65536 + s.highestSeq) + seqDiff;
     if (seqDiff > 0) {
       if (seq < s.highestSeq) s.cycles++;
       s.highestSeq = seq;
@@ -912,15 +951,30 @@ class MediaTransport extends EventEmitter {
       s.packetsLost = Math.max(0, expected - s.packets);
     }
 
-    // Interarrival jitter (RFC 3550 §A.8).
+    // Interarrival jitter (RFC 3550 §A.8) — in the STREAM's RTP clock
+    // units, because this value goes on the wire in our RR (RFC 3550
+    // §6.4.1 mandates media-clock units). The previous hardcoded 90 kHz
+    // arrival clock produced a large phantom jitter for audio (Opus is
+    // 48 kHz: perfectly-paced 20 ms packets measured |1800−960| = 840
+    // ticks ≈ 17.5 ms of fake jitter reported to the sender). Clock
+    // rate is resolved lazily per SSRC from the negotiated codec, same
+    // retry pattern as peekKeyframeFn above; until it resolves we skip
+    // the sample rather than record a wrong one.
+    if (s.clockRate === undefined) {
+      var _mapForClock  = state.remoteSsrcMap[ssrc];
+      var _midForClock  = _mapForClock ? _mapForClock.mid : null;
+      var _recvForClock = _midForClock != null ? state.mediaReceivers[_midForClock] : null;
+      if (_recvForClock && _recvForClock.codec && _recvForClock.codec.clockRate) {
+        s.clockRate = _recvForClock.codec.clockRate;
+      }
+    }
     var arrival = Date.now();
-    if (s.lastArrival !== 0) {
-      // Both arrival and ts converted to RTP clock. For 90kHz video:
-      // 1 ms local time == 90 RTP ticks. Generic 90k clock here is fine
-      // for stats display.
-      var arrivalTicks = arrival * 90;
-      var lastArrivalTicks = s.lastArrival * 90;
-      var d = Math.abs((arrivalTicks - lastArrivalTicks) - (ts - s.lastTs));
+    if (s.lastArrival !== 0 && s.clockRate) {
+      // `| 0` folds the 32-bit RTP timestamp wraparound into a signed
+      // delta (RFC 1982 serial arithmetic), so a wrap between two
+      // consecutive packets doesn't produce a ~2^32 spike.
+      var tsDelta = (ts - s.lastTs) | 0;
+      var d = Math.abs((arrival - s.lastArrival) * (s.clockRate / 1000) - tsDelta);
       s.jitter += (d - s.jitter) / 16;
     }
     s.lastArrival = arrival;
@@ -940,13 +994,32 @@ class MediaTransport extends EventEmitter {
     // true, NackGenerator skips adding the gap below this packet to its
     // missing list and evicts existing missing entries below it — both because
     // the decoder will reset from this keyframe.
+    // Gated by negotiated feedback: only streams whose codec negotiated
+    // generic 'nack' in a=rtcp-fb get a generator (video, in practice).
+    // Audio (Opus) negotiates only transport-cc — running NACK here sent
+    // RFC 4585 NACKs (and, on list overflow, PLIs!) against audio SSRCs,
+    // which peers ignore but which is non-compliant protocol noise.
+    // `undefined` means "not resolved yet" (mapping/receiver may lag the
+    // first packets — same lazy-retry pattern as peekKeyframeFn); `null`
+    // means "resolved: no NACK for this stream".
     var nackGen = state.nackGenerators[ssrc];
-    if (!nackGen) {
-      nackGen = state.nackGenerators[ssrc] = new NackGenerator({});
+    if (nackGen === undefined) {
+      var _mapForNack  = state.remoteSsrcMap[ssrc];
+      var _midForNack  = _mapForNack ? _mapForNack.mid : null;
+      var _recvForNack = _midForNack != null ? state.mediaReceivers[_midForNack] : null;
+      if (_recvForNack && _recvForNack.codec) {
+        var _fbList = _recvForNack.codec.feedback || [];
+        var _wantsNack = false;
+        for (var _fbi = 0; _fbi < _fbList.length; _fbi++) {
+          if (_fbList[_fbi] === 'nack') { _wantsNack = true; break; }
+        }
+        nackGen = state.nackGenerators[ssrc] = _wantsNack ? new NackGenerator({}) : null;
+      }
     }
-    var extSeq = s.cycles * 65536 + s.highestSeq;
-    var isKeyframe = s.peekKeyframeFn ? s.peekKeyframeFn(parsed.payload) : false;
-    nackGen.observePacket(extSeq, isKeyframe, isRecovered);
+    if (nackGen) {
+      var isKeyframe = s.peekKeyframeFn ? s.peekKeyframeFn(parsed.payload) : false;
+      nackGen.observePacket(extSeq, isKeyframe, isRecovered);
+    }
 
     // Transport-CC feedback generation.
     //
@@ -1091,7 +1164,7 @@ class MediaTransport extends EventEmitter {
           ssrc: localSsrc, mediaSsrc: remoteSsrc,
           fractionLost: fractionLost,
           totalLost: stats.packetsLost,
-          highestSeq: stats.highestSeq + (stats.cycles << 16),
+          highestSeq: (stats.cycles * 65536 + stats.highestSeq) >>> 0,
           jitter: Math.floor(stats.jitter),
           lastSR: stats.lastSR,
           delaySinceLastSR: dlsr,
@@ -1099,13 +1172,22 @@ class MediaTransport extends EventEmitter {
       }
 
       // Single REMB covers all known remote SSRCs in one shot.
+      //
+      // The bitrate here is not a real receive-side estimate (we don't
+      // run REMB-style BWE); with transport-cc negotiated, Chrome runs
+      // send-side BWE off our TWCC feedback and treats an incoming REMB
+      // only as an upper CAP on that estimate. The old hardcoded 2 Mbps
+      // therefore silently capped any HD/screenshare sender at 2 Mbps.
+      // Default lifted to 10 Mbps and made configurable via
+      // state.rembBitrateBps for deployments that want a real ceiling.
       if (remoteSsrcList.length > 0) {
         var localSsrc2 = 1;
         var firstMapping = state.remoteSsrcMap[remoteSsrcList[0]];
         if (firstMapping && state.localSsrcs[firstMapping.mid]) {
           localSsrc2 = state.localSsrcs[firstMapping.mid].id;
         }
-        self.sendRtcp(buildREMB(localSsrc2, remoteSsrcList, 2000000));
+        var rembBps = state.rembBitrateBps || 10000000;
+        self.sendRtcp(buildREMB(localSsrc2, remoteSsrcList, rembBps));
       }
 
       // SR (Sender Report) for every outbound stream. Lets the remote
@@ -1120,10 +1202,29 @@ class MediaTransport extends EventEmitter {
         var sent = Date.now();
         var ntpSec  = Math.floor(sent / 1000) + 2208988800;
         var ntpFrac = Math.floor(((sent % 1000) / 1000) * 0x100000000);
+
+        // RFC 3550 §6.4.1: the SR's rtpTimestamp must correspond to the
+        // SAME instant as its ntpTimestamp. Extrapolate from the most
+        // recent sent packet's RTP timestamp by the wall-clock elapsed
+        // since it left, × the stream's clock rate (registered by api.js
+        // via registerOutboundStream). If clockRate is missing we fall
+        // back to the unextrapolated last-sent timestamp — at most one
+        // frame off, still a valid (NTP, RTP) correspondence point.
+        // The previous constant 0 gave receivers a degenerate RTP↔NTP
+        // mapping, which disabled A/V sync (lipsync) entirely.
+        var srRtpTs = 0;
+        if (oSt.lastSentRtpTimestamp != null) {
+          srRtpTs = oSt.lastSentRtpTimestamp;
+          if (oSt.clockRate && oSt.lastSentAt) {
+            srRtpTs = (srRtpTs +
+              Math.round((sent - oSt.lastSentAt) * oSt.clockRate / 1000)) >>> 0;
+          }
+        }
+
         var srBuf = buildSR({
           ssrc:         oSsrc,
           ntpTimestamp: [ntpSec, ntpFrac],
-          rtpTimestamp: 0,
+          rtpTimestamp: srRtpTs,
           packetCount:  oSt.packets,
           octetCount:   oSt.bytes,
         });

@@ -59,6 +59,15 @@ var PPID_BINARY_EMPTY  = 57;
 var DCEP_OPEN = 0x03;
 var DCEP_ACK  = 0x02;
 
+// Send-side backpressure cap. The SCTP send queue is unbounded, so a
+// send-loop that outruns the network would grow it until the process
+// OOMs. Chrome/libwebrtc bound each DataChannel's outbound buffer at
+// 16 MB (older Chrome threw from send() when full; newer Chrome closes
+// the channel). We mirror the 16 MB figure and throw — a naive bulk
+// send-loop then fails loudly instead of silently eating all the RAM.
+// Overridable per channel via createDataChannel(label,{maxBufferedAmount}).
+var DEFAULT_MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024;
+
 // RFC 8831 §6.4 — RTCPriorityType to numeric DCEP priority.
 var DCEP_PRIORITY_BY_NAME = {
   'very-low':  128,
@@ -158,6 +167,13 @@ class RTCDataChannel {
     this.bufferedAmount             = 0;
     this.bufferedAmountLowThreshold = 0;
 
+    // Non-standard: hard cap on bufferedAmount for send-side backpressure.
+    // W3C leaves the exact limit UA-defined (Chrome uses 16 MB); we expose
+    // it as an override on createDataChannel(label, { maxBufferedAmount }).
+    this._maxBufferedAmount = (opts.maxBufferedAmount != null)
+      ? opts.maxBufferedAmount
+      : DEFAULT_MAX_BUFFERED_AMOUNT;
+
     // Internal event surface for api.js to attach onopen/onmessage/etc.
     this._ev = new EventEmitter();
 
@@ -187,6 +203,34 @@ class RTCDataChannel {
     var buf  = typeof data === 'string' ? Buffer.from(data, 'utf-8') : Buffer.from(data);
     var ppid = typeof data === 'string' ? PPID_STRING : PPID_BINARY;
     if (buf.length === 0) ppid = typeof data === 'string' ? PPID_STRING_EMPTY : PPID_BINARY_EMPTY;
+
+    // ── Backpressure guard (mirrors Chrome/libwebrtc's 16 MB cap) ──
+    // The SCTP send queue is unbounded; without this, a send-loop that
+    // outruns the link grows it until the process OOMs. If this message
+    // would push bufferedAmount past the cap, refuse it by throwing —
+    // that way a naive bulk loop fails loudly and the caller learns to
+    // pace via bufferedAmount + the 'bufferedamountlow' event, exactly
+    // the pattern browsers force. Checked BEFORE stats/queueing so a
+    // rejected send neither inflates counters nor enters the SCTP queue.
+    if (this.bufferedAmount + buf.length > this._maxBufferedAmount) {
+      var qErr = new Error('RTCDataChannel.send: send buffer full — ' +
+        this.bufferedAmount + ' bytes queued + ' + buf.length +
+        ' new exceeds maxBufferedAmount (' + this._maxBufferedAmount +
+        '). Pace sends: check dataChannel.bufferedAmount and wait for the ' +
+        '"bufferedamountlow" event before sending more.');
+      qErr.name = 'OperationError';
+      try {
+        this._ev.emit('error', {
+          type:  'error',
+          error: {
+            name:        'OperationError',
+            message:     qErr.message,
+            errorDetail: 'send-buffer-full',
+          },
+        });
+      } catch (e) {}
+      throw qErr;
+    }
 
     // Update stats before send — send may fail silently but spec expects
     // counters to reflect the API call.
@@ -253,12 +297,15 @@ class RTCDataChannel {
       try { self._ev.emit('close'); } catch (e) {}
     };
 
-    if (sctp && sctp.peerSupportsReconfig) {
+    if (sctp && sctp.peerSupportsReconfig && this.id != null) {
       // Tell peer to reset (close) the stream. The callback fires when
       // peer responds. We finalize on any terminal response — the goal
       // is local visibility of 'closed', not strict-correct error
       // propagation. If the round-trip silently fails (association
       // died), the sctp.on('close') handler tears down all DCs.
+      // (id == null means the channel never got a stream ID assigned —
+      // DCEP_OPEN never went out — so there's nothing to reset at the
+      // peer; fall through to the local-only close.)
       sctp.resetStreams([this.id], function (err, res) { finalize(); });
     } else {
       // Peer doesn't support RECONFIG — local-only close. Peer will see
@@ -414,7 +461,8 @@ class DataChannelController extends EventEmitter {
   close() {
     // Close every open DataChannel. W3C webrtc-pc §6.2: when a peer
     // connection closes, every associated RTCDataChannel transitions to
-    // readyState 'closed' and fires 'close'. dc.close() is idempotent.
+    // readyState 'closed' and fires 'close'. dc.close() is idempotent
+    // and kicks off the graceful per-stream RECONFIG where supported.
     for (var i = 0; i < this._dataChannels.length; i++) {
       var dc = this._dataChannels[i];
       if (dc && dc.readyState !== 'closed' && typeof dc.close === 'function') {
@@ -424,6 +472,18 @@ class DataChannelController extends EventEmitter {
 
     if (this._sctp) {
       try { this._sctp.close(); } catch (e) {}
+    }
+
+    // pc.close() is terminal — don't leave channels parked in 'closing'
+    // waiting on RECONFIG/SHUTDOWN round-trips that may never complete
+    // (we just told SCTP to shut down underneath them). Finalize every
+    // channel now; the per-channel finalize closure and the sctp 'close'
+    // handler both guard on readyState, so this stays idempotent.
+    for (var j = 0; j < this._dataChannels.length; j++) {
+      var dcj = this._dataChannels[j];
+      if (!dcj || dcj.readyState === 'closed') continue;
+      dcj.readyState = 'closed';
+      try { dcj._ev.emit('close'); } catch (e) {}
     }
 
     this._setSctpState('closed');
@@ -460,7 +520,7 @@ class DataChannelController extends EventEmitter {
    */
   _createInternal(label, options) {
     options = options || {};
-    var id = options.id != null ? options.id : this._allocStreamId();
+    var id = options.id != null ? options.id : this._maybeAllocStreamId();
 
     var dc = new RTCDataChannel(this, {
       id:                id,
@@ -477,20 +537,48 @@ class DataChannelController extends EventEmitter {
       // W3C §6.2.1 — RTCPriorityType, default 'low'. Stored for round-trip
       // via api.js getter; not used for SCTP scheduling today.
       priority:          options.priority || 'low',
+      // Non-standard backpressure override (defaults to 16 MB in the ctor).
+      maxBufferedAmount: (options.maxBufferedAmount != null) ? options.maxBufferedAmount : null,
     });
 
     this._dataChannels.push(dc);
-    this._dataChannelMap[id] = dc;
+    // id may be null when the DTLS role isn't decided yet (see
+    // _maybeAllocStreamId) — the real ID is assigned in _sendDcepOpen,
+    // which also registers the channel in the map.
+    if (id != null) this._dataChannelMap[id] = dc;
     this._deps.updateNegotiationNeededFlag();
 
     return dc;
   }
 
+  /**
+   * Allocate a stream ID now if the parity is already determined,
+   * otherwise defer (return null).
+   *
+   * RFC 8832 §6 parity (DTLS client = evens, DTLS server = odds) depends
+   * on the DTLS role, which isn't decided until negotiation. The old
+   * code allocated eagerly with a 'server' fallback, so the common
+   *   createDataChannel() → createOffer() → ... → we become DTLS client
+   * flow latched ODD ids on the client side — colliding with the ids the
+   * true server allocates for its own channels. Deferral also matches
+   * W3C §6.2: RTCDataChannel.id is null until the ID is assigned, and
+   * libwebrtc's behaviour of assigning sids when the transport is ready.
+   */
+  _maybeAllocStreamId() {
+    if (this._nextDataChannelId === null && this._deps.getDtlsRole() == null) {
+      return null;   // parity unknown — _sendDcepOpen assigns later
+    }
+    return this._allocStreamId();
+  }
+
   _allocStreamId() {
     if (this._nextDataChannelId === null) {
       // RFC 8832 §6: DTLS-client uses evens (0, 2, 4...), DTLS-server
-      // uses odds (1, 3, 5...). null role falls back to 'server' to
-      // match the historical cm.js behaviour.
+      // uses odds (1, 3, 5...). By the time this latches, the role is
+      // known (deferred callers reach here via _sendDcepOpen, which runs
+      // after DTLS connects); null can only still appear for negotiated
+      // channels created pre-handshake with explicit ids, where the
+      // 'server' fallback keeps the historical cm.js behaviour.
       var role = this._deps.getDtlsRole();
       this._nextDataChannelId = (role === 'client') ? 0 : 1;
     }
@@ -553,6 +641,14 @@ class DataChannelController extends EventEmitter {
         var dc = self._dataChannels[i];
         if (dc.readyState !== 'connecting') continue;
         if (dc.negotiated) {
+          // Deferred-ID safety net: a negotiated channel created before
+          // the DTLS role was known could still carry id=null (an app
+          // that omitted the out-of-band id). Assign one now that the
+          // role is fixed, and register it so incoming data routes.
+          if (dc.id == null) {
+            dc.id = self._allocStreamId();
+            self._dataChannelMap[dc.id] = dc;
+          }
           dc.readyState = 'open';
           dc._ev.emit('open');
         } else {
@@ -562,6 +658,25 @@ class DataChannelController extends EventEmitter {
     });
 
     sctp.on('close', function () {
+      // The association is gone — graceful SHUTDOWN completed, remote
+      // ABORT, or path failure. W3C webrtc-pc §6.2: every channel riding
+      // a closed transport transitions to 'closed' and fires 'close'.
+      // This also finalizes channels stuck in 'closing' whose RECONFIG
+      // round-trip can no longer complete (their resetStreams callback
+      // will never fire). Without this handler, a remote ABORT left all
+      // channels 'open' forever and pc.close() left them 'closing'
+      // forever — dc.close()'s own finalize closure is a no-op once we
+      // move the state here, so the paths stay idempotent.
+      for (var i = 0; i < self._dataChannels.length; i++) {
+        var dc = self._dataChannels[i];
+        if (!dc || dc.readyState === 'closed') continue;
+        if (dc.readyState !== 'closing') {
+          dc.readyState = 'closing';
+          try { dc._ev.emit('closing'); } catch (e) {}
+        }
+        dc.readyState = 'closed';
+        try { dc._ev.emit('close'); } catch (e) {}
+      }
       self._setSctpState('closed');
     });
 
@@ -653,6 +768,13 @@ class DataChannelController extends EventEmitter {
   // SCTP being up and the channel being non-negotiated.
   _sendDcepOpen(dc) {
     if (!this._sctp) return;
+    // Deferred-ID assignment: channels created before the DTLS role was
+    // decided carry id=null (see _maybeAllocStreamId). By now DTLS is
+    // connected and the role is fixed, so the parity is correct.
+    if (dc.id == null) {
+      dc.id = this._allocStreamId();
+      this._dataChannelMap[dc.id] = dc;
+    }
     var msg = buildDcepOpen(dc);
     this._diag('sending DCEP_OPEN for streamId=' + dc.id +
       ' label=' + JSON.stringify(dc.label) +
@@ -705,8 +827,6 @@ class DataChannelController extends EventEmitter {
           maxPacketLifeTime: (channelType & 0x02) ? reliability : null,
         });
       }
-      dc.readyState = 'open';
-
       // ORDER MATTERS:
       // 1. emit 'datachannel' first so the API layer wraps the channel and
       //    user code gets a chance to register 'open'/'message' listeners.
@@ -718,12 +838,21 @@ class DataChannelController extends EventEmitter {
       if (isNewChannel) {
         this.emit('datachannel', { channel: dc });
       }
-      dc._ev.emit('open');
+      // Only transition connecting→open (and fire 'open') on the FIRST
+      // DCEP_OPEN. A duplicate arriving after the app closed the channel
+      // must NOT resurrect it from 'closing'/'closed' back to 'open' —
+      // that produced a zombie channel with an 'open' event after 'close'.
+      if (dc.readyState === 'connecting') {
+        dc.readyState = 'open';
+        dc._ev.emit('open');
+      }
 
     } else if (msgType === DCEP_ACK) {
-      // Our channel was accepted by remote.
+      // Our channel was accepted by remote. Same gating: a duplicate ACK
+      // (or one racing a local close) must not revive a non-connecting
+      // channel.
       var dc2 = this._dataChannelMap[streamId];
-      if (dc2) {
+      if (dc2 && dc2.readyState === 'connecting') {
         dc2.readyState = 'open';
         dc2._ev.emit('open');
       }

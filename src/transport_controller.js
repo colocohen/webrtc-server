@@ -26,6 +26,20 @@ import { createSecureContext } from 'lemon-tls';
 import { generateCertificate } from './cert.js';
 import * as SDP from './sdp.js';
 
+// Debug logging gate (mirrors api.js / connection_manager.js). '[tc]'
+// lines trace DTLS-role / setup decisions. Off by default — set
+// WEBRTC_DEBUG=1 to enable.
+var _DBG = (typeof process !== 'undefined' &&
+            process.env &&
+            (process.env.WEBRTC_DEBUG === '1' ||
+             process.env.WEBRTC_DEBUG === 'true'));
+function _diag() {
+  if (!_DBG) return;
+  if (typeof console !== 'undefined' && console.log) {
+    console.log.apply(console, arguments);
+  }
+}
+
 
 /* ========================= Constants ========================= */
 
@@ -262,7 +276,7 @@ function applyRemoteDescription(state, parsed) {
     if (firstWithCreds.icePwd)      state.remoteIcePwd      = firstWithCreds.icePwd;
     if (firstWithCreds.fingerprint) state.remoteFingerprint = firstWithCreds.fingerprint;
     if (firstWithCreds.setup && !state.dtlsRole) {
-      console.log('[tc] setup decision — mode:', state.mode, 'remote setup:', firstWithCreds.setup);
+      _diag('[tc] setup decision — mode:', state.mode, 'remote setup:', firstWithCreds.setup);
       // An ICE-lite peer is always the ICE-controlled agent: it never
       // initiates connectivity checks, it only responds. It must therefore
       // also be the DTLS *server* (a=setup:passive) and let the full,
@@ -280,7 +294,7 @@ function applyRemoteDescription(state, parsed) {
       } else {
         state.dtlsRole = SDP.resolveSetup(firstWithCreds.setup) === 'active' ? 'client' : 'server';
       }
-      console.log('[tc] → dtlsRole set to:', state.dtlsRole);
+      _diag('[tc] → dtlsRole set to:', state.dtlsRole);
     }
   }
 

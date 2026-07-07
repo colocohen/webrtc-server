@@ -685,6 +685,39 @@ function createAnswer(parsedOffer, config) {
 }
 
 function buildAnswerMedia(offerMedia, config) {
+  // RFC 3264 §6: an m-section rejected in the offer (port 0) MUST be
+  // answered with port 0. This shows up on renegotiation after the peer
+  // stopped a transceiver — JSEP §5.2.2 keeps the slot as a rejected
+  // m-section until it's recycled. Answering it with port 9 + a full
+  // codec list "resurrects" the section, and strict peers (Chrome)
+  // reject the entire answer. The rejected answer must still carry at
+  // least one format on the m= line (RFC 3264 mirrors the offer's);
+  // everything else — ICE, DTLS, codecs, extensions — is omitted.
+  if (offerMedia.port === 0) {
+    var rejectedPayloads = 'webrtc-datachannel';
+    if (offerMedia.type !== 'application') {
+      var rejFmts = [];
+      var rejCodecs = offerMedia.codecs || [];
+      for (var rj = 0; rj < rejCodecs.length; rj++) {
+        rejFmts.push(rejCodecs[rj].payloadType);
+        if (rejCodecs[rj].rtxPayloadType != null) rejFmts.push(rejCodecs[rj].rtxPayloadType);
+      }
+      rejectedPayloads = rejFmts.length > 0 ? rejFmts.join(' ') : '0';
+    }
+    var rejected = {
+      type: offerMedia.type,
+      port: 0,
+      protocol: offerMedia.protocol,
+      payloads: rejectedPayloads,
+      connection: { version: 4, ip: '0.0.0.0' },
+      mid: offerMedia.mid,
+    };
+    // application sections never carry a direction (see the normal-path
+    // comment below — Chrome's state machine dislikes it there).
+    if (offerMedia.type !== 'application') rejected.direction = 'inactive';
+    return rejected;
+  }
+
   var m = {
     type: offerMedia.type,
     port: 9,
