@@ -148,7 +148,12 @@ function createTransceiver(state, kind, init) {
   } else {
     var ssrc = SDP.generateSsrc();
     var rtxSsrc = SDP.generateSsrc();
-    layers.push({ rid: null, ssrc: ssrc, rtxSsrc: rtxSsrc });
+    // FlexFEC: video streams get a FEC SSRC alongside (RFC 8627 model —
+    // FEC rides its own SSRC, paired via a=ssrc-group:FEC-FR). Allocated
+    // unconditionally like rtxSsrc; only EMITTED when flexfec is
+    // negotiated (mirrors the rtxNegotiated gating in sdp.js).
+    var fecSsrc = (kind === 'video') ? SDP.generateSsrc() : null;
+    layers.push({ rid: null, ssrc: ssrc, rtxSsrc: rtxSsrc, fecSsrc: fecSsrc });
     encodings.push({
       rid:                   null,
       active:                true,
@@ -178,9 +183,16 @@ function createTransceiver(state, kind, init) {
   state.localSsrcs[mid] = {
     id:     layers[0].ssrc,
     rtxId:  layers[0].rtxSsrc,
+    fecId:  layers[0].fecSsrc || null,
     msid:   'stream0 ' + kind + mid,
     layers: layers.slice(),
   };
+  // Data-plane lookup: media SSRC → its FEC SSRC (media_transport.sendRtp
+  // uses this to know which outgoing streams get FlexFEC protection).
+  if (layers[0].fecSsrc) {
+    if (!state.localFecSsrcs) state.localFecSsrcs = {};
+    state.localFecSsrcs[layers[0].ssrc] = layers[0].fecSsrc;
+  }
 
   return transceiver;
 }

@@ -175,13 +175,22 @@ function ConnectionManager(config) {
     announcedAddresses: config.announcedAddresses || null,
 
     // Identity
-    // RFC 4566 §5.2 requires sess-id to form a globally unique session
-    // identifier. Date.now() alone collides if two PCs are constructed
-    // in the same millisecond (common when an app spins up many PCs at
-    // startup). Append 32 bits of randomness so the id is unique even
-    // under tight construction-time concurrency.
-    localSessionId: String(Date.now()) +
-                    String(crypto.randomBytes(4).readUInt32BE(0)),
+    // JSEP (RFC 8829 §5.2.1): <sess-id> MUST be representable by a
+    // 64-bit signed integer and MUST be less than 2^63-1; RECOMMENDED
+    // construction is a 64-bit quantity with the highest bit cleared and
+    // the remaining 63 bits cryptographically random (what Chrome does —
+    // at most 19 digits). The previous scheme concatenated Date.now()
+    // (13 digits) with a uint32 (up to 10 digits), producing up to 23
+    // digits — a numeric string that overflows u64/i64 parsers and
+    // crashed webrtc-rs during interop ("number too large to fit in
+    // target type"). Randomness also satisfies RFC 8866 §5.2 global
+    // uniqueness without collision risk across PCs created in the same
+    // millisecond.
+    localSessionId: (function () {
+      var b = crypto.randomBytes(8);
+      b[0] &= 0x7F;   // clear the top bit → value < 2^63
+      return b.readBigUInt64BE(0).toString();
+    })(),
     localCname: crypto.randomBytes(8).toString('hex'),
 
     // ICE
@@ -191,6 +200,18 @@ function ConnectionManager(config) {
     remoteIcePwd: null,
     remoteIceLite: false,
     remoteCandidates: [],
+    // Local candidates gathered in the CURRENT gathering phase (full-ICE
+    // mode only; lite candidates are read synchronously off the agent).
+    // Consumed by:
+    //   (a) the in-place localDescription patch in the agent's
+    //       'candidate' handler (JSEP §4.1.13/14 — the description
+    //       exposes candidates gathered since it was set), and
+    //   (b) MediaSessionFactory via prepareForCreateOffer/Answer, so
+    //       SUBSEQUENT offers/answers embed the roster (JSEP §5.2.2:
+    //       "for each candidate gathered during the most recent
+    //       gathering phase, an a=candidate line MUST be added").
+    // Reset on ICE restart (new gathering phase → new roster).
+    localGatheredCandidates: [],
     selectedPair: null,
 
     // DTLS
@@ -276,6 +297,12 @@ function ConnectionManager(config) {
     outboundStats: {},
     rtcpStats: {},
     remoteOutboundStats: {},
+    // SRTP profile negotiated via DTLS use_srtp (RFC 5764). IANA number:
+    // 0x0001 = AES_CM_128_HMAC_SHA1_80, 0x0007 = AEAD_AES_128_GCM.
+    // Set by the 'clienthello' handler (server) or read from the peer's
+    // hello in extractSrtpKeys (client).
+    negotiatedSrtpProfile: null,
+
     senderBuffer: new SenderBuffer(),
     rtxStreams: {},
     nackThrottle: new NackThrottle(),
@@ -291,8 +318,8 @@ function ConnectionManager(config) {
     }),
 
     // Outgoing RTP header-extension stamper. On every sendRtp() we call
-    // stamper.stamp(pkt) to apply transport-cc (extmap:2), abs-send-time
-    // (extmap:1), and optionally mid. The stamper owns the per-session
+    // stamper.stamp(pkt) to apply abs-send-time (extmap:2), transport-cc
+    // (extmap:3), and optionally mid (extmap:4). The stamper owns the per-session
     // counters/state for these extensions — extMap comes from the SDP
     // a=extmap: lines (see SDP.js). Using a stamper (rather than inline
     // code in sendRtp) matches the design of libwebrtc's RTPSenderEgress
@@ -309,6 +336,7 @@ function ConnectionManager(config) {
       // If DEFAULT_VIDEO_EXTENSIONS in sdp.js changes, these IDs must
       // be updated to stay in lockstep.
       extMap: {
+        'audio-level':               1,   // RFC 6464 (DEFAULT_AUDIO_EXTENSIONS id 1)
         'abs-send-time':             2,   // matches DEFAULT_VIDEO_EXTENSIONS
         'transport-cc':              3,
         'mid':                       4,
@@ -396,6 +424,14 @@ function ConnectionManager(config) {
     // us go async later without changing the class.
     prepareForCreateOffer: function (iceRestart, cb) {
       ensureIceCredentials(iceRestart);
+      if (iceRestart) {
+        // New gathering phase (RFC 8829 §3.5.1) — the previous roster is
+        // authenticated against the old creds and must not leak into the
+        // restart offer. The agent will re-emit fresh candidates after
+        // setLocalDescription, repopulating this and re-patching the new
+        // pending description.
+        state.localGatheredCandidates = [];
+      }
       if (iceRestart && iceAgent && typeof iceAgent.restart === 'function') {
         iceAgent.restart();
         iceAgent.setLocalParameters({
@@ -407,8 +443,16 @@ function ConnectionManager(config) {
       prepareIceForSdp();
       cb(null, {
         setup:          setupForRole() || 'actpass',
+        // Candidates to embed at SDP-build time. Lite: the agent's sync
+        // gather result (unchanged behavior). Full: the roster gathered
+        // so far — JSEP §5.2.2 requires subsequent offers to carry every
+        // candidate of the most recent gathering phase (Chrome does).
+        // Empty roster (first offer, or right after ICE restart) → null,
+        // preserving the trickle-from-scratch shape.
         liteCandidates: (state.mode === 'lite' && iceAgent)
-          ? iceAgent.localCandidates : null,
+          ? iceAgent.localCandidates
+          : (state.localGatheredCandidates.length > 0
+              ? state.localGatheredCandidates : null),
       });
     },
 
@@ -430,8 +474,11 @@ function ConnectionManager(config) {
             '→ chosen setup:', chosenSetup);
       cb(null, {
         setup:          chosenSetup,
+        // Same roster logic as prepareForCreateOffer — see comment there.
         liteCandidates: (state.mode === 'lite' && iceAgent)
-          ? iceAgent.localCandidates : null,
+          ? iceAgent.localCandidates
+          : (state.localGatheredCandidates.length > 0
+              ? state.localGatheredCandidates : null),
       });
     },
 
@@ -603,10 +650,30 @@ function ConnectionManager(config) {
     iceAgent.on('candidate', function(candidate) {
       if (state.closed) return;
       if (candidate === null) {
+        // Gathering complete. In full mode, finalize the local description
+        // in place: a=end-of-candidates + default-candidate m=/c= promotion
+        // (browser-parity — JSEP §4.1.13/14 + §5.2.2). Lite mode already
+        // baked all of this in at SDP-build time (MSF endOfCandidates), so
+        // it's skipped — finalize is idempotent anyway, but skipping keeps
+        // the lite path byte-identical to before.
+        if (state.mode !== 'lite') {
+          // Coherence before observability: candidates gathered before the
+          // description existed live only in the roster — fold them in,
+          // then finalize (default-candidate port promotion,
+          // end-of-candidates), so the end-of-candidates event below and
+          // the 'complete' state flip both expose a fully-formed SDP.
+          syncGatheredCandidatesIntoLocalDescription();
+          finalizeLocalCandidatesInDescription();
+        }
         ev.emit('icecandidate', { candidate: null });
         return;
       }
       if (state.mode === 'lite') return;
+
+      // Roster bookkeeping for the current gathering phase. Deduped so a
+      // re-emitted candidate (agent-level gather retriggers) can't double
+      // up in descriptions or subsequent offers.
+      var isNewCandidate = _rememberGatheredCandidate(candidate);
 
       // Per RFC 8839 §5.1.1 + W3C: with BUNDLE the trickled candidate's
       // sdpMid should match the BUNDLE-tagged section — the first
@@ -617,18 +684,20 @@ function ConnectionManager(config) {
       // back to '0' on the very rare paths where parsedLocalSdp isn't
       // populated yet (in practice the full-mode candidate emission
       // runs after setLocalDescription's cascade, so it is).
-      var bundleMid = '0';
-      var bundleIdx = 0;
-      var localSdp = state.parsedLocalSdp;
-      if (localSdp && localSdp.media) {
-        for (var bi = 0; bi < localSdp.media.length; bi++) {
-          if (localSdp.media[bi].port !== 0) {
-            bundleMid = String(localSdp.media[bi].mid);
-            bundleIdx = bi;
-            break;
-          }
-        }
+      var _target = resolveBundleTarget();
+      var bundleMid = _target.mid;
+      var bundleIdx = _target.idx;
+
+      // Write the candidate into the live local description (JSEP
+      // §4.1.13/14: pending/currentLocalDescription include "any local
+      // candidates that have been generated by the ICE agent since the
+      // local description was set"). Without this, one-shot signaling
+      // (WHIP/WHEP, HTTP POST) reads a candidate-less SDP forever and
+      // only trickle over a side channel works.
+      if (isNewCandidate) {
+        patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx);
       }
+
       ev.emit('icecandidate', {
         candidate: SDP.buildCandidateString(candidate),
         sdpMid: bundleMid,
@@ -643,6 +712,19 @@ function ConnectionManager(config) {
 
     iceAgent.on('gatheringstatechange', function(newState) {
       if (state.closed) return;
+      // setState emits 'icegatheringstatechange' synchronously while
+      // applying the update (before cascades run) — so a listener reading
+      // localDescription inside the event observes whatever the SDP is at
+      // this exact moment. Establish the JSEP view invariant FIRST: fold
+      // the roster in and finalize, then flip the state. Without this
+      // ordering, the flip raced the (separately-evented) finalize and a
+      // fast reader saw a placeholder-port, candidate-less answer.
+      if (newState === 'complete') {
+        syncGatheredCandidatesIntoLocalDescription();
+        if (state.mode !== 'lite') {
+          finalizeLocalCandidatesInDescription();
+        }
+      }
       setState({ iceGatheringState: newState });
     });
 
@@ -781,6 +863,164 @@ function ConnectionManager(config) {
   }
 
 
+  /* ====================== Local candidates ⇄ local description ====================== */
+  //
+  // Full-ICE mode gathers candidates asynchronously, AFTER the local
+  // description was committed. Browsers surface each gathered candidate
+  // into the live description (W3C webrtc-pc "surface the candidate":
+  // "add candidate to connection.[[PendingLocalDescription]].sdp"), and
+  // on completion promote the default candidate into the m=/c= lines.
+  // These helpers replicate that. Lite mode never enters here — its
+  // candidates are embedded synchronously at build time (prepareIceForSdp
+  // → liteCandidates) and the 'candidate' handler's lite guard holds.
+
+  function _candidateKey(c) {
+    return [c.foundation, c.component || 1,
+            String(c.protocol || '').toLowerCase(),
+            c.ip, c.port, c.type].join('/');
+  }
+
+  // Returns true if the candidate is new to the current gathering phase.
+  function _rememberGatheredCandidate(candidate) {
+    var key = _candidateKey(candidate);
+    for (var i = 0; i < state.localGatheredCandidates.length; i++) {
+      if (_candidateKey(state.localGatheredCandidates[i]) === key) return false;
+    }
+    state.localGatheredCandidates.push(candidate);
+    return true;
+  }
+
+  // Replace (never mutate) the active local description object. Browsers
+  // hand out a NEW RTCSessionDescription on each read after a candidate
+  // lands; the object an app captured earlier keeps its old .sdp. Since
+  // _commitDescription stores the very object the user passed to
+  // setLocalDescription, mutating desc.sdp in place would rewrite the
+  // user's own variable — swap the slot instead.
+  function _swapLocalDescription(newSdp) {
+    var desc = state.pendingLocalDescription || state.currentLocalDescription;
+    if (!desc) return;
+    var newDesc = { type: desc.type, sdp: newSdp };
+    if (state.pendingLocalDescription) state.pendingLocalDescription = newDesc;
+    else state.currentLocalDescription = newDesc;
+  }
+
+  // Keep the parsed views coherent with a string-level patch. The
+  // 'candidate' handler's bundleMid resolution and MSF's renegotiation
+  // pinning both read these — a stale parsed view would silently diverge
+  // from the SDP string the user sees.
+  function _syncParsedCandidate(parsed, idx, c) {
+    if (!parsed || !parsed.media || !parsed.media[idx]) return;
+    var m = parsed.media[idx];
+    if (!m.candidates) m.candidates = [];
+    m.candidates.push({
+      foundation:     String(c.foundation),
+      component:      c.component || 1,
+      protocol:       c.protocol,
+      priority:       c.priority,
+      ip:             c.ip,
+      port:           c.port,
+      type:           c.type,
+      relatedAddress: c.relatedAddress || null,
+      relatedPort:    c.relatedPort != null ? c.relatedPort : null,
+      tcpType:        c.tcpType || null,
+    });
+  }
+
+  function _syncParsedFinalize(parsed, defCand) {
+    if (!parsed || !parsed.media) return;
+    for (var i = 0; i < parsed.media.length; i++) {
+      var m = parsed.media[i];
+      if (m.port === 0) continue;
+      if (m.candidates && m.candidates.length > 0) m.endOfCandidates = true;
+      if (defCand) m.port = defCand.port;
+    }
+  }
+
+  // Resolve the BUNDLE-tagged target for candidate placement: the first
+  // non-rejected m-section of the local description (RFC 8839 §5.1.1 +
+  // W3C). Shared by the incremental emission path and the roster sync.
+  function resolveBundleTarget() {
+    var mid = '0', idx = 0;
+    var localSdp = state.parsedLocalSdp;
+    if (localSdp && localSdp.media) {
+      for (var bi = 0; bi < localSdp.media.length; bi++) {
+        if (localSdp.media[bi].port !== 0) {
+          mid = String(localSdp.media[bi].mid);
+          idx = bi;
+          break;
+        }
+      }
+    }
+    return { mid: mid, idx: idx };
+  }
+
+  // JSEP §4.1.13/14 invariant: a local description slot reflects every
+  // candidate gathered in the current phase. The incremental emission
+  // path maintains this from the moment a description exists — but this
+  // library deliberately gathers EARLY (agent up at answer-prep time so
+  // one-shot signaling gets inline candidates), so candidates can be
+  // gathered BEFORE any local description is installed. Those live only
+  // in the roster; patchLocalDescriptionWithCandidate dropped them (no
+  // description to patch), and nothing ever re-applied them — a fast
+  // machine answered with zero candidates and a placeholder port.
+  //
+  // This function re-establishes the invariant from the roster at any
+  // point. Idempotent by construction: SDP.addCandidate returns the
+  // string unchanged for an already-present candidate, and the patcher
+  // treats identity as no-op — so it is safe to call from multiple
+  // coherence points (cascade, gathering-done, pre-complete).
+  function syncGatheredCandidatesIntoLocalDescription() {
+    if (state.mode === 'lite') return;   // lite bakes candidates at build time
+    var desc = state.pendingLocalDescription || state.currentLocalDescription;
+    if (!desc || !desc.sdp) return;
+    if (state.localGatheredCandidates.length === 0) return;
+    var target = resolveBundleTarget();
+    for (var i = 0; i < state.localGatheredCandidates.length; i++) {
+      patchLocalDescriptionWithCandidate(
+        state.localGatheredCandidates[i], target.mid, target.idx);
+    }
+  }
+
+  function patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx) {
+    var desc = state.pendingLocalDescription || state.currentLocalDescription;
+    if (!desc || !desc.sdp) return;
+
+    var patched = SDP.addCandidate(desc.sdp, candidate, bundleMid);
+    if (patched === desc.sdp) return;   // mid not found — warned inside addCandidate
+
+    var patchedPending = !!state.pendingLocalDescription;
+    _swapLocalDescription(patched);
+
+    // parsedLocalSdp tracks pending-or-current (same view the patched slot
+    // exposes) — always sync. parsedCurrentLocalSdp tracks ONLY current:
+    // sync it only when current was the patched slot, and only when it's a
+    // distinct object (after a local answer both point at the same parse —
+    // syncing twice would duplicate the candidate).
+    _syncParsedCandidate(state.parsedLocalSdp, bundleIdx, candidate);
+    if (!patchedPending &&
+        state.parsedCurrentLocalSdp !== state.parsedLocalSdp) {
+      _syncParsedCandidate(state.parsedCurrentLocalSdp, bundleIdx, candidate);
+    }
+  }
+
+  function finalizeLocalCandidatesInDescription() {
+    var desc = state.pendingLocalDescription || state.currentLocalDescription;
+    if (!desc || !desc.sdp) return;
+    if (state.localGatheredCandidates.length === 0) return;   // nothing gathered
+
+    var finalizedPending = !!state.pendingLocalDescription;
+    var finalized = SDP.finalizeCandidates(desc.sdp, state.localGatheredCandidates);
+    _swapLocalDescription(finalized);
+
+    var defCand = SDP.selectDefaultCandidate(state.localGatheredCandidates);
+    _syncParsedFinalize(state.parsedLocalSdp, defCand);
+    if (!finalizedPending &&
+        state.parsedCurrentLocalSdp !== state.parsedLocalSdp) {
+      _syncParsedFinalize(state.parsedCurrentLocalSdp, defCand);
+    }
+  }
+
+
   /* ====================== Reactive State ====================== */
 
   function setState(updates) {
@@ -848,12 +1088,35 @@ function ConnectionManager(config) {
       });
     }
 
+    // 2b. Local description ↔ gathered-candidate coherence (JSEP
+    //     §4.1.13/14). Trigger: setLocalDescription committed a slot →
+    //     signalingState changed. This library gathers early (agent up at
+    //     answer-prep), so the roster may already hold candidates emitted
+    //     before any description existed; fold them into the fresh slot.
+    //     Condition-not-history per the cascade doctrine; idempotent via
+    //     SDP.addCandidate identity, so re-runs are no-ops.
+    if (state.localGatheredCandidates.length > 0 &&
+        (state.pendingLocalDescription || state.currentLocalDescription)) {
+      syncGatheredCandidatesIntoLocalDescription();
+    }
+
     // 3. DTLS: ICE connected + role known → start handshake
     //    Trigger: ICE agent emits 'connected'
     if ((state.iceConnectionState === 'connected' || state.iceConnectionState === 'completed') &&
         state.dtlsState === 'new' && state.dtlsRole !== null) {
       setState({ dtlsState: 'connecting' });
       startDtls();
+    }
+
+    // 3b. Surface handshake progress (W3C webrtc-pc §4.3.3 connectionState
+    //     derivation: any transport in 'connecting' ⇒ PC 'connecting').
+    //     Previously the PC jumped straight new → connected, so a stalled
+    //     DTLS handshake left connectionState frozen at 'new' with no
+    //     observable transition at all — apps saw ICE connect and then
+    //     silence. Now they see 'connecting', and the watchdog in
+    //     startDtls guarantees an eventual 'failed' if DTLS never lands.
+    if (state.dtlsState === 'connecting' && state.connectionState === 'new') {
+      setState({ connectionState: 'connecting' });
     }
 
     // 4. Connection ready: DTLS connected → update connectionState
@@ -865,9 +1128,13 @@ function ConnectionManager(config) {
     // 5. SRTP: DTLS connected + media in SDP → derive keys
     //    Trigger: dtlsState → 'connected'
     if (state.dtlsState === 'connected' && state.srtpState === 'new' && hasMediaInSdp()) {
-      var keys = extractSrtpKeys();
-      if (keys) {
-        state.srtpKeys = keys;
+      var srtpSession = extractSrtpKeys();
+      if (srtpSession) {
+        // Note: since the fromDtlsKeyingMaterial migration this holds the
+        // SrtpSession itself, not a raw key struct. Nothing reads it (the
+        // data plane goes through getSrtpSession() → state.srtpSession);
+        // kept only as a state-inspection breadcrumb.
+        state.srtpKeys = srtpSession;
         state.srtpState = 'ready';
         ev.emit('srtp:ready');
         mediaTransport.startRtcpTimer();
@@ -886,6 +1153,34 @@ function ConnectionManager(config) {
         remotePort:     state.remoteSctpPort,
         maxMessageSize: state.sendMaxMessageSize,
       });
+    }
+
+    // 7. Terminal DTLS failure → release the ICE transport.
+    //    dtlsState 'failed' is terminal in this state machine: nothing
+    //    ever resets it to 'new', and cascade 3 only starts DTLS from
+    //    'new', so once DTLS has failed the session can never recover —
+    //    yet the ICE agent previously kept running its consent checks,
+    //    keepalives, and sockets, producing dead-session chatter
+    //    (disconnected/connected flapping observed AFTER connectionState
+    //    already reported 'failed') and leaking timers+sockets on servers
+    //    handling many peers. Close the agent to stop all of it; its
+    //    'statechange' → 'closed' propagates to iceConnectionState via
+    //    the existing handler.
+    //
+    //    Scoped to DTLS failure only: an ICE-level failure
+    //    (iceConnectionState 'failed') is recoverable via restartIce()
+    //    per W3C §5.6 and MUST NOT tear the agent down.
+    //
+    //    iceAgent is intentionally NOT nulled: cascade 1's `!iceAgent`
+    //    guard would otherwise re-create (and re-gather) a fresh agent on
+    //    the next unrelated setState while local descriptions still
+    //    exist. One-shot flag rather than a state probe so re-entrant
+    //    cascade passes (agent close emits events synchronously) can't
+    //    double-close.
+    if (state.dtlsState === 'failed' && iceAgent &&
+        !state._iceClosedAfterDtlsFailure) {
+      state._iceClosedAfterDtlsFailure = true;
+      try { iceAgent.close(); } catch (e) {}
     }
   }
 
@@ -1000,14 +1295,146 @@ function ConnectionManager(config) {
       cipherSuites: [0xC02B, 0xC02C, 0xC02F, 0xC030],
     });
 
-    // use_srtp extension
-    session.set_context({
-      local_extensions: [
-        { type: 14, data: new Uint8Array([0x00, 0x02, 0x00, 0x01, 0x00]) },
-      ],
-    });
+    // ── use_srtp negotiation (RFC 5764 §4.1) ──
+    //
+    // Wire format of the extension body:
+    //   uint16 profiles_length | uint16 profile[] | uint8 mki_length | mki
+    //
+    // Supported profiles, preference-ordered. GCM first: rtp-packet
+    // implements both, and AEAD_AES_128_GCM measured FASTER than
+    // AES_CM_128_HMAC_SHA1_80 in Node (single AEAD pass vs CTR+HMAC).
+    //   0x0007 = SRTP_AEAD_AES_128_GCM      (RFC 7714)
+    //   0x0001 = SRTP_AES128_CM_HMAC_SHA1_80 (RFC 5764)
+    //   0x0008 = SRTP_AEAD_AES_256_GCM      (RFC 7714 §11.2)
+    // Order matches libwebrtc: GCM-128 first (its default when GCM is
+    // enabled), then GCM-256, then the legacy CM fallback.
+    var SRTP_PROFILE_PREFERENCE = [0x0007, 0x0008, 0x0001];
+
+    function _buildUseSrtpExt(profiles) {
+      var body = new Uint8Array(2 + profiles.length * 2 + 1);
+      body[0] = 0; body[1] = profiles.length * 2;
+      for (var pi = 0; pi < profiles.length; pi++) {
+        body[2 + pi * 2]     = (profiles[pi] >> 8) & 0xFF;
+        body[2 + pi * 2 + 1] =  profiles[pi]       & 0xFF;
+      }
+      // trailing byte = MKI length 0
+      return { type: 14, data: body };
+    }
+
+    function _parseUseSrtpProfiles(extData) {
+      // Returns the uint16 profile list, or [] on malformed input.
+      if (!extData || extData.length < 3) return [];
+      var listLen = (extData[0] << 8) | extData[1];
+      if (listLen % 2 !== 0 || 2 + listLen > extData.length) return [];
+      var out = [];
+      for (var o = 2; o < 2 + listLen; o += 2) {
+        out.push((extData[o] << 8) | extData[o + 1]);
+      }
+      return out;
+    }
+
+    if (isServer) {
+      // DTLS server: per RFC 5764 §4.1.2 we must answer with EXACTLY ONE
+      // profile chosen from the CLIENT's offered list. The 'clienthello'
+      // event fires synchronously before lemon-tls builds the ServerHello,
+      // so setting local_extensions inside the handler lands the answer in
+      // the ServerHello.
+      session.on('clienthello', function (rawData, message) {
+        // Primary source: the parsed ClientHello handed to the event —
+        // available on every lemon-tls version. Fallback: the session
+        // accessor (needs lemon-tls with the pre-emit extension store).
+        var ext = null;
+        if (message && Array.isArray(message.extensions)) {
+          for (var mi = 0; mi < message.extensions.length; mi++) {
+            if (message.extensions[mi] && message.extensions[mi].type === 14) {
+              ext = message.extensions[mi];
+              break;
+            }
+          }
+        }
+        if (!ext && typeof session.getRemoteExtension === 'function') {
+          ext = session.getRemoteExtension(14);   // use_srtp
+        }
+        var offered = ext ? _parseUseSrtpProfiles(ext.data) : [];
+        var chosen = null;
+        for (var i = 0; i < SRTP_PROFILE_PREFERENCE.length && chosen == null; i++) {
+          if (offered.indexOf(SRTP_PROFILE_PREFERENCE[i]) >= 0) {
+            chosen = SRTP_PROFILE_PREFERENCE[i];
+          }
+        }
+        if (chosen == null) {
+          // Peer offered nothing we support (or no use_srtp at all).
+          // Fall back to answering CM — Chrome always offers it; a peer
+          // that truly can't do CM will abort on its side per RFC 5764.
+          _diag('[cm-diag] use_srtp: no mutual profile in client offer ' +
+            JSON.stringify(offered) + ' — answering CM');
+          chosen = 0x0001;
+        }
+        state.negotiatedSrtpProfile = chosen;
+        session.set_context({ local_extensions: [_buildUseSrtpExt([chosen])] });
+        _diag('[cm-diag] use_srtp: client offered ' + JSON.stringify(offered) +
+          ' → answering 0x' + chosen.toString(16).padStart(4, '0'));
+      });
+    } else {
+      // DTLS client: offer our full preference list in the ClientHello;
+      // read the server's single choice from its hello after connect
+      // (in extractSrtpKeys, via getRemoteExtension).
+      session.set_context({
+        local_extensions: [_buildUseSrtpExt(SRTP_PROFILE_PREFERENCE)],
+      });
+    }
 
     state.dtlsSession = session;
+
+    // ── DTLS handshake watchdog + reconciliation ──
+    // lemon-tls's retransmit timer only guards OUR un-acked flights; once
+    // the peer's flight is received, processHandshakeRecord treats it as
+    // an implicit ACK. If the handshake then stalls (peer goes silent, or
+    // a processing bug swallows the flight), NO timer is left running and
+    // the connection previously hung forever in dtlsState 'connecting'
+    // with connectionState frozen.
+    //
+    // Two layers of defense:
+    //   1. RECONCILE (every 5s while connecting): if the DTLS session's
+    //      own state says 'connected' but our 'connect' listener was
+    //      somehow never invoked (missed event — e.g. a stale/patched
+    //      lemon-tls build), recover by driving onDtlsConnected directly,
+    //      and log loudly so the missed event gets reported instead of
+    //      masked. connectionState derives from the handshake itself —
+    //      never from SCTP — so this covers media-only sessions too.
+    //   2. HARD FAIL (30s): still 'connecting' AND the session really
+    //      isn't connected → surface OperationError + 'failed' rather
+    //      than hanging. 30s covers the full worst-case retransmit
+    //      schedule (1s doubling × 6) with margin.
+    state._dtlsReconcileTimer = setInterval(function () {
+      if (state.closed || state.dtlsState !== 'connecting') return;
+      if (session.connected) {
+        console.warn('[dtls] session reports connected but the connect ' +
+          'event was never observed — recovering via reconciliation. ' +
+          'This indicates a missed-event bug or a stale lemon-tls build; ' +
+          'please report it with WEBRTC_DEBUG=1 output.');
+        onDtlsConnected(session);
+      }
+    }, 5000);
+    if (state._dtlsReconcileTimer.unref) state._dtlsReconcileTimer.unref();
+
+    state._dtlsWatchdog = setTimeout(function () {
+      state._dtlsWatchdog = null;
+      if (state.closed || state.dtlsState !== 'connecting') return;
+      // Last-chance reconcile before declaring failure.
+      if (session.connected) {
+        console.warn('[dtls] connect event missed for 30s; recovering at ' +
+          'watchdog deadline. Please report with WEBRTC_DEBUG=1 output.');
+        onDtlsConnected(session);
+        return;
+      }
+      var toErr = new Error('DTLS handshake timed out after 30s (state still connecting)');
+      toErr.name = 'OperationError';
+      try { ev.emit('dtls:error', toErr); } catch (e) {}
+      try { session.close(); } catch (e) {}
+      setState({ dtlsState: 'failed', connectionState: 'failed' });
+    }, 30000);
+    if (state._dtlsWatchdog.unref) state._dtlsWatchdog.unref();
 
     session.on('packet', function(data) { if (iceAgent) iceAgent.send(data); });
     session.on('connect', function() { onDtlsConnected(session); });
@@ -1037,6 +1464,8 @@ function ConnectionManager(config) {
     });
 
     session.on('error', function(err) {
+      if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
+      if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
       ev.emit('dtls:error', err);
       // Any DTLS error transitions to 'failed' (W3C webrtc-pc): not just
       // handshake-time errors. A post-handshake fatal alert (steady-state
@@ -1067,32 +1496,53 @@ function ConnectionManager(config) {
    */
   function extractSrtpKeys() {
     if (!state.dtlsSession || !state.dtlsSession.tls) return null;
-    var secrets = state.dtlsSession.tls.getTrafficSecrets();
-    if (!secrets || !secrets.masterSecret || !secrets.localRandom || !secrets.remoteRandom) return null;
+    var tls = state.dtlsSession.tls;
+    var secrets = tls.getTrafficSecrets();
+    if (!secrets) return null;
 
-    // Client random comes first in the seed regardless of our role.
-    var clientRandom = secrets.isServer ? secrets.remoteRandom : secrets.localRandom;
-    var serverRandom = secrets.isServer ? secrets.localRandom : secrets.remoteRandom;
+    // ── Resolve the negotiated SRTP profile ──
+    // Server side: we picked it in the 'clienthello' handler.
+    // Client side: the server's hello carries its single choice in the
+    // use_srtp extension — read it from the remote extensions.
+    var profile = state.negotiatedSrtpProfile;
+    if (profile == null) {
+      var ext = tls.getRemoteExtension ? tls.getRemoteExtension(14) : null;
+      if (ext && ext.data && ext.data.length >= 4) {
+        var listLen = (ext.data[0] << 8) | ext.data[1];
+        if (listLen >= 2 && 2 + listLen <= ext.data.length) {
+          profile = (ext.data[2] << 8) | ext.data[3];   // server answers ONE
+        }
+      }
+    }
+    if (profile == null) profile = 0x0001;   // legacy peers: CM
+    state.negotiatedSrtpProfile = profile;
 
-    // RFC 5764 — 60 bytes: clientKey(16) | serverKey(16) | clientSalt(14) | serverSalt(14)
-    var seed = Buffer.concat([Buffer.from(clientRandom), Buffer.from(serverRandom)]);
-    var material = _tls12Prf(
-      Buffer.from(secrets.masterSecret),
-      'EXTRACTOR-dtls_srtp',
-      seed,
-      60
+    // ── Export keying material (RFC 5764 §4.2) ──
+    // Preferred path: lemon-tls's RFC 5705 / RFC 8446 exporter.
+    // Fallback: local TLS 1.2 PRF (kept for older lemon-tls builds).
+    var wantLen = SrtpSession.keyingMaterialLength(profile);
+    var material = (typeof tls.exportKeyingMaterial === 'function')
+      ? tls.exportKeyingMaterial(wantLen, 'EXTRACTOR-dtls_srtp')
+      : null;
+
+    if (!material || material.length !== wantLen) {
+      // Fallback: manual TLS 1.2 PRF over master secret + hello randoms.
+      if (!secrets.masterSecret || !secrets.localRandom || !secrets.remoteRandom) return null;
+      var clientRandom = secrets.isServer ? secrets.remoteRandom : secrets.localRandom;
+      var serverRandom = secrets.isServer ? secrets.localRandom : secrets.remoteRandom;
+      var seed = Buffer.concat([Buffer.from(clientRandom), Buffer.from(serverRandom)]);
+      material = _tls12Prf(Buffer.from(secrets.masterSecret), 'EXTRACTOR-dtls_srtp', seed, wantLen);
+    }
+
+    // ── Slice per RFC 5764 §4.2 + build the session (rtp-packet does both;
+    //    accepts the profile as the IANA number directly) ──
+    state.srtpSession = SrtpSession.fromDtlsKeyingMaterial(
+      profile, material, secrets.isServer
     );
-
-    var keys = {
-      clientKey:  material.subarray(0, 16),
-      serverKey:  material.subarray(16, 32),
-      clientSalt: material.subarray(32, 46),
-      serverSalt: material.subarray(46, 60),
-      isServer:   secrets.isServer,
-    };
-
-    state.srtpSession = new SrtpSession(keys);
-    return keys;
+    _diag('[cm-diag] SRTP session ready: profile=0x' +
+      profile.toString(16).padStart(4, '0') +
+      ' (' + state.srtpSession.profile + ')');
+    return state.srtpSession;
   }
 
   /**
@@ -1203,6 +1653,8 @@ function ConnectionManager(config) {
       return;
     }
     _diag('[cm-diag] DTLS fingerprint verified ✓');
+    if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
+    if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
     setState({ dtlsSession: dtlsSession, dtlsState: 'connected' });
   }
 
@@ -1418,6 +1870,7 @@ function ConnectionManager(config) {
         } else {
           // Refresh on renegotiation — peer may have dropped/reordered codecs.
           if (existing.sender) existing.sender._negotiatedCodecs = _senderCodecs;
+          existing._negotiatedCodecs = _senderCodecs;
           existing.remoteSimulcast = _remoteSimulcast;
         }
         continue;
@@ -1431,6 +1884,18 @@ function ConnectionManager(config) {
         transceiver = existing;
         // Refresh on renegotiation
         if (transceiver.sender) transceiver.sender._negotiatedCodecs = _senderCodecs;
+        transceiver._negotiatedCodecs = _senderCodecs;
+        // FlexFEC: surface the negotiated PT to media_transport's receive
+        // path (one PT per session is sufficient — flexfec-03 protects
+        // whole streams, pairing rides in a=ssrc-group:FEC-FR).
+        if (_senderCodecs) {
+          for (var _ffi = 0; _ffi < _senderCodecs.length; _ffi++) {
+            if (_senderCodecs[_ffi] && _senderCodecs[_ffi].flexfecPayloadType != null) {
+              state.flexfecPayloadType = _senderCodecs[_ffi].flexfecPayloadType;
+              break;
+            }
+          }
+        }
         transceiver.remoteSimulcast = _remoteSimulcast;
       } else {
         transceiver = {
@@ -1682,6 +2147,14 @@ function ConnectionManager(config) {
     if (state._diagPktCountsTimer) {
       clearInterval(state._diagPktCountsTimer);
       state._diagPktCountsTimer = null;
+    }
+    if (state._dtlsWatchdog) {
+      clearTimeout(state._dtlsWatchdog);
+      state._dtlsWatchdog = null;
+    }
+    if (state._dtlsReconcileTimer) {
+      clearInterval(state._dtlsReconcileTimer);
+      state._dtlsReconcileTimer = null;
     }
 
     // W3C webrtc-pc: when the peer connection closes, every transport

@@ -204,11 +204,11 @@ function SctpAssociation(config) {
   var localPort  = config.port       || 5000;
   var remotePort = config.remotePort || 5000;
 
-  // Role: 'client' actively sends INIT on connect(); 'server' waits for
-  // an incoming INIT. Default 'server' matches the most common WebRTC
-  // case where the browser-side initiates. Validated here so a typo
-  // ('clent', 'svr', etc.) errors at construction rather than producing
-  // mysterious silence later.
+  // Role: informational only for association setup — per RFC 8841 BOTH
+  // endpoints initiate the SCTP association (connect() sends INIT from
+  // either role), so 'client'/'server' no longer gates the handshake.
+  // The DataChannel layer still uses it for DCEP stream-id parity
+  // (RFC 8832 §6: DTLS client = even ids, DTLS server = odd).
   var role = config.role || 'server';
   if (role !== 'client' && role !== 'server') {
     throw new TypeError("SctpAssociation: role must be 'client' or 'server' (got " + JSON.stringify(role) + ")");
@@ -2944,9 +2944,10 @@ function SctpAssociation(config) {
    * Symmetric for both roles. The intent is "tell me when ready", and
    * the function tolerates whatever state the association is in:
    *
-   *   • 'closed' (initial)         — registers the callback, sends INIT
-   *                                   if role='client', otherwise waits
-   *                                   for an incoming INIT.
+   *   • 'closed' (initial)         — registers the callback and sends
+   *                                   INIT (both roles — RFC 8841
+   *                                   requires both endpoints to
+   *                                   initiate the association).
    *   • 'cookie-wait'/'cookie-echoed' — handshake already in progress;
    *                                   registers the callback to fire
    *                                   when 'open' or 'close' settles.
@@ -3020,10 +3021,29 @@ function SctpAssociation(config) {
       ev.on('close', onClose);
     }
 
-    // Send INIT only if we're the client AND we haven't already started.
-    // (Mid-handshake calls just attach the callback; server side never
-    // sends INIT regardless.)
-    if (!isServer && state === STATE_CLOSED) {
+    // Initiate regardless of role. RFC 8841 (SCTP over DTLS in SDP):
+    //
+    //   "When an SCTP association is established, both SCTP endpoints
+    //    MUST initiate the SCTP association (i.e., both SCTP endpoints
+    //    take the 'active' role). ... As both SCTP endpoints take the
+    //    'active' role, the SDP 'setup' attribute does not apply to
+    //    SCTP association establishment."
+    //
+    // The previous guard sent INIT only for role='client' (mirroring
+    // the DTLS setup role). Stacks that make the symmetric mistake in
+    // the opposite direction — SIPSorcery and werift both wait for the
+    // peer's INIT even as DTLS client — then deadlocked with us: DTLS
+    // completed, nobody sent INIT, and the DataChannel never opened.
+    // (libdatachannel/pion masked it by always initiating, exactly as
+    // the RFC requires.)
+    //
+    // The DTLS role retains exactly one SCTP-adjacent duty — DCEP
+    // stream-id parity (RFC 8832 §6: DTLS client uses even stream ids,
+    // server odd) — and plays no part in association establishment.
+    // Simultaneous INITs from both ends are ordinary SCTP (RFC 4960
+    // §5.2.1) and are already handled by handleInit's collision path.
+    // (Mid-handshake calls just attach the callback.)
+    if (state === STATE_CLOSED) {
       sendInit();
     }
   }

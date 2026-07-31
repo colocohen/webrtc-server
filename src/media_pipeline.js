@@ -19,7 +19,10 @@
 // sending starts immediately.
 
 import { EventEmitter } from 'events';
-import { VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder, MediaStreamTrack } from 'media-processing';
+import { VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder, MediaStreamTrack, computeAudioDbov } from 'media-processing';
+import { REDPacketizer, REDDepacketizer } from 'rtp-packet';
+import { H265Packetizer, H265Depacketizer } from 'rtp-packet';
+import { DtmfPacketizer } from 'rtp-packet';
 import {
   VP8Packetizer, VP8Depacketizer,
   VP9Packetizer, VP9Depacketizer,
@@ -79,6 +82,13 @@ var VIDEO_CODECS = {
   // itself; we don't need to parse keyframe dimensions out of the OBUs to
   // call decoder.configure(). Default 1280x720 is a reasonable starter
   // (matches what Chrome guesses for AV1 if no dims are supplied up-front).
+  H265: {
+    Packetizer:         H265Packetizer,
+    Depacketizer:       H265Depacketizer,
+    decoderCodec:       'h265',
+    parseKeyframeDims:  parseH265KeyframeDimensions,
+    requiresDescription: false,          // Annex-B end-to-end, like H264
+  },
   AV1: {
     Packetizer:         AV1Packetizer,
     Depacketizer:       AV1Depacketizer,
@@ -131,11 +141,160 @@ function parseVp9KeyframeDimensions(data) {
  * TODO Phase 1.5: real implementation (Exp-Golomb decoding). For now, returns
  * a default. Chrome's H264 decoder reconfigures from the SPS in the bitstream.
  */
+// ── Shared SPS bit-reading machinery (H.264 + H.265) ──
+//
+// Both parsers need: Annex-B NAL scan, emulation-prevention removal
+// (00 00 03 → 00 00), and Exp-Golomb ue(v)/se(v) reads. The dimensions
+// matter for real since MP-9: VideoDecoder pins its OUTPUT scale to the
+// configured dims, so a wrong bootstrap here re-scales the whole stream.
+
+function _ebspToRbsp(buf) {
+  var out = Buffer.allocUnsafe(buf.length);
+  var o = 0, zeros = 0;
+  for (var i = 0; i < buf.length; i++) {
+    if (zeros >= 2 && buf[i] === 3) { zeros = 0; continue; }  // emulation byte
+    zeros = (buf[i] === 0) ? zeros + 1 : 0;
+    out[o++] = buf[i];
+  }
+  return out.subarray(0, o);
+}
+
+function _BitReader(buf) { this.buf = buf; this.pos = 0; }
+_BitReader.prototype.u = function (n) {
+  var v = 0;
+  for (var i = 0; i < n; i++) {
+    var byte = this.buf[this.pos >> 3];
+    if (byte === undefined) throw new Error('sps: eof');
+    v = (v << 1) | ((byte >> (7 - (this.pos & 7))) & 1);
+    this.pos++;
+  }
+  return v >>> 0;
+};
+_BitReader.prototype.ue = function () {
+  var zeros = 0;
+  while (this.u(1) === 0) { if (++zeros > 31) throw new Error('sps: bad ue'); }
+  return zeros === 0 ? 0 : ((1 << zeros) - 1) + this.u(zeros);
+};
+_BitReader.prototype.se = function () {
+  var k = this.ue();
+  return (k & 1) ? (k + 1) >> 1 : -(k >> 1);
+};
+
+// Walk Annex-B start codes, return payload of first NAL matching pred.
+function _findNal(data, pred) {
+  var i = 0, n = data.length;
+  while (i + 3 < n) {
+    if (data[i] === 0 && data[i+1] === 0 && (data[i+2] === 1 || (data[i+2] === 0 && data[i+3] === 1))) {
+      var start = i + (data[i+2] === 1 ? 3 : 4);
+      // find next start code
+      var j = start;
+      while (j + 3 < n && !(data[j] === 0 && data[j+1] === 0 && (data[j+2] === 1 || (data[j+2] === 0 && data[j+3] === 1)))) j++;
+      var end = (j + 3 < n) ? j : n;
+      if (pred(data[start])) return data.subarray(start, end);
+      i = end;
+    } else i++;
+  }
+  return null;
+}
+
+/**
+ * H.264 SPS parse (ITU-T H.264 §7.3.2.1.1) — coded size minus the
+ * frame-cropping window, i.e. the true display dimensions.
+ */
 function parseH264KeyframeDimensions(data) {
-  if (!data || data.length < 5) return null;
-  // Annex-B: find NALU with type 7 (SPS). nal_unit_type = byte & 0x1F
-  // TODO: scan for 00 00 00 01 or 00 00 01, find SPS, parse.
-  return { width: 640, height: 480 };
+  if (!data || data.length < 8) return null;
+  try {
+    var sps = _findNal(data, function (b) { return (b & 0x1F) === 7; });
+    if (!sps) return null;
+    var r = new _BitReader(_ebspToRbsp(sps.subarray(1)));  // skip nal header byte
+    var profile = r.u(8);
+    r.u(8);                              // constraint flags + reserved
+    r.u(8);                              // level_idc
+    r.ue();                              // sps_id
+    var chromaIdc = 1;
+    if ([100,110,122,244,44,83,86,118,128,138,139,134,135].indexOf(profile) >= 0) {
+      chromaIdc = r.ue();
+      if (chromaIdc === 3) r.u(1);       // separate_colour_plane
+      r.ue(); r.ue(); r.u(1);            // bit depths + qpprime
+      if (r.u(1)) {                      // seq_scaling_matrix_present
+        var lists = (chromaIdc !== 3) ? 8 : 12;
+        for (var li = 0; li < lists; li++) {
+          if (r.u(1)) {                  // scaling_list_present[li]
+            var size = (li < 6) ? 16 : 64, last = 8, next = 8;
+            for (var si = 0; si < size; si++) {
+              if (next !== 0) next = (last + r.se() + 256) % 256;
+              last = (next === 0) ? last : next;
+            }
+          }
+        }
+      }
+    }
+    r.ue();                              // log2_max_frame_num_minus4
+    var poc = r.ue();
+    if (poc === 0) r.ue();
+    else if (poc === 1) {
+      r.u(1); r.se(); r.se();
+      var cyc = r.ue();
+      for (var c = 0; c < cyc; c++) r.se();
+    }
+    r.ue(); r.u(1);                      // max_num_ref, gaps_allowed
+    var widthMbs  = r.ue() + 1;
+    var heightMap = r.ue() + 1;
+    var frameMbsOnly = r.u(1);
+    if (!frameMbsOnly) r.u(1);           // mb_adaptive
+    r.u(1);                              // direct_8x8
+    var cropL = 0, cropR = 0, cropT = 0, cropB = 0;
+    if (r.u(1)) { cropL = r.ue(); cropR = r.ue(); cropT = r.ue(); cropB = r.ue(); }
+    // Crop units per §7.4.2.1.1 (chroma 4:2:0 → x2 horizontally, x2*(2-fmo) vertically)
+    var subW = (chromaIdc === 1 || chromaIdc === 2) ? 2 : 1;
+    var subH = (chromaIdc === 1) ? 2 : 1;
+    var width  = widthMbs * 16 - subW * (cropL + cropR);
+    var height = (2 - frameMbsOnly) * heightMap * 16 - subH * (2 - frameMbsOnly) * (cropT + cropB);
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return null;
+    return { width: width, height: height };
+  } catch (e) { return null; }
+}
+
+/**
+ * H.265 SPS parse (ITU-T H.265 §7.3.2.2.1). NAL type 33; header is 2
+ * bytes. profile_tier_level is a fixed 12-byte general block plus
+ * optional per-sub-layer blocks gated by presence flags.
+ */
+function parseH265KeyframeDimensions(data) {
+  if (!data || data.length < 10) return null;
+  try {
+    var sps = _findNal(data, function (b) { return ((b >> 1) & 0x3F) === 33; });
+    if (!sps) return null;
+    var r = new _BitReader(_ebspToRbsp(sps.subarray(2)));  // skip 2-byte nal header
+    r.u(4);                              // sps_video_parameter_set_id
+    var maxSub = r.u(3);                 // sps_max_sub_layers_minus1
+    r.u(1);                              // temporal_id_nesting
+    // profile_tier_level: general block = 88 bits + level_idc(8) = 96 bits
+    r.u(32); r.u(32); r.u(24); r.u(8);   // 96 bits total
+    if (maxSub > 0) {
+      var profPresent = [], levelPresent = [];
+      for (var i = 0; i < maxSub; i++) { profPresent.push(r.u(1)); levelPresent.push(r.u(1)); }
+      for (var j = maxSub; j < 8; j++) r.u(2);            // reserved alignment
+      for (var k = 0; k < maxSub; k++) {
+        if (profPresent[k]) { r.u(32); r.u(32); r.u(24); } // 88 bits
+        if (levelPresent[k]) r.u(8);
+      }
+    }
+    r.ue();                              // sps_seq_parameter_set_id
+    var chromaIdc = r.ue();
+    if (chromaIdc === 3) r.u(1);         // separate_colour_plane
+    var width  = r.ue();                 // pic_width_in_luma_samples
+    var height = r.ue();                 // pic_height_in_luma_samples
+    if (r.u(1)) {                        // conformance_window_flag
+      var wl = r.ue(), wr = r.ue(), wt = r.ue(), wb = r.ue();
+      var subW = (chromaIdc === 1 || chromaIdc === 2) ? 2 : 1;
+      var subH = (chromaIdc === 1) ? 2 : 1;
+      width  -= subW * (wl + wr);
+      height -= subH * (wt + wb);
+    }
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return null;
+    return { width: width, height: height };
+  } catch (e) { return null; }
 }
 
 
@@ -240,6 +399,15 @@ function createVideoSendPipeline(opts) {
     // old one left off — matching libwebrtc's RtpSender::SetTrack which
     // keeps the encoder/packetizer alive across track swaps.
     initialSequenceNumber: opts.initialSequenceNumber,
+    // 15-bit PictureID in the VP8/VP9 payload descriptor, incremented once
+    // per frame. Purely payload-level — needs no SDP negotiation — and
+    // libwebrtc receivers key frame-continuity tracking and simulcast
+    // layer switching on it. Codecs without the concept (H.264, Opus)
+    // ignore unknown options. Continuity across replaceTrack is NOT
+    // preserved (unlike the seq counter above): a PictureID jump after a
+    // track swap is tolerated by receivers, so carrying the extra state
+    // isn't worth it.
+    pictureId:   true,
   });
 
   var frameCount = 0;   // counts frames fed to the encoder (for keyframe cadence)
@@ -899,13 +1067,29 @@ function createAudioSendPipeline(opts) {
 
   var codecInfo = AUDIO_CODECS.OPUS;
 
-  var packetizer = new codecInfo.Packetizer({
-    ssrc:        ssrc,
-    payloadType: payloadType,
-    // RTP sequence-number continuity across pipeline restarts (see the
-    // video send pipeline for the full rationale — same flow for audio).
-    initialSequenceNumber: opts.initialSequenceNumber,
-  });
+  // RED (RFC 2198): when the negotiated codec carries a redPayloadType,
+  // the wire packets are RED-wrapped — current opus frame + previous
+  // frame(s) as redundancy, repairing single losses with zero RTT.
+  // REDPacketizer is a drop-in for OpusPacketizer (same packetize(chunk)
+  // shape); the opus PT rides inside as innerPayloadType.
+  var packetizer;
+  if (opts.redPayloadType != null) {
+    packetizer = new REDPacketizer({
+      ssrc:              ssrc,
+      payloadType:       opts.redPayloadType,
+      innerPayloadType:  payloadType,
+      redundancy:        opts.redundancy || 1,
+      initialSequenceNumber: opts.initialSequenceNumber,
+    });
+  } else {
+    packetizer = new codecInfo.Packetizer({
+      ssrc:        ssrc,
+      payloadType: payloadType,
+      // RTP sequence-number continuity across pipeline restarts (see the
+      // video send pipeline for the full rationale — same flow for audio).
+      initialSequenceNumber: opts.initialSequenceNumber,
+    });
+  }
 
   var stopped = false;
   var active  = true;
@@ -929,6 +1113,10 @@ function createAudioSendPipeline(opts) {
   // Tracks whether ANY packet has been emitted on this pipeline. Used to
   // gate getLastSequenceNumber() — see video send for rationale.
   var _packetsSent = 0;
+  var _lastRtpTs = null;
+  var _dtmfActive = false;
+  var _lastAudioDbov = null;
+  var _lastVoiceActivity = false;
 
   function _processChunkForSend(chunk) {
     if (stopped || !active) return;
@@ -944,8 +1132,13 @@ function createAudioSendPipeline(opts) {
       }
       return;
     }
+    if (_dtmfActive) return;   // libwebrtc-style: tone replaces audio frames
+    var _alHints = (_lastAudioDbov != null)
+      ? { audioLevel: _lastAudioDbov, voiceActivity: _lastVoiceActivity }
+      : null;
     for (var i = 0; i < pkts.length; i++) {
-      manager.sendRtp(pkts[i]);
+      _lastRtpTs = pkts[i].readUInt32BE(4);
+      manager.sendRtp(pkts[i], _alHints);
       _packetsSent++;
     }
   }
@@ -1011,11 +1204,26 @@ function createAudioSendPipeline(opts) {
     abort: function () {},
   });
 
+  // Negotiated a=fmtp params (RFC 7587) — forwarded via the W3C
+  // config.opus surface so media-processing's codecs.js maps them to
+  // libopus (-fec/-packet_loss/-dtx/…). Without this, useinbandfec=1
+  // promised in our SDP was silently inactive.
+  var _opusFmtp = null;
+  if (opts.fmtp) {
+    _opusFmtp = {};
+    if (opts.fmtp.useinbandfec != null)     _opusFmtp.useinbandfec = parseInt(opts.fmtp.useinbandfec, 10) === 1;
+    if (opts.fmtp.usedtx != null)           _opusFmtp.usedtx = parseInt(opts.fmtp.usedtx, 10) === 1;
+    if (opts.fmtp.maxaveragebitrate != null) _opusFmtp.maxaveragebitrate = parseInt(opts.fmtp.maxaveragebitrate, 10);
+    if (opts.fmtp.maxplaybackrate != null)  _opusFmtp.maxplaybackrate = parseInt(opts.fmtp.maxplaybackrate, 10);
+    if (opts.fmtp.cbr != null)              _opusFmtp.cbr = parseInt(opts.fmtp.cbr, 10) === 1;
+  }
+
   encoder.configure({
     codec:            codecInfo.decoderCodec,
     sampleRate:       codecInfo.clockRate,
     numberOfChannels: codecInfo.numberOfChannels,
     bitrate:          bitrate,
+    opus:             _opusFmtp || undefined,
   });
 
   var onData = function (audioData) {
@@ -1023,6 +1231,13 @@ function createAudioSendPipeline(opts) {
       try { if (audioData && typeof audioData.close === 'function') audioData.close(); } catch (e) {}
       return;
     }
+    // RFC 6464 send side (RTP-5): level is a property of THIS frame, so
+    // compute pre-encode and let the send loop attach it to the packets
+    // that carry the frame. Cheap: one RMS pass over ≤20ms of samples.
+    try {
+      _lastAudioDbov = computeAudioDbov(audioData);
+      _lastVoiceActivity = _lastAudioDbov < 56;   // ~ -56 dBov speech gate
+    } catch (e) {}
     try { encoder.encode(audioData); }
     catch (e) {
       if (typeof console !== 'undefined' && console.error) {
@@ -1094,6 +1309,50 @@ function createAudioSendPipeline(opts) {
     readable:    readable,
     writable:    writable,
     takeStreams: takeStreams,
+    // DTMF (RFC 4733, API-3). Rides the SAME SSRC + seq space as the
+    // audio: the DtmfPacketizer pulls seq numbers from the audio
+    // packetizer's own counter, and the event timestamp anchors to the
+    // last audio packet's RTP ts. While a tone is active, opus output
+    // is suppressed (libwebrtc replaces audio frames the same way).
+    dtmfPayloadType: (opts.dtmfPayloadType != null) ? opts.dtmfPayloadType : null,
+    sendDtmf: function (tone, durationMs, onDone) {
+      if (opts.dtmfPayloadType == null) return false;
+      if (_dtmfActive) return false;                 // one tone at a time
+      var dp = new DtmfPacketizer({
+        ssrc: ssrc,
+        payloadType: opts.dtmfPayloadType,
+        clockRate: 48000,
+        nextSequenceNumber: function () {
+          var s = packetizer.sequenceNumber & 0xFFFF;
+          packetizer.sequenceNumber = (s + 1) & 0xFFFF;
+          return s;
+        },
+      });
+      _dtmfActive = true;
+      var startTs = (_lastRtpTs != null) ? _lastRtpTs : 0;
+      dp.startEvent(tone, startTs);
+      var elapsed = 0, STEP = 20;
+      var timer = setInterval(function () {
+        try {
+          elapsed += STEP;
+          if (elapsed >= durationMs) {
+            clearInterval(timer);
+            var ends = dp.endEvent(STEP);
+            for (var e = 0; e < ends.length; e++) manager.sendRtp(ends[e]);
+            _dtmfActive = false;
+            if (onDone) onDone();
+          } else {
+            manager.sendRtp(dp.update(STEP));
+          }
+        } catch (err) {
+          clearInterval(timer);
+          _dtmfActive = false;
+          if (onDone) onDone(err);
+        }
+      }, STEP);
+      if (timer.unref) timer.unref();
+      return true;
+    },
     // See video send pipeline's getLastSequenceNumber.
     getLastSequenceNumber: function () {
       if (!packetizer || packetizer.sequenceNumber == null) return null;
@@ -1152,11 +1411,27 @@ function createAudioReceivePipeline(opts) {
 
   /* ── JitterBuffer ───────────────────────────────────────────────────── */
 
+  // RED (RFC 2198): when negotiated, incoming packets on the RED PT are
+  // unwrapped first — the RED depacketizer emits parse()-shaped
+  // pseudo-packets (primary + any recovered redundant frames, deduped,
+  // in timestamp order) straight into the opus depacketizer. Plain-PT
+  // packets bypass it, so a peer that stops sending RED mid-call keeps
+  // working.
+  var redDepacketizer = (opts.redPayloadType != null)
+    ? new REDDepacketizer({ output: function (pp) { depacketizer.depacketize(pp); } })
+    : null;
+
   var jitterBuffer = new JitterBuffer({
     latency: opts.jitterLatencyMs != null ? opts.jitterLatencyMs : 20,
     output:  function (parsedPacket) {
       if (stopped) return;
-      try { depacketizer.depacketize(parsedPacket); }
+      try {
+        if (redDepacketizer && parsedPacket.payloadType === opts.redPayloadType) {
+          redDepacketizer.depacketize(parsedPacket);
+        } else {
+          depacketizer.depacketize(parsedPacket);
+        }
+      }
       catch (e) {}
     },
     onLoss: function (lostSeq, count) {
@@ -1173,6 +1448,14 @@ function createAudioReceivePipeline(opts) {
         synthesizedSamplesDuration: (lostCount * FRAME_MS) / 1000,
       });
     },
+  });
+
+  // Stream discontinuity: reset any depacketizer state. Audio has no
+  // keyframes to request — Opus frames are self-contained, so playback
+  // simply continues from the re-anchored position.
+  jitterBuffer.on('resync', function () {
+    if (stopped) return;
+    try { depacketizer.reset(); } catch (e) {}
   });
 
 
@@ -1494,8 +1777,33 @@ function createVideoReceivePipeline(opts) {
       catch (e) { /* depacketizer already reports via error callback */ }
     },
     onLoss: function (/* seq */) {
-      // TODO Phase 6: send PLI via manager.requestKeyframe(mid).
+      // Per-seq loss recovery is handled by MediaTransport's NackGenerator
+      // (gap detection → NACK → RTX → PLI escalation on overflow). Nothing
+      // to do here — hooks below handle the cases NACK can't.
     },
+  });
+
+  // ── Stream discontinuity handling ──
+  //
+  // 'resync': the buffer re-anchored after a large sequence jump (camera
+  // restart, SSRC reuse, long outage). Any half-assembled frame in the
+  // depacketizer belongs to the old timeline and will never complete —
+  // clear it so the first post-jump frame doesn't get glued to stale
+  // fragments. Then ask for a keyframe: the decoder needs a fresh start.
+  //
+  // 'gap': a discontinuity too large for per-packet NACK (loss callbacks
+  // are capped per gap). NACKing hundreds of packets is pointless — the
+  // decoder can't use them anyway once a reference frame is gone.
+  // requestKeyframe() → PLI; MediaTransport throttles duplicates, so this
+  // and the NackGenerator's own PLI escalation never double-fire.
+  jitterBuffer.on('resync', function () {
+    if (stopped) return;
+    try { depacketizer.reset(); } catch (e) {}
+    try { manager.requestKeyframe(ssrc); } catch (e) {}
+  });
+  jitterBuffer.on('gap', function () {
+    if (stopped) return;
+    try { manager.requestKeyframe(ssrc); } catch (e) {}
   });
 
 

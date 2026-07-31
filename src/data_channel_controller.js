@@ -433,10 +433,13 @@ class DataChannelController extends EventEmitter {
     this._wireSctpEvents(sctp);
     this._setSctpState('connecting');
 
-    // Drive the handshake. connect() is symmetric: client side sends
-    // INIT, server side just waits for incoming INIT. Either way, the
-    // existing 'open' listener wired above transitions sctpState to
-    // 'connected' when the handshake completes.
+    // Drive the handshake. connect() sends INIT from BOTH roles — RFC
+    // 8841: "both SCTP endpoints MUST initiate the SCTP association";
+    // the DTLS setup role does not apply to association establishment
+    // (it only sets DCEP stream-id parity, RFC 8832 §6). Simultaneous
+    // INITs are ordinary SCTP and resolved by the association's
+    // collision handling. The existing 'open' listener wired above
+    // transitions sctpState to 'connected' when the handshake completes.
     sctp.connect();
   }
 

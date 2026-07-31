@@ -38,6 +38,9 @@
 
 import { EventEmitter } from 'node:events';
 import {
+  FlexFecDecoder,
+  FlexFecEncoder,
+  readAudioLevel,
   parse as parseRtp,
   parseRtxPacket,
   NackGenerator,
@@ -143,7 +146,7 @@ class MediaTransport extends EventEmitter {
    * Caller (media_pipeline.js) is responsible for packet framing — we treat
    * the buffer as a complete RTP packet and only modify the extension area.
    */
-  sendRtp(rtpPacket) {
+  sendRtp(rtpPacket, hints) {
     var state = this._state;
     var srtp = this._deps.getSrtpSession();
     var ice = this._deps.getIceAgent();
@@ -159,7 +162,7 @@ class MediaTransport extends EventEmitter {
     // The stamper owns the per-session counter state and centralizes all
     // RTP-protocol knowledge in one place (libwebrtc's RTPSenderEgress
     // does the same).
-    rtpPacket = state.headerStamper.stamp(rtpPacket);
+    rtpPacket = state.headerStamper.stamp(rtpPacket, hints);
 
     // Save a copy of the plaintext RTP for potential NACK retransmission.
     // We store the packet as it will go on the wire (transport-cc extension
@@ -244,6 +247,39 @@ class MediaTransport extends EventEmitter {
         ' selectedPair=' + (state.selectedPair ? 'yes' : 'NO'));
     }
     ice.send(enc);
+
+    // ── FlexFEC send path (flexfec-03) ──
+    //
+    // For video SSRCs that have a paired FEC SSRC (allocated in
+    // rtp_transmission_manager, declared via a=ssrc-group:FEC-FR) and a
+    // negotiated flexfec PT: feed the FINAL on-wire media packet
+    // (post-stamp, pre-SRTP — exactly the bytes the receiver's decoder
+    // will XOR against) into a per-SSRC encoder; every groupSize packets
+    // it emits one FEC packet, which takes the same SRTP+ICE path.
+    // FEC packets deliberately skip the stamper, senderBuffer and BWE
+    // recordSend — they're never NACKed/RTXed, and libwebrtc doesn't
+    // count them in transport-cc pacing feedback either.
+    if (state.flexfecPayloadType != null &&
+        state.localFecSsrcs && state.localFecSsrcs[ssrc] != null) {
+      if (!state.flexfecEncoders) state.flexfecEncoders = {};
+      var _fenc = state.flexfecEncoders[ssrc];
+      if (!_fenc) {
+        _fenc = state.flexfecEncoders[ssrc] = new FlexFecEncoder({
+          ssrc:          state.localFecSsrcs[ssrc],
+          payloadType:   state.flexfecPayloadType,
+          protectedSsrc: ssrc,
+          groupSize:     state.flexfecGroupSize || 4,
+        });
+        this._diag('[cm-diag] flexfec: encoder created media=' + ssrc +
+                   ' fec=' + state.localFecSsrcs[ssrc] +
+                   ' pt=' + state.flexfecPayloadType);
+      }
+      var _fecPkts = _fenc.protect(rtpPacket);
+      for (var _fpi = 0; _fpi < _fecPkts.length; _fpi++) {
+        var _fecEnc = srtp.encryptRtp(_fecPkts[_fpi]);
+        if (_fecEnc) ice.send(_fecEnc);
+      }
+    }
   }
 
   /**
@@ -745,6 +781,52 @@ class MediaTransport extends EventEmitter {
     var ts   = parsed.timestamp;
     var ssrc = parsed.ssrc;
 
+    // ── FlexFEC receive path (flexfec-03) ──
+    //
+    // FEC packets arrive on their own SSRC with the negotiated flexfec PT.
+    // Each carries the protected media SSRC in its header; we keep one
+    // FlexFecDecoder per protected SSRC (created on first FEC sighting),
+    // feed it every media packet of that SSRC, and re-inject recovered
+    // packets through this same handler (isRecovered=true — the exact
+    // pattern RTX recovery uses, so NackGenerator/stats treat them right).
+    if (state.flexfecPayloadType != null) {
+      if (pt === state.flexfecPayloadType && !isRecovered) {
+        // Protected SSRC lives at FEC-payload offset 12 (after the
+        // 12-byte RTP header → bytes 24-27 of the packet).
+        if (rtp.length >= 28) {
+          var _protSsrc = rtp.readUInt32BE(24);
+          if (!state.flexfecDecoders) state.flexfecDecoders = {};
+          var _dec = state.flexfecDecoders[_protSsrc];
+          if (!_dec) {
+            _dec = state.flexfecDecoders[_protSsrc] = new FlexFecDecoder();
+            this._diag('[cm-diag] flexfec: decoder created for protected ssrc=' + _protSsrc);
+          }
+          var _recovered = _dec.addFecPacket(rtp);
+          for (var _ri = 0; _ri < _recovered.length; _ri++) {
+            this._handleIncomingRtpInner(_recovered[_ri], rinfo, /*isRecovered=*/true, _recovered[_ri].length);
+          }
+        }
+        return;   // FEC packets never continue into the media pipeline
+      }
+      // Media packet → feed the decoder window (created on first media,
+      // not first FEC: with in-order delivery FEC always TRAILS its
+      // group, so a lazily-on-FEC decoder would start with an empty
+      // window and the whole first group would be unrecoverable). A
+      // late-arriving packet may also complete a pending FEC group.
+      // Non-video SSRCs get a small bounded window too — harmless, and
+      // the transport layer doesn't know per-SSRC kinds reliably before
+      // the first packets anyway.
+      if (!isRecovered) {
+        if (!state.flexfecDecoders) state.flexfecDecoders = {};
+        var _mdec = state.flexfecDecoders[ssrc];
+        if (!_mdec) _mdec = state.flexfecDecoders[ssrc] = new FlexFecDecoder();
+        var _rec2 = _mdec.addMediaPacket(rtp);
+        for (var _ri2 = 0; _ri2 < _rec2.length; _ri2++) {
+          this._handleIncomingRtpInner(_rec2[_ri2], rinfo, /*isRecovered=*/true, _rec2[_ri2].length);
+        }
+      }
+    }
+
     // ── RID/repaired-RID runtime learning (RFC 8852 §3.1) ──
     //
     // On simulcast offers where we don't yet know which SSRC corresponds to
@@ -1090,11 +1172,23 @@ class MediaTransport extends EventEmitter {
       }
 
       if (!receiver._ssrcEntries) receiver._ssrcEntries = {};
-      receiver._ssrcEntries[ssrc] = {
+      var _sync = {
         source:       ssrc,
         timestamp:    nowWall,
         rtpTimestamp: parsed.timestamp,
       };
+      // ssrc-audio-level (RFC 6464): the negotiated ext id is latched
+      // BUNDLE-wide by transport_controller. dBov value cached raw;
+      // api.js converts to the W3C linear 0..1 form at read time.
+      var _alId = state.remoteAudioLevelExtId;
+      if (_alId != null && parsed.extensions && parsed.extensions[_alId]) {
+        var _al = readAudioLevel(parsed.extensions[_alId]);
+        if (_al) {
+          _sync.audioLevelDbov = _al.level;
+          _sync.voiceActivity  = !!_al.voice;
+        }
+      }
+      receiver._ssrcEntries[ssrc] = _sync;
     }
 
     var info = { payloadType: pt, sequenceNumber: seq, ssrc: ssrc };

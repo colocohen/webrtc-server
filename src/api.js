@@ -396,6 +396,42 @@ function RTCPeerConnection(config) {
   // live in cm.js so they observe committed state at chain-execution time.
 
   this.createOffer = function (options) {
+    var self = this;
+    // Legacy options (JSEP §5.1 / W3C legacy extensions):
+    //   offerToReceiveX: true  → ensure at least one transceiver of that
+    //     kind can receive (add a recvonly one if none exists).
+    //   offerToReceiveX: false → strip the receive direction from every
+    //     transceiver of that kind (sendrecv→sendonly, recvonly→inactive).
+    // Old apps (pre-transceiver API) still pass these; Chrome honors
+    // them, so we do too.
+    if (options && (('offerToReceiveAudio' in options) || ('offerToReceiveVideo' in options))) {
+      var kinds = [['offerToReceiveAudio', 'audio'], ['offerToReceiveVideo', 'video']];
+      for (var ki = 0; ki < kinds.length; ki++) {
+        var optName = kinds[ki][0], kind = kinds[ki][1];
+        if (!(optName in options)) continue;
+        var want = !!options[optName];
+        var trs = self.getTransceivers().filter(function (t) {
+          return t && !t.stopped && t.receiver && t.receiver.track &&
+                 t.receiver.track.kind === kind;
+        });
+        if (want) {
+          var canRecv = trs.some(function (t) {
+            return t.direction === 'sendrecv' || t.direction === 'recvonly';
+          });
+          if (!canRecv) {
+            try { self.addTransceiver(kind, { direction: 'recvonly' }); } catch (e) {}
+          }
+        } else {
+          for (var ti = 0; ti < trs.length; ti++) {
+            var t2 = trs[ti];
+            try {
+              if (t2.direction === 'sendrecv')      t2.direction = 'sendonly';
+              else if (t2.direction === 'recvonly') t2.direction = 'inactive';
+            } catch (e) {}
+          }
+        }
+      }
+    }
     return new Promise(function (resolve, reject) {
       manager.createOffer(options, function (err, desc) {
         if (err) reject(err); else resolve(desc);
@@ -1153,7 +1189,9 @@ function RTCRtpSender(internal, track, manager) {
   // toneBuffer but doesn't emit telephone-event RTP packets (see
   // ROADMAP API-3). The presence of the object on audio senders matches
   // what feature-detection code expects.
-  this.dtmf = (internal.kind === 'audio') ? new RTCDTMFSender() : null;
+  this.dtmf = (internal.kind === 'audio')
+    ? new RTCDTMFSender(function () { return pipeline; })
+    : null;
   // W3C webrtc-encoded-transform §3 — RTCRtpScriptTransform integration.
   // The transform property holds an app-provided RTCRtpScriptTransform
   // (which wraps a Worker that processes encoded frames). Setting it
@@ -1424,12 +1462,14 @@ function RTCRtpSender(internal, track, manager) {
         // some SIP gateways use 96, etc.) — peer would silently drop our
         // audio packets.
         var _negotiatedAudioPt = 111;
+        var _negotiatedAudioCodec = null;
         var _audioNegCodecs = internal.sender && internal.sender._negotiatedCodecs;
         if (_audioNegCodecs && _audioNegCodecs.length) {
           for (var _aci = 0; _aci < _audioNegCodecs.length; _aci++) {
             var _anc = _audioNegCodecs[_aci];
             if (_anc && _anc.name && _anc.name.toLowerCase() === 'opus') {
               _negotiatedAudioPt = _anc.payloadType;
+              _negotiatedAudioCodec = _anc;
               break;
             }
           }
@@ -1455,6 +1495,21 @@ function RTCRtpSender(internal, track, manager) {
           payloadType: _negotiatedAudioPt,
           maxBitrate:  enc.maxBitrate || 0,
           initialSequenceNumber: initSeqA,
+          // Negotiated RFC 7587 fmtp (useinbandfec/usedtx/…) → encoder,
+          // and the RED PT (RFC 2198) when the peer negotiated one.
+          fmtp:           _negotiatedAudioCodec ? _negotiatedAudioCodec.fmtp : null,
+          redPayloadType: _negotiatedAudioCodec ? _negotiatedAudioCodec.redPayloadType : null,
+          dtmfPayloadType: (function () {
+            // RFC 4733: telephone-event PT from the negotiated set.
+            if (!_audioNegCodecs) return null;
+            for (var _di = 0; _di < _audioNegCodecs.length; _di++) {
+              var _dc = _audioNegCodecs[_di];
+              if (_dc && _dc.name && _dc.name.toLowerCase() === 'telephone-event') {
+                return _dc.payloadType;
+              }
+            }
+            return null;
+          })(),
         });
       }
     } catch (e) {
@@ -1939,6 +1994,18 @@ RTCRtpSender.getCapabilities = function(kind) {
     // Spread into a fresh object so callers can't mutate our table.
     var out = { mimeType: entry.mimeType, clockRate: entry.clockRate };
     if (entry.channels !== undefined) out.channels = entry.channels;
+    // sdpFmtpLine (QUICK-5 followup): sourced from sdp.js's DEFAULT
+    // codec tables — the same fmtp we actually put on the wire in
+    // offers, so capabilities and negotiation can't drift apart.
+    var defTable = (kind === 'video') ? SDP.DEFAULT_VIDEO_CODECS : SDP.DEFAULT_AUDIO_CODECS;
+    var shortName = String(entry.mimeType).split('/')[1] || '';
+    for (var d = 0; d < defTable.length; d++) {
+      if (String(defTable[d].name).toLowerCase() === shortName.toLowerCase() && defTable[d].fmtp) {
+        var line = SDP.buildFmtpConfig ? SDP.buildFmtpConfig(defTable[d].fmtp) : null;
+        if (line) out.sdpFmtpLine = line;
+        break;
+      }
+    }
     codecs.push(out);
   }
 
@@ -2167,10 +2234,27 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
       _diag('[api-diag] RTCRtpReceiver: starting audio pipeline ssrc=' + ssrc +
                   ' mid=' + (internalTransceiver && internalTransceiver.mid));
       try {
+        // RED PT from the negotiated codec set (offer/answer both attach
+        // redPayloadType to the opus entry — sdp.js extractCodecs pass 2b).
+        var _rxAudioRedPt = null;
+        var _rxNegCodecs = (internalTransceiver && internalTransceiver._negotiatedCodecs) ||
+                           (internalTransceiver && internalTransceiver.sender &&
+                            internalTransceiver.sender._negotiatedCodecs);
+        if (_rxNegCodecs) {
+          for (var _rci = 0; _rci < _rxNegCodecs.length; _rci++) {
+            var _rnc = _rxNegCodecs[_rci];
+            if (_rnc && _rnc.redPayloadType != null &&
+                _rnc.name && _rnc.name.toLowerCase() === 'opus') {
+              _rxAudioRedPt = _rnc.redPayloadType;
+              break;
+            }
+          }
+        }
         pipeline = createAudioReceivePipeline({
           track:   self.track,
           manager: manager,
           ssrc:    ssrc,
+          redPayloadType: _rxAudioRedPt,
         });
         _diag('[api-diag] RTCRtpReceiver: audio pipeline started ✓');
       } catch (e) {
@@ -2467,6 +2551,12 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
         source:       e.source,
         timestamp:    e.timestamp,
         rtpTimestamp: e.rtpTimestamp,
+        // W3C: audioLevel is LINEAR 0..1 (1.0 = 0 dBov). Convert from the
+        // cached RFC 6464 dBov (0 loud .. 127 silent): 10^(-dbov/20).
+        audioLevel: (e.audioLevelDbov != null)
+          ? Math.pow(10, -e.audioLevelDbov / 20)
+          : undefined,
+        voiceActivityFlag: (e.audioLevelDbov != null) ? e.voiceActivity : undefined,
       };
       if (e.audioLevel !== undefined) out.audioLevel = e.audioLevel;
       result.push(out);
@@ -3332,38 +3422,82 @@ function RTCIceTransport(manager) {
 
 /* ========================= RTCDTMFSender ========================= */
 
-function RTCDTMFSender() {
+function RTCDTMFSender(getPipeline) {
+  var self = this;
   this.toneBuffer = '';
-  // ontonechange — receives RTCDTMFToneChangeEvent. Settable field;
-  // never actually dispatched until DTMF emission lands (API-3).
   this.ontonechange = null;
+  var _playing = false;
 
-  // W3C §5.5: canInsertDTMF reports whether DTMF can be sent now.
-  // Returns true only when:
-  //   • The sender's transceiver is sending audio (currentDirection
-  //     includes "send")
-  //   • The negotiated codec list includes telephone-event
-  // Both depend on telephone-event packetization that we haven't
-  // wired yet (API-3); for now report false so feature-detection
-  // code knows DTMF is unavailable rather than getting silent failures.
+  function _pipeline() {
+    try { return getPipeline ? getPipeline() : null; } catch (e) { return null; }
+  }
+
+  // W3C §5.5: true when the audio pipeline is live AND telephone-event
+  // was negotiated (the pipeline only exposes a dtmfPayloadType then).
   Object.defineProperty(this, 'canInsertDTMF', {
-    get: function() {
-      // TODO (API-3): return true when telephone-event has been
-      // negotiated in the m=audio section AND the transceiver is in
-      // a sending direction.
-      return false;
+    get: function () {
+      var p = _pipeline();
+      return !!(p && typeof p.sendDtmf === 'function' && p.dtmfPayloadType != null);
     },
   });
 
-  this.insertDTMF = function(tones, duration, interToneGap) {
-    // DTMF over RTP per RFC 4733 (telephone-event payload type) is not
-    // yet implemented — see ROADMAP API-3. Storing the requested tones
-    // in toneBuffer matches the spec field shape; actually emitting
-    // them on the wire requires a telephone-event packetizer + codec
-    // negotiation in SDP.
-    this.toneBuffer = tones || '';
+  function _fireToneChange(tone) {
+    if (typeof self.ontonechange === 'function') {
+      try { self.ontonechange(new RTCDTMFToneChangeEvent({ tone: tone })); }
+      catch (e) {}
+    }
+  }
+
+  function _runNext(duration, gap) {
+    if (self.toneBuffer.length === 0) {
+      _playing = false;
+      _fireToneChange('');                       // W3C: empty tone marks completion
+      return;
+    }
+    var tone = self.toneBuffer[0];
+    self.toneBuffer = self.toneBuffer.slice(1);
+    if (tone === ',') {
+      // §5.5.4 step: comma = 2-second pause, no tonechange payload change
+      _fireToneChange(',');
+      var t1 = setTimeout(function () { _runNext(duration, gap); }, 2000);
+      if (t1.unref) t1.unref();
+      return;
+    }
+    _fireToneChange(tone);
+    var p = _pipeline();
+    var started = p && p.sendDtmf && p.sendDtmf(tone, duration);
+    // Whether or not the wire send started (e.g. renegotiated away
+    // mid-buffer), keep the state machine's timing contract.
+    var t2 = setTimeout(function () { _runNext(duration, gap); }, duration + gap);
+    if (t2.unref) t2.unref();
+  }
+
+  /**
+   * W3C §5.5.2 insertDTMF(tones, duration, interToneGap).
+   * Replaces toneBuffer; starts playout if idle.
+   */
+  this.insertDTMF = function (tones, duration, interToneGap) {
+    tones = (tones == null) ? '' : String(tones);
+    if (!/^[0-9A-Da-d#*,]*$/.test(tones)) {
+      var err = new Error('insertDTMF: invalid DTMF characters in "' + tones + '"');
+      err.name = 'InvalidCharacterError';
+      throw err;
+    }
+    if (!this.canInsertDTMF) {
+      var err2 = new Error('insertDTMF: DTMF cannot be sent (no negotiated telephone-event or sender inactive)');
+      err2.name = 'InvalidStateError';
+      throw err2;
+    }
+    var dur = Math.min(6000, Math.max(40, (duration == null) ? 100 : duration));
+    var gap = Math.max(30, (interToneGap == null) ? 70 : interToneGap);
+    this.toneBuffer = tones.toUpperCase();
+    if (!_playing && this.toneBuffer.length > 0) {
+      _playing = true;
+      _runNext(dur, gap);
+    }
   };
 }
+
 
 
 /* ========================= Event Classes ========================= */

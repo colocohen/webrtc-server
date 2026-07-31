@@ -266,8 +266,17 @@ function WebRTCRouter(options) {
     if (initialUfrag) byUfrag[initialUfrag] = iceAgent;
 
     // Track the current ufrag so we can unregister the right key on close
-    // (ICE restart changes it; see 'restart' handler below).
+    // (ICE restart / setLocalParameters change it; see handlers below).
     let currentUfrag = initialUfrag;
+
+    function adoptUfrag(newUfrag) {
+      if (!newUfrag || newUfrag === currentUfrag) return;
+      if (currentUfrag && byUfrag[currentUfrag] === iceAgent) {
+        delete byUfrag[currentUfrag];
+      }
+      currentUfrag = newUfrag;
+      byUfrag[newUfrag] = iceAgent;
+    }
 
     // ── Selected pair → cache rinfo for fast-path routing ──
     iceAgent.on('selectedpair', function(pair) {
@@ -279,18 +288,32 @@ function WebRTCRouter(options) {
     // ── ICE restart → register the new ufrag (the old selectedPair keeps
     //    working during the drain period; its rinfo entry stays valid). ──
     iceAgent.on('restart', function(info) {
-      if (info && info.ufrag) {
-        if (currentUfrag && byUfrag[currentUfrag] === iceAgent) {
-          delete byUfrag[currentUfrag];
-        }
-        currentUfrag = info.ufrag;
-        byUfrag[info.ufrag] = iceAgent;
-      }
+      if (info && info.ufrag) adoptUfrag(info.ufrag);
     });
 
-    // ── Agent closed → remove from all tables ──
+    // ── Local credentials replaced via setLocalParameters ──
+    // The SDP layer may call restart() and then immediately override the
+    // agent-generated creds with its own (state-owned) ufrag/pwd. Binding
+    // requests arrive with THAT ufrag — index by it, not by the transient
+    // one from the 'restart' event.
+    iceAgent.on('localparameters', function(params) {
+      if (params && params.ufrag) adoptUfrag(params.ufrag);
+    });
+
+    // ── Agent terminal states ──
+    // 'failed' is recoverable via restart() (the library keeps the agent
+    // functional and restart-from-failed is the conventional path out), so
+    // we only purge the now-stale 5-tuple fast-path entries and KEEP the
+    // ufrag registration — the post-restart Binding Requests must still
+    // find this agent. Full deregistration happens only on 'closed'.
     iceAgent.on('statechange', function(newState) {
-      if (newState !== 'closed' && newState !== 'failed') return;
+      if (newState === 'failed') {
+        for (const k in byRinfo) {
+          if (byRinfo[k] === iceAgent) delete byRinfo[k];
+        }
+        return;
+      }
+      if (newState !== 'closed') return;
 
       const idx = agents.indexOf(iceAgent);
       if (idx >= 0) agents.splice(idx, 1);

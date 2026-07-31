@@ -212,7 +212,14 @@ function applyRemoteDescription(state, parsed) {
   state.remoteTransportCcExtId = null;
   state.remoteRidExtId         = null;
   state.remoteRepairedRidExtId = null;
+  state.remoteAudioLevelExtId  = null;
+  var AUDIO_LEVEL_URI = 'urn:ietf:params:rtp-hdrext:ssrc-audio-level';
+
   function _latchExtId(uri, id, msMid) {
+    if (uri === AUDIO_LEVEL_URI) {
+      if (state.remoteAudioLevelExtId == null) state.remoteAudioLevelExtId = id;
+      return;
+    }
     if (uri === TCC_URI) {
       if (state.remoteTransportCcExtId == null) state.remoteTransportCcExtId = id;
       else if (state.remoteTransportCcExtId !== id && typeof console !== 'undefined' && console.warn) {

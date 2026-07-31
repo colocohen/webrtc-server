@@ -68,6 +68,10 @@ function buildMediaForTransceiver(state, t) {
         channels:    c.channels,
         fmtp:        c.fmtp,
         feedback:    c.feedback,
+        // RED (RFC 2198): offered alongside opus at PT 63, mirroring
+        // Chrome's default audio offer. The answer side attaches this
+        // from the remote offer instead (extractCodecs pass 2b).
+        redPayloadType: (c.name === 'opus') ? 63 : undefined,
       };
     });
   } else {
@@ -79,6 +83,11 @@ function buildMediaForTransceiver(state, t) {
         fmtp:           c.fmtp,
         feedback:       c.feedback,
         rtxPayloadType: c.rtx ? (97 + idx * 2) : undefined,
+        // FlexFEC (flexfec-03): offered once per video m-section, on the
+        // first codec entry, at PT 118 (outside the 96..10x primary/rtx
+        // range). Send path lives in media_transport.sendRtp; receive
+        // path in _handleIncomingRtpInner.
+        flexfecPayloadType: (idx === 0) ? 118 : undefined,
       };
     });
   }
@@ -333,15 +342,30 @@ function buildOffer(state, options) {
     }
   }
 
+  // RFC 3264 §8: bump o= session version on every generated description.
+  // Counter lives on state so it survives renegotiations; starts at 2
+  // (Chrome's visual convention) and increments monotonically.
+  state.localSdpVersion = (state.localSdpVersion || 1) + 1;
+
   return SDP.createOffer({
     sessionId:       state.localSessionId,
+    sessionVersion:  state.localSdpVersion,
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
     dtls:            { fingerprint: state.localFingerprint, setup: options.setup },
     media:           mediaSections,
     cname:           state.localCname,
     mode:            state.mode,
     candidates:      options.liteCandidates,
-    endOfCandidates: (state.mode === 'lite'),
+    // Lite: all candidates known at build time — always terminal.
+    // Full: terminal only when the current gathering phase has actually
+    // completed AND produced the roster we're embedding (JSEP §5.2.2).
+    // The roster-length guard keeps a post-ICE-restart offer (stale
+    // iceGatheringState 'complete', roster just reset) from claiming
+    // end-of-candidates over an empty list.
+    endOfCandidates: (state.mode === 'lite') ||
+                     (state.iceGatheringState === 'complete' &&
+                      !!(state.localGatheredCandidates &&
+                         state.localGatheredCandidates.length > 0)),
   });
 }
 
@@ -397,14 +421,29 @@ function buildAnswer(state, options) {
     }
   }
 
+  // RFC 3264 §8 — same counter as buildOffer.
+  state.localSdpVersion = (state.localSdpVersion || 1) + 1;
+
   return SDP.createAnswer(state.parsedRemoteSdp, {
+    // JSEP §5.3.2: across subsequent answers "the fields of the o= line
+    // MUST stay the same" except <session-version>. Without threading the
+    // PC's stable session id here, sdp.js's createAnswer fell back to
+    // String(Date.now()) — a FRESH sess-id on every generated answer,
+    // changing the o= identity mid-session (and disagreeing with the
+    // sess-id our own offers use via buildOffer).
+    sessionId:       state.localSessionId,
+    sessionVersion: state.localSdpVersion,
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
     dtls:            { fingerprint: state.localFingerprint, setup: options.setup },
     ssrcs:           ssrcs,
     directions:      directions,
     cname:           state.localCname,
     candidates:      options.liteCandidates,
-    endOfCandidates: (state.mode === 'lite'),
+    // Same rule as buildOffer — see comment there.
+    endOfCandidates: (state.mode === 'lite') ||
+                     (state.iceGatheringState === 'complete' &&
+                      !!(state.localGatheredCandidates &&
+                         state.localGatheredCandidates.length > 0)),
     mode:            state.mode,
   });
 }

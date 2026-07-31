@@ -67,6 +67,9 @@ function computeAnswerDirection(offerDir, hasLocalSsrc, userPreferredDir) {
 // Default codecs we support (can be overridden)
 var DEFAULT_AUDIO_CODECS = [
   { name: 'opus', clockRate: 48000, channels: 2, fmtp: { minptime: 10, useinbandfec: 1 }, feedback: ['transport-cc'] },
+  // DTMF (RFC 4733). Clock matches opus (48k) like Chrome's offer; the
+  // fmtp bare token advertises tone events 0-15.
+  { name: 'telephone-event', clockRate: 48000, channels: 1, fmtp: { '0-15': true }, feedback: [] },
 ];
 
 // Feedback order matches Chrome 147 output for visual parity in dumps.
@@ -76,6 +79,10 @@ var DEFAULT_VIDEO_CODECS = [
   { name: 'VP9',  clockRate: 90000, feedback: ['goog-remb', 'transport-cc', 'ccm fir', 'nack', 'nack pli'], rtx: true },
   { name: 'H264', clockRate: 90000, feedback: ['goog-remb', 'transport-cc', 'ccm fir', 'nack', 'nack pli'], rtx: true,
     fmtp: { 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1, 'packetization-mode': 1 } },
+  // H.265/HEVC (RFC 7798). Safari negotiates it natively; Chrome behind
+  // a flag. rtp-packet ships H265Packetizer/Depacketizer; the pipeline
+  // wires them via VIDEO_CODECS.H265.
+  { name: 'H265', clockRate: 90000, feedback: ['goog-remb', 'transport-cc', 'ccm fir', 'nack', 'nack pli'], rtx: true },
 ];
 
 /* ========================= Default header extensions =========================
@@ -249,6 +256,39 @@ function extractCodecs(media) {
         break;
       }
     }
+  }
+
+  // Pass 2b: RED association (RFC 2198, audio). Chrome offers
+  // `a=rtpmap:63 red/48000/2` + `a=fmtp:63 111/111` — the fmtp names the
+  // wrapped primary PT (possibly twice, for 2-level redundancy). Attach
+  // redPayloadType to that primary so the answer echoes it and the
+  // pipeline can wrap/unwrap.
+  for (var p3 = 0; p3 < payloads.length; p3++) {
+    var pt3 = payloads[p3];
+    var rtp3 = rtpMap[pt3];
+    if (!rtp3 || rtp3.codec.toLowerCase() !== 'red') continue;
+    var redCfg = fmtpMap[pt3] || '';
+    var innerPt = parseInt(String(redCfg).split('/')[0], 10);
+    for (var c3 = 0; c3 < codecs.length; c3++) {
+      if ((!isNaN(innerPt) && codecs[c3].payloadType === innerPt) ||
+          (isNaN(innerPt) && codecs[c3].name.toLowerCase() === 'opus')) {
+        codecs[c3].redPayloadType = pt3;
+        break;
+      }
+    }
+  }
+
+  // Pass 2c: FlexFEC association (flexfec-03, video). Chrome offers
+  // `a=rtpmap:N flexfec-03/90000` + `a=fmtp:N repair-window=10000000`.
+  // Unlike RTX/RED there's no per-codec fmtp link — flexfec protects the
+  // whole video stream (SSRC pairing rides in a=ssrc-group:FEC-FR).
+  // Attach the PT to the FIRST video primary so negotiation carries it.
+  for (var p4 = 0; p4 < payloads.length; p4++) {
+    var pt4 = payloads[p4];
+    var rtp4 = rtpMap[pt4];
+    if (!rtp4 || rtp4.codec.toLowerCase() !== 'flexfec-03') continue;
+    if (codecs.length > 0) codecs[0].flexfecPayloadType = pt4;
+    break;
   }
 
   return codecs;
@@ -576,6 +616,8 @@ function negotiateCodecs(remoteCodecs, localCodecs) {
         fmtp: remote.fmtp || local.fmtp || {},
         feedback: intersectFeedback(remote.feedback, local.feedback),
         rtxPayloadType: remote.rtxPayloadType,
+        redPayloadType: remote.redPayloadType,
+        flexfecPayloadType: remote.flexfecPayloadType,
       });
       break;
     }
@@ -622,7 +664,11 @@ function createAnswer(parsedOffer, config) {
     origin: {
       username: '-',
       sessionId: sessionId,
-      sessionVersion: 2,  // Chrome convention (JSEP)
+      // RFC 3264 §8: o= version MUST increment on every session
+      // modification. Caller threads the current value via
+      // config.sessionVersion (cm.js state counter); first offer starts
+      // at 2 to match Chrome's visual convention.
+      sessionVersion: (config && config.sessionVersion) || 2,
       netType: 'IN',
       ipVer: 4,
       address: '127.0.0.1',
@@ -643,17 +689,8 @@ function createAnswer(parsedOffer, config) {
     sdpObj.icelite = 'ice-lite';
   }
 
-  // BUNDLE: mirror offer's BUNDLE groups
-  if (parsedOffer.bundleGroups.length > 0) {
-    for (var g = 0; g < parsedOffer.bundleGroups.length; g++) {
-      sdpObj.groups.push({
-        type: 'BUNDLE',
-        mids: parsedOffer.bundleGroups[g].join(' '),
-      });
-    }
-  }
-
-  // Build media sections
+  // Build media sections FIRST — the BUNDLE grouping below must exclude
+  // any m-section we rejected during answer construction.
   for (var i = 0; i < parsedOffer.media.length; i++) {
     var offer = parsedOffer.media[i];
     var mediaObj = buildAnswerMedia(offer, {
@@ -679,6 +716,32 @@ function createAnswer(parsedOffer, config) {
       endOfCandidates: !!config.endOfCandidates,
     });
     sdpObj.media.push(mediaObj);
+  }
+
+  // BUNDLE: mirror the offer's BUNDLE groups, minus any m-section this
+  // answer rejects. RFC 8843 §7.3.3: a rejected bundled "m=" section
+  // "MUST NOT" have its identification-tag placed in the answer's
+  // 'group:BUNDLE' list. Previously the offer's groups were copied
+  // verbatim BEFORE the media loop, so a rejected mid (e.g. audio with
+  // no common codec) stayed in the group and strict peers failed the
+  // whole answer over the inconsistency.
+  if (parsedOffer.bundleGroups.length > 0) {
+    var aliveMids = {};
+    for (var am = 0; am < sdpObj.media.length; am++) {
+      if (sdpObj.media[am].port !== 0) {
+        aliveMids[String(sdpObj.media[am].mid)] = true;
+      }
+    }
+    for (var g = 0; g < parsedOffer.bundleGroups.length; g++) {
+      var keptMids = [];
+      for (var km = 0; km < parsedOffer.bundleGroups[g].length; km++) {
+        var candMid = String(parsedOffer.bundleGroups[g][km]);
+        if (aliveMids[candMid]) keptMids.push(candMid);
+      }
+      if (keptMids.length > 0) {
+        sdpObj.groups.push({ type: 'BUNDLE', mids: keptMids.join(' ') });
+      }
+    }
   }
 
   return sdpTransform.write(sdpObj);
@@ -812,6 +875,42 @@ function buildAnswerMedia(offerMedia, config) {
   var localCodecs = (offerMedia.type === 'audio') ? config.localAudioCodecs : config.localVideoCodecs;
   var negotiated = negotiateCodecs(offerMedia.codecs, localCodecs);
 
+  // RFC 3264 §6: when codec negotiation yields nothing in common, the
+  // stream MUST be rejected by setting the port to zero — never answered
+  // "live" with an empty format list. A live m-line without a single
+  // a=rtpmap is malformed; strict peers reject the entire session
+  // description over it (SIPSorcery: "Set remote description failed
+  // AudioIncompatible"), and with BUNDLE that collateral kills every
+  // other m-section too. The rejected m= line still mirrors the offer's
+  // payload list (RFC 3264 requires at least one format on the line).
+  // createAnswer() excludes rejected mids from the answer's BUNDLE group
+  // per RFC 8843 §7.3.3.
+  //
+  // Spec caveat, documented deliberately: RFC 8843 §7.3.3 says the
+  // offerer-TAGGED section (first mid in the group) "cannot" be rejected
+  // this way — the sanctioned alternatives are rejecting the whole offer
+  // or rejecting every bundled section, both strictly worse (they kill
+  // the data channel that CAN work). Mainstream stacks accept a rejected
+  // tagged section with the group re-tagged to the next mid, so that is
+  // what we produce.
+  if (negotiated.length === 0) {
+    var noCodecFmts = [];
+    var offCodecs = offerMedia.codecs || [];
+    for (var nc = 0; nc < offCodecs.length; nc++) {
+      noCodecFmts.push(offCodecs[nc].payloadType);
+      if (offCodecs[nc].rtxPayloadType != null) noCodecFmts.push(offCodecs[nc].rtxPayloadType);
+    }
+    return {
+      type: offerMedia.type,
+      port: 0,
+      protocol: offerMedia.protocol,
+      payloads: noCodecFmts.length > 0 ? noCodecFmts.join(' ') : '0',
+      connection: { version: 4, ip: '0.0.0.0' },
+      mid: offerMedia.mid,
+      direction: 'inactive',
+    };
+  }
+
   // Build rtp, fmtp, rtcpFb, payloads
   var rtp = [];
   var fmtp = [];
@@ -856,6 +955,38 @@ function buildAnswerMedia(offerMedia, config) {
       fmtp.push({
         payload: codec.rtxPayloadType,
         config: 'apt=' + codec.payloadType,
+      });
+    }
+
+    // RED (RFC 2198, audio) — rtpmap red/<rate>/<ch> + fmtp "<pt>/<pt>"
+    // naming the wrapped primary, matching Chrome's shape exactly.
+    if (codec.redPayloadType) {
+      payloadList.push(codec.redPayloadType);
+      rtp.push({
+        payload: codec.redPayloadType,
+        codec: 'red',
+        rate: codec.clockRate,
+        encoding: codec.channels || undefined,
+      });
+      fmtp.push({
+        payload: codec.redPayloadType,
+        config: codec.payloadType + '/' + codec.payloadType,
+      });
+    }
+
+    // FlexFEC (flexfec-03, video) — answered only when the peer offered
+    // it (flexfecPayloadType is only ever attached from a remote offer;
+    // our defaults don't set it). repair-window mirrors Chrome.
+    if (codec.flexfecPayloadType) {
+      payloadList.push(codec.flexfecPayloadType);
+      rtp.push({
+        payload: codec.flexfecPayloadType,
+        codec: 'flexfec-03',
+        rate: 90000,
+      });
+      fmtp.push({
+        payload: codec.flexfecPayloadType,
+        config: 'repair-window=10000000',
       });
     }
   }
@@ -916,7 +1047,12 @@ function buildAnswerMedia(offerMedia, config) {
       if (negotiated[rti].rtxPayloadType) { rtxNegotiated = true; break; }
     }
 
-    function _emitLayerSsrcsA(primary, rtx) {
+    var flexfecNegotiatedA = false;
+    for (var ffa = 0; ffa < negotiated.length; ffa++) {
+      if (negotiated[ffa].flexfecPayloadType) { flexfecNegotiatedA = true; break; }
+    }
+
+    function _emitLayerSsrcsA(primary, rtx, fec) {
       if (primary == null) return;
       m.ssrcs.push({ id: primary, attribute: 'cname', value: cname });
       if (ssrc.msid) {
@@ -929,6 +1065,16 @@ function buildAnswerMedia(offerMedia, config) {
         }
         m.ssrcGroups.push({ semantics: 'FID', ssrcs: primary + ' ' + rtx });
       }
+      // FlexFEC pairing (RFC 8627 §5 / flexfec-03): declare the FEC SSRC
+      // and bind it to the media SSRC. Gated like RTX — only when a
+      // flexfec PT was actually negotiated in this m-section.
+      if (fec != null && flexfecNegotiatedA) {
+        m.ssrcs.push({ id: fec, attribute: 'cname', value: cname });
+        if (ssrc.msid) {
+          m.ssrcs.push({ id: fec, attribute: 'msid', value: ssrc.msid });
+        }
+        m.ssrcGroups.push({ semantics: 'FEC-FR', ssrcs: primary + ' ' + fec });
+      }
     }
 
     var ansLayers = (ssrc.layers && ssrc.layers.length)
@@ -936,7 +1082,8 @@ function buildAnswerMedia(offerMedia, config) {
                     : [{ rid: null, ssrc: ssrc.id, rtxSsrc: ssrc.rtxId }];
 
     for (var ali = 0; ali < ansLayers.length; ali++) {
-      _emitLayerSsrcsA(ansLayers[ali].ssrc, ansLayers[ali].rtxSsrc);
+      _emitLayerSsrcsA(ansLayers[ali].ssrc, ansLayers[ali].rtxSsrc,
+                       (ali === 0) ? (ansLayers[ali].fecSsrc || ssrc.fecId) : null);
     }
 
     var ansRids = [];
@@ -1020,7 +1167,7 @@ function createOffer(config) {
     origin: {
       username: '-',
       sessionId: sessionId,
-      sessionVersion: 2,  // Chrome uses 2 (JSEP convention). Version '1' worked but diverged visually.
+      sessionVersion: (config && config.sessionVersion) || 2,  // RFC 3264 §8 — see createOffer note
       netType: 'IN',
       ipVer: 4,
       address: '127.0.0.1',
@@ -1198,9 +1345,13 @@ function createOffer(config) {
         for (var rti = 0; rti < codecs.length; rti++) {
           if (codecs[rti].rtxPayloadType) { rtxNegotiated = true; break; }
         }
+        var flexfecNegotiated = false;
+        for (var ffi = 0; ffi < codecs.length; ffi++) {
+          if (codecs[ffi].flexfecPayloadType) { flexfecNegotiated = true; break; }
+        }
 
-        // Helper to emit one layer's SSRCs (primary + optional RTX).
-        function _emitLayerSsrcs(primary, rtx) {
+        // Helper to emit one layer's SSRCs (primary + optional RTX + FEC).
+        function _emitLayerSsrcs(primary, rtx, fec) {
           if (primary == null) return;
           m.ssrcs.push({ id: primary, attribute: 'cname', value: cname });
           if (spec.ssrc.msid) {
@@ -1213,6 +1364,14 @@ function createOffer(config) {
             }
             // FID (RFC 4588 §4) pairs the primary SSRC with its RTX SSRC
             m.ssrcGroups.push({ semantics: 'FID', ssrcs: primary + ' ' + rtx });
+          }
+          // FEC-FR (flexfec-03) — same gating as FID, see the RTX comment.
+          if (fec != null && flexfecNegotiated) {
+            m.ssrcs.push({ id: fec, attribute: 'cname', value: cname });
+            if (spec.ssrc.msid) {
+              m.ssrcs.push({ id: fec, attribute: 'msid', value: spec.ssrc.msid });
+            }
+            m.ssrcGroups.push({ semantics: 'FEC-FR', ssrcs: primary + ' ' + fec });
           }
         }
 
@@ -1227,7 +1386,8 @@ function createOffer(config) {
                      : [{ rid: null, ssrc: spec.ssrc.id, rtxSsrc: spec.ssrc.rtxId }];
 
         for (var li = 0; li < layers.length; li++) {
-          _emitLayerSsrcs(layers[li].ssrc, layers[li].rtxSsrc);
+          _emitLayerSsrcs(layers[li].ssrc, layers[li].rtxSsrc,
+                          (li === 0) ? (layers[li].fecSsrc || spec.ssrc.fecId) : null);
         }
 
         // RID + simulcast attributes (only when there are actually multiple
@@ -1283,6 +1443,24 @@ function addCandidate(sdpString, candidate, mid) {
     var m = raw.media[i];
     if (String(m.mid) === String(mid)) {
       if (!m.candidates) m.candidates = [];
+      // Idempotence: a candidate is identified by its transport address
+      // (RFC 8839 §5.1 — foundation/component/transport/address/port).
+      // Re-adding an existing one returns the SDP unchanged, so callers
+      // may apply a full gathered-candidate roster at any time (JSEP
+      // §4.1.13/14 view maintenance) without producing duplicate lines —
+      // the caller detects the no-op via string identity, exactly like
+      // the mid-not-found path below.
+      for (var d = 0; d < m.candidates.length; d++) {
+        var ex = m.candidates[d];
+        if (ex.foundation === candidate.foundation &&
+            (ex.component || 1) === (candidate.component || 1) &&
+            ex.transport === candidate.protocol &&
+            ex.ip === candidate.ip &&
+            ex.port === candidate.port &&
+            ex.type === candidate.type) {
+          return sdpString;
+        }
+      }
       m.candidates.push({
         foundation: candidate.foundation,
         component: candidate.component || 1,
@@ -1310,6 +1488,77 @@ function addCandidate(sdpString, candidate, mid) {
     console.warn('[sdp] addCandidate: mid="' + mid + '" not found in SDP; candidate dropped');
   }
   return sdpString;
+}
+
+// Pick the "default candidate" for the m=/c= lines. RFC 8839 §4.2.1.2:
+// the default SHOULD be the candidate most likely to be reachable by an
+// arbitrary peer — relayed if present, else server-reflexive, else host.
+// Within a type class, highest ICE priority wins. Component 1 only (we
+// always negotiate rtcp-mux, so component 2 never exists). UDP preferred;
+// TCP-only rosters fall back to the best TCP candidate.
+var _DEFAULT_CAND_TYPE_RANK = { relay: 3, srflx: 2, host: 1, prflx: 0 };
+
+function selectDefaultCandidate(candidates) {
+  if (!candidates || !candidates.length) return null;
+  var best = null;
+  var bestUdp = false;
+  var bestRank = -1;
+  var bestPrio = -1;
+  for (var i = 0; i < candidates.length; i++) {
+    var c = candidates[i];
+    if (!c || c.ip == null || c.port == null) continue;
+    if ((c.component || 1) !== 1) continue;
+    var isUdp = String(c.protocol || '').toLowerCase() === 'udp';
+    var rank  = _DEFAULT_CAND_TYPE_RANK[c.type] != null
+                ? _DEFAULT_CAND_TYPE_RANK[c.type] : 0;
+    var prio  = c.priority || 0;
+    // Ordering: UDP beats TCP, then type rank, then priority.
+    if (best === null ||
+        (isUdp && !bestUdp) ||
+        (isUdp === bestUdp && rank > bestRank) ||
+        (isUdp === bestUdp && rank === bestRank && prio > bestPrio)) {
+      best = c; bestUdp = isUdp; bestRank = rank; bestPrio = prio;
+    }
+  }
+  return best;
+}
+
+// Finalize a local SDP once ICE gathering has completed (full-ICE /
+// non-trickle consumers — WHIP/WHEP, one-shot HTTP signaling):
+//   1. a=end-of-candidates (RFC 8838 §8.2 / RFC 8840) on every m-section
+//      that carries a=candidate lines. JSEP §5.2.2: sections bundled into
+//      another section omit both candidates and end-of-candidates, which
+//      falls out naturally — only the BUNDLE-tagged section has candidates.
+//   2. m= port and c= address promoted from placeholder (9 / 0.0.0.0) to
+//      the default candidate (JSEP §5.2.2 + RFC 8839 §4.2.1.2). The
+//      a=rtcp line, when present, is aligned too (rtcp-mux ⇒ same port,
+//      RFC 5761 §5.1.3).
+// Idempotent: re-running on an already-finalized SDP is a no-op. Rejected
+// (port=0) m-sections are never touched (RFC 3264 §6).
+function finalizeCandidates(sdpString, gatheredCandidates) {
+  var raw = sdpTransform.parse(sdpString);
+  var def = selectDefaultCandidate(gatheredCandidates);
+  var ipVer = (def && String(def.ip).indexOf(':') >= 0) ? 6 : 4;
+
+  for (var i = 0; i < raw.media.length; i++) {
+    var m = raw.media[i];
+    if (m.port === 0) continue;   // rejected slot — must stay untouched
+
+    if (m.candidates && m.candidates.length > 0 && !m.endOfCandidates) {
+      m.endOfCandidates = 'end-of-candidates';
+    }
+
+    if (def) {
+      m.port = def.port;
+      m.connection = { version: ipVer, ip: def.ip };
+      if (m.rtcp) {
+        m.rtcp.port    = def.port;
+        m.rtcp.ipVer   = ipVer;
+        m.rtcp.address = def.ip;
+      }
+    }
+  }
+  return sdpTransform.write(raw);
 }
 
 // Parse a candidate string "candidate:..." → object
@@ -1592,6 +1841,7 @@ export {
 
   // Build
   createOffer, createAnswer, addCandidate, buildCandidateString,
+  selectDefaultCandidate, finalizeCandidates,
 
   // Negotiation
   negotiateCodecs,
