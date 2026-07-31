@@ -66,6 +66,20 @@ function derInteger(value) {
   }
   // Buffer
   var buf = Buffer.from(value);
+  // DER minimal-integer rule (X.690 §8.3.2): the leading 0x00 octet is
+  // permitted ONLY when the following octet has its high bit set (it
+  // exists purely to keep the value positive). Random serials that roll
+  // a leading zero (e.g. randomBytes()[0] of 0x00 or 0x80 after the
+  // positivity mask) previously produced 02 10 00 <low-bit-byte> ... —
+  // an illegal non-minimal encoding that strict parsers (OpenSSL 3 /
+  // Node's X509Certificate) reject, so ~1-in-256 generated certificates
+  // crashed DTLS session construction at startup. Strip redundant
+  // leading zeros first; then apply the positivity pad as before.
+  var start = 0;
+  while (start < buf.length - 1 && buf[start] === 0x00 && (buf[start + 1] & 0x80) === 0) {
+    start++;
+  }
+  if (start > 0) buf = buf.subarray(start);
   if (buf[0] >= 0x80) buf = Buffer.concat([Buffer.from([0]), buf]);
   return derWrap(0x02, buf);
 }
