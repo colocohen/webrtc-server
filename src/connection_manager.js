@@ -1141,11 +1141,22 @@ function ConnectionManager(config) {
       }
     }
 
-    // 6. SCTP: DTLS connected + DataChannel needed → start association.
+    // 6. SCTP: DTLS connected + DataChannel NEGOTIATED → start association.
     //    Trigger: dtlsState → 'connected'. The cascade marks 'connecting'
     //    immediately for visibility; dcController.start() will transition
     //    the state to 'connected' when the SCTP handshake completes.
-    if (state.dtlsState === 'connected' && state.sctpState === 'new') {
+    //
+    //    The negotiation gate (remoteSctpPort != null, i.e. the remote
+    //    description carried an accepted m=application with a=sctp-port)
+    //    is essential: an SCTP association only exists when the SDP
+    //    negotiated one (RFC 8841 — the association is described BY the
+    //    m=application section; libwebrtc likewise brings up its SCTP
+    //    transport only for a negotiated data section). Media-only
+    //    sessions previously fired an INIT into the DTLS anyway; lenient
+    //    peers ignored it, but strict ones (libdatachannel) answer with
+    //    a fatal alert and tear the whole connection down post-connect.
+    if (state.dtlsState === 'connected' && state.sctpState === 'new' &&
+        state.remoteSctpPort != null) {
       state.sctpState = 'connecting';
       dcController.start({
         dtlsRole:       state.dtlsRole,
@@ -1451,8 +1462,11 @@ function ConnectionManager(config) {
       // If SCTP isn't up yet, kick it. The dcController.start() call here
       // is rare — usually the setState cascade in onDtlsConnected has
       // already started it. This is a defensive fallback in case data
-      // races ahead of the cascade.
-      if (!dcController.sctpAssociation) {
+      // races ahead of the cascade. Same negotiation gate as cascade 6:
+      // without a negotiated m=application there is no association to
+      // kick — and inbound DTLS application data in that state is not
+      // SCTP traffic for us to answer.
+      if (!dcController.sctpAssociation && state.remoteSctpPort != null) {
         dcController.start({
           dtlsRole:       state.dtlsRole,
           localPort:      state.sctpPort,
