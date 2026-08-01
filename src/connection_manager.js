@@ -155,6 +155,36 @@ function ConnectionManager(config) {
     ? config.mode
     : ((config.socket || config.socket6) ? 'lite' : 'full');
 
+  // ── mDNS candidates ('auto' from the resolved mode) ──
+  // Browsers conceal host candidates behind ".local" names
+  // (draft-ietf-mmusic-mdns-ice-candidates), so:
+  //   full  (browser-like client, likely on the peer's LAN)  → resolve
+  //          inbound ".local" candidates, like a browser would.
+  //   lite  (router/socket = cloud server)                   → off. A lite
+  //          agent never initiates checks — it learns peer addresses from
+  //          inbound check sources — and cloud hosts can't reach the LAN's
+  //          multicast group anyway.
+  // Explicit config.mdns (false / true / options object) always wins;
+  // it is forwarded to IceAgent verbatim. register is never auto-enabled.
+  var resolvedMdns = (config.mdns !== undefined)
+    ? config.mdns
+    : (resolvedMode === 'full');
+
+  // ── Port-mapping assisted gathering ('auto' from the resolved mode) ──
+  // full mode = a P2P client application — the same category where
+  // qBittorrent / Transmission / Syncthing enable UPnP/NAT-PMP by default,
+  // and where the mapping often beats STUN srflx outright (a forwarding
+  // rule works behind symmetric NAT; a reflexive mapping does not). The
+  // mapped port leads only to the ICE socket, which drops anything that
+  // is not credentialed STUN or session DTLS — exposure is equivalent to
+  // what srflx already implies. lite (cloud server) → off: public address,
+  // no home gateway to ask. Explicit config.portMapping always wins
+  // (false disables; an options object customizes and is forwarded
+  // verbatim — e.g. { description: 'MyApp' } for the router UI).
+  var resolvedPortMapping = (config.portMapping !== undefined)
+    ? config.portMapping
+    : (resolvedMode === 'full');
+
   /* ====================== State ====================== */
 
   var state = {
@@ -629,6 +659,11 @@ function ConnectionManager(config) {
       includeLoopback:    config.includeLoopback || false,
       controlling:        controlling,
       trickle:            true,
+      // mDNS ".local" candidates (draft-ietf-mmusic-mdns-ice-candidates).
+      // Resolved above from config.mdns / the ICE mode ('auto').
+      mdns:               resolvedMdns,
+      // UPnP/NAT-PMP/PCP assisted gathering. Resolved above ('auto').
+      portMapping:        resolvedPortMapping,
       // External socket mode (shared UDP port — server scenario).
       socket:             config.socket  || null,
       socket6:            config.socket6 || null,
@@ -744,14 +779,14 @@ function ConnectionManager(config) {
     // RTCPeerConnectionIceErrorEvent.
     iceAgent.on('candidateerror', function(err) {
       if (state.closed) return;
-      // err shape: { type: 'srflx'|'relay', server, error }
+      // err shape: { type: 'srflx'|'relay'|'mdns', server, address?, error }
       // Normalize to spec shape: { address, errorCode, errorText, port, url }
       var e = err || {};
       ev.emit('icecandidateerror', {
         url:       e.server || null,
         errorText: (e.error && (e.error.message || String(e.error))) || 'gather failed',
-        errorCode: (e.error && e.error.code) || 0,
-        address:   null,
+        errorCode: (e.error && typeof e.error.code === 'number') ? e.error.code : 0,
+        address:   e.address || null,
         port:      null,
       });
     });
