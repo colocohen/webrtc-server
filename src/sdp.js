@@ -423,11 +423,17 @@ function extractCandidates(media) {
     cands.push({
       foundation: String(c.foundation),
       component: c.component,
-      protocol: c.transport,
+      // Token fields are case-insensitive on the wire (RFC 8839's ABNF
+      // literal is even spelled "UDP", RFC 5234 §2.3 makes literals
+      // case-insensitive, and libdatachannel ships the uppercase form).
+      // Everything downstream — pair formation in the ICE agent included —
+      // compares against our canonical lowercase, so normalize at this
+      // parse boundary exactly like parseCandidate() above already does.
+      protocol: String(c.transport || '').toLowerCase(),
       priority: c.priority,
       ip: c.ip,
       port: c.port,
-      type: c.type,
+      type: String(c.type || '').toLowerCase(),
       relatedAddress: c.raddr || null,
       relatedPort: c.rport || null,
       tcpType: c.tcptype || null,
