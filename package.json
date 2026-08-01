@@ -1,6 +1,6 @@
 {
   "name": "webrtc-server",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Complete WebRTC stack for Node.js servers with browser-compatible API.",
   "type": "module",
   "main": "index.js",

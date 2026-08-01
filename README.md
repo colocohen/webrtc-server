@@ -53,6 +53,7 @@ Build SFUs, MCUs, recording servers, WHIP/WHEP endpoints, SIP gateways, conferen
 - **W3C WebRTC API** — `RTCPeerConnection`, `RTCRtpSender`/`Receiver`/`Transceiver`, `RTCDataChannel`, `RTCDtlsTransport`, `RTCIceTransport`, `RTCSctpTransport`, `RTCCertificate`, `RTCDTMFSender`
 - **Full media stack** — VP8, VP9, H.264, H.265, AV1 video; Opus audio; with packetization, jitter buffer, and a three-layer loss-recovery stack (NACK/RTX + RED + FlexFEC)
 - **ICE** — full and lite modes, trickle ICE, ICE restart, host/srflx/relay candidates
+- **NAT traversal beyond the browser** — resolves browsers' mDNS `.local` candidates (draft-ietf-mmusic-mdns-ice-candidates) and gathers gateway-assisted candidates via UPnP-IGD/NAT-PMP/PCP — direct P2P connections that a browser alone can't make, often with no STUN/TURN at all
 - **DTLS-SRTP** — AEAD AES-128-GCM and AES-256-GCM (RFC 7714) with AES-128-CM fallback; full handshake with certificate generation and reuse; keys derived via the RFC 5764 DTLS exporter
 - **Loss resilience** — NACK/RTX retransmission, RED redundant audio (RFC 2198), and FlexFEC forward error correction (flexfec-03), all negotiated and wired automatically
 - **DataChannel** — SCTP over DTLS, ordered/unordered, reliable/unreliable, full DCEP (RFC 8832)
@@ -200,6 +201,8 @@ const pc = new RTCPeerConnection({
   socket6: existingIpv6Socket,
   announcedAddresses: ['1.2.3.4'],  // public IPs to advertise as host candidates
   mode: 'lite',                     // ICE mode — see below
+  mdns: true,                       // resolve .local candidates — auto by mode, see below
+  portMapping: { description: 'MyApp' },  // gateway-assisted gathering — auto by mode
   cert: pemString, key: pemString,  // raw cert/key (alternative to certificates)
 });
 ```
@@ -399,6 +402,61 @@ webrtc-server picks the right mode automatically based on configuration:
 
 You can override by passing `mode` explicitly.
 
+## NAT traversal that tries harder than a browser
+
+A browser has exactly three ways to reach a peer: host, STUN srflx, TURN
+relay. webrtc-server ships two more capabilities — enabled automatically
+where they make sense — that frequently turn "relay or fail" into a direct
+connection:
+
+**mDNS candidate resolution.** Every modern browser conceals its LAN
+addresses behind `.local` names (draft-ietf-mmusic-mdns-ice-candidates).
+A Node peer that can't resolve them silently loses every direct LAN path —
+same-office calls end up crossing the internet through a relay.
+webrtc-server resolves them like a browser would (with the draft's safety
+rules: UUID-only names, single-IP rule), and a client can also conceal its
+*own* addresses with `mdns: { register: true }`.
+
+**Port-mapping assisted gathering.** For full-ICE clients (Electron, CLI,
+IoT — the P2P case), the stack asks the gateway for a UDP forwarding rule
+via UPnP-IGD, NAT-PMP or PCP, and advertises the external address as an
+srflx candidate. Unlike a STUN mapping, a forwarding rule is reachable by
+**any** peer — it keeps working behind symmetric NAT, where classic srflx
+fails and browsers fall back to TURN. It's the same NAT traversal
+qBittorrent and Syncthing enable by default, and it means two home users
+can often connect **directly, with zero servers** in either the media or
+the discovery path. Exposure is no wider than ICE already implies: the
+mapped port leads only to the ICE socket, which drops anything that isn't
+credentialed STUN or the session's DTLS. Mappings carry finite auto-renewed
+leases, are labeled in the router's UI (set `portMapping: { description }`),
+and are removed on close. CGNAT is detected up front and reported via
+`onicecandidateerror` instead of producing useless candidates.
+
+Defaults follow the resolved ICE mode — zero configuration for the common
+cases, explicit config always wins:
+
+| | full (client) | lite (server with `router`/`socket`) |
+|---|---|---|
+| `mdns` (resolve `.local`) | **on** | off |
+| `portMapping` | **on** | off |
+| `mdns: { register }` | opt-in | — |
+
+```js
+// Electron P2P client — everything above just works:
+const pc = new RTCPeerConnection({ iceServers: [...] });
+
+// Opt out, or customize:
+const pc2 = new RTCPeerConnection({ portMapping: false });
+const pc3 = new RTCPeerConnection({
+  mdns: { register: true },                 // conceal our host IPs too
+  portMapping: { description: 'MyApp' },    // what the router UI shows
+});
+```
+
+Both capabilities live in [`turn-server`](https://npmjs.com/package/turn-server)'s
+ICE agent as lazy optional dependencies (`mdns-local`, `port-mapper`) —
+an SFU deployment that never uses them never loads them.
+
 ## Codec support
 
 | Codec | Direction | Notes |
@@ -459,6 +517,7 @@ This produces verbose output and is intended for development; leave it off in pr
 - RFC 4733 — RTP Payload for DTMF Digits
 - RFC 4566 — Session Description Protocol (SDP)
 - RFC 5245 / RFC 8445 — Interactive Connectivity Establishment (ICE)
+- draft-ietf-mmusic-mdns-ice-candidates — mDNS `.local` candidate resolution and concealment (the mechanism browsers ship; never published as an RFC)
 - RFC 5763 / RFC 5764 — DTLS-SRTP key exchange
 - RFC 5761 — Multiplexing RTP and RTCP
 - RFC 6184 — RTP Payload Format for H.264
