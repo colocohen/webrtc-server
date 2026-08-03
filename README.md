@@ -44,6 +44,7 @@ Build SFUs, MCUs, recording servers, WHIP/WHEP endpoints, SIP gateways, conferen
 - [Loss resilience](#loss-resilience)
 - [Use cases](#use-cases)
 - [Debugging](#debugging)
+- [Interoperability](#interoperability)
 - [RFC compliance](#rfc-compliance)
 - [Sponsors](#-sponsors)
 - [License](#-license)
@@ -505,6 +506,37 @@ WEBRTC_DEBUG=1 node server.js
 ```
 
 This produces verbose output and is intended for development; leave it off in production.
+
+## Interoperability
+
+Verified against every implementation in
+[sipsorcery/webrtc-interop](https://github.com/sipsorcery/webrtc-interop),
+in both the client and server roles.
+
+**Peer Connection Test**
+
+| | client | server |
+|---|---|---|
+| pion (Go) | ✔ | ✔ |
+| aiortc (Python) | ✔ | ✔ |
+| libdatachannel (C++) | ✔ | ✔ |
+| SIPSorcery (C#) | ✔ | ✔ |
+| webrtc-rs (Rust) | ✔ | ✔ |
+| werift (TypeScript) | ✔ | ✔ |
+| libwebrtc (Chromium m132) | ✔ | — |
+| GStreamer | ✔ | — |
+| Janus | ✔ | — |
+
+**Data Channel Echo Test**
+
+| | client | server |
+|---|---|---|
+| libdatachannel | ✔ | ✔ |
+| SIPSorcery | ✔ | ✔ |
+| werift | ✔ | ✔ |
+
+Also verified against Chrome directly via the browser test page.
+
 
 ## RFC compliance
 
