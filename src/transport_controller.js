@@ -323,9 +323,16 @@ function applyRemoteDescription(state, parsed) {
     // attribute means assume 65536. Effective send cap is the tighter of
     // local and peer.
     if (m.type === 'application') {
-      var peerMax = m.maxMessageSize != null ? m.maxMessageSize : 65536;
+      // ZERO MEANS NO LIMIT (RFC 8841), which is a different statement
+      // from the attribute being ABSENT (where 65536 is assumed). Both
+      // collapsed to the same substituted 65536 here, so a peer that
+      // explicitly said "send me anything" was capped at 64KB and our
+      // reported sctp.maxMessageSize contradicted what it had asked for.
+      var peerMax = (m.maxMessageSize != null) ? m.maxMessageSize : 65536;
       state.remoteMaxMessageSize = peerMax;
-      state.sendMaxMessageSize   = Math.min(state.maxMessageSize, peerMax);
+      state.sendMaxMessageSize   = (peerMax === 0)
+        ? state.maxMessageSize
+        : Math.min(state.maxMessageSize, peerMax);
     }
   }
 }

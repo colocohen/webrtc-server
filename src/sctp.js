@@ -1230,6 +1230,7 @@ function SctpAssociation(config) {
           // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
           // no CRC recomputation. Packet bytes are byte-identical to the
           // original send (vtag, ports, TSN, payload all unchanged).
+          _sctpDiagPacket(fr.packet, 'retransmit');
           ev.emit('packet', fr.packet);
           sctpStats.fastRetransmits++;
           sctpStats.chunksRetransmitted++;
@@ -2473,6 +2474,7 @@ function SctpAssociation(config) {
       if (bundle.length === 1) {
         // Single chunk — emit its standalone packet untouched (byte-for-
         // byte identical to the non-bundled path; no concat, no CRC redo).
+        _sctpDiagPacket(bundle[0].packet, 'bundle');
         ev.emit('packet', bundle[0].packet);
       } else {
         var parts = new Array(bundle.length + 1);
@@ -2692,6 +2694,56 @@ function SctpAssociation(config) {
     emitOneChunk(chunkType, chunkFlags, chunkBody, vtag);
   }
 
+  /**
+   * Describe an OUTGOING SCTP packet (LEMON_DEBUG=1 / WEBRTC_DEBUG=1).
+   *
+   * A peer that rejects a packet at the DTLS layer with decode_error has
+   * already decrypted it successfully and failed to make sense of what was
+   * inside — so the question is which chunk we sent, not how it was
+   * protected. This walks the packet the way the peer does: every chunk
+   * type, its length, and for DATA the stream, sequence and PPID, which is
+   * what identifies a DCEP control message versus user data.
+   */
+  function _sctpDiagPacket(pkt, where) {
+    try {
+      if (typeof process === 'undefined' || !process.env ||
+          (process.env.LEMON_DEBUG !== '1' && process.env.WEBRTC_DEBUG !== '1')) return;
+      var NAMES = { 0:'DATA', 1:'INIT', 2:'INIT_ACK', 3:'SACK', 4:'HEARTBEAT',
+                    5:'HEARTBEAT_ACK', 6:'ABORT', 7:'SHUTDOWN', 8:'SHUTDOWN_ACK',
+                    9:'ERROR', 10:'COOKIE_ECHO', 11:'COOKIE_ACK', 14:'SHUTDOWN_COMPLETE',
+                    15:'AUTH', 64:'I_DATA', 128:'ASCONF_ACK', 130:'RE_CONFIG',
+                    131:'PAD', 192:'FORWARD_TSN', 193:'ASCONF', 194:'I_FORWARD_TSN' };
+      var PPIDS = { 50:'DCEP', 51:'STRING', 52:'BINARY_PARTIAL', 53:'BINARY',
+                    56:'STRING_PARTIAL', 57:'STRING_EMPTY', 58:'BINARY_EMPTY' };
+      var parts = [];
+      var off = 12;
+      while (off + 4 <= pkt.length) {
+        var ct = pkt[off];
+        var clen = pkt.readUInt16BE(off + 2);
+        if (clen < 4) { parts.push('MALFORMED(len=' + clen + ')'); break; }
+        var desc = (NAMES[ct] || ('type' + ct)) + '(' + clen + ')';
+        if (ct === 0 && off + 16 <= pkt.length) {
+          var tsn = pkt.readUInt32BE(off + 4);
+          var sid = pkt.readUInt16BE(off + 8);
+          var ssn = pkt.readUInt16BE(off + 10);
+          var ppid = pkt.readUInt32BE(off + 12);
+          desc += ' tsn=' + tsn + ' sid=' + sid + ' ssn=' + ssn +
+                  ' ppid=' + ppid + (PPIDS[ppid] ? '/' + PPIDS[ppid] : '') +
+                  ' flags=0x' + pkt[off + 1].toString(16);
+          if (ppid === 50 && off + 17 <= pkt.length) {
+            var dcep = pkt[off + 16];
+            desc += ' dcep=' + (dcep === 3 ? 'OPEN' : dcep === 2 ? 'ACK' : dcep);
+          }
+        }
+        parts.push(desc);
+        var padded = clen + ((clen % 4) ? 4 - (clen % 4) : 0);
+        off += padded;
+      }
+      console.log('[sctp-tx] len=' + pkt.length + ' ' + parts.join(' + ') +
+                  (where ? '  <' + where + '>' : ''));
+    } catch (e) {}
+  }
+
   function emitOneChunk(chunkType, chunkFlags, chunkBody, vtag) {
     var chunkLen = 4 + chunkBody.length;
     var chunkPadded = chunkLen;
@@ -2711,6 +2763,7 @@ function SctpAssociation(config) {
     chunkBody.copy(pkt, 16);
 
     pkt.writeUInt32LE(crc32c(pkt), 8);
+    _sctpDiagPacket(pkt, 'emitOneChunk');
     ev.emit('packet', pkt);
   }
 

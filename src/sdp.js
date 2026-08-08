@@ -539,6 +539,46 @@ function _msidsPerSection(sdpString) {
   return out;
 }
 
+/**
+ * Emit the EXTRA a=fingerprint lines that sdp-transform cannot.
+ *
+ * RFC 8122 / W3C 4.9: a connection configured with several certificates
+ * advertises ALL of their fingerprints, so the peer accepts whichever we
+ * present in the DTLS handshake. sdp-transform's grammar treats
+ * fingerprint as a single-valued field — an array collapses to one line
+ * — so the additional lines are inserted into the written text, right
+ * after the first fingerprint of each media section. Same class of
+ * limitation as multi-msid, handled the same way: at the text level,
+ * in one place, rather than by teaching every caller.
+ */
+function _appendExtraFingerprints(sdpText, fingerprints) {
+  if (!fingerprints || fingerprints.length < 2) return sdpText;
+  var extra = [];
+  for (var i = 1; i < fingerprints.length; i++) {
+    var f = fingerprints[i];
+    // UPPERCASE, like every other fingerprint we write. The first one
+    // goes through the writer's own normalisation and the extras did
+    // not, so an offer carried one line in each case — cosmetic to read,
+    // but RFC 8122 compares hex case-insensitively while plenty of real
+    // parsers (and WPT) match the exact text.
+    if (f && f.value) {
+      extra.push('a=fingerprint:' + (f.algorithm || 'sha-256') + ' ' +
+                 String(f.value).toUpperCase());
+    }
+  }
+  if (!extra.length) return sdpText;
+  var eol = /\r\n/.test(sdpText) ? '\r\n' : '\n';
+  var lines = sdpText.split(/\r?\n/);
+  var out = [];
+  for (var l = 0; l < lines.length; l++) {
+    out.push(lines[l]);
+    if (lines[l].indexOf('a=fingerprint:') === 0) {
+      for (var e = 0; e < extra.length; e++) out.push(extra[e]);
+    }
+  }
+  return out.join(eol);
+}
+
 function parseRemoteSdp(sdpString) {
   var raw = sdpTransform.parse(sdpString);
   var _rawMsids = _msidsPerSection(sdpString);
@@ -667,7 +707,10 @@ function parseRemoteSdp(sdpString) {
 
       // SCTP (for DataChannel)
       sctpPort: m.sctpPort || null,
-      maxMessageSize: m.maxMessageSize || null,
+      // ZERO IS A VALUE (RFC 8841: no limit), so it must survive the
+      // parse — || collapsed it to null, which every consumer then read
+      // as "attribute absent" and substituted 65536 for.
+      maxMessageSize: (m.maxMessageSize != null) ? m.maxMessageSize : null,
     };
 
     result.media.push(section);
@@ -817,6 +860,8 @@ function createAnswer(parsedOffer, config) {
       // ability-to-send, AND user preference. Falls back to 'sendrecv' in
       // computeAnswerDirection when absent (back-compat).
       userPreferredDir: config.directions ? config.directions[offer.mid] : null,
+      hasLocalTrack:    !!(config.hasTracks && config.hasTracks[offer.mid]),
+      userPreferredCodecs: (config.codecPreferences && config.codecPreferences[offer.mid]) || null,
       // ICE candidates to embed in this m-section. With ice-lite or when
       // half-trickle is desired, pass the full candidate list here so it's
       // included in the answer SDP. The peer then needs no separate trickle.
@@ -855,7 +900,7 @@ function createAnswer(parsedOffer, config) {
     }
   }
 
-  return sdpTransform.write(sdpObj);
+  return _appendExtraFingerprints(sdpTransform.write(sdpObj), config.dtls && config.dtls.fingerprints);
 }
 
 function buildAnswerMedia(offerMedia, config) {
@@ -906,10 +951,21 @@ function buildAnswerMedia(offerMedia, config) {
     iceOptions: 'trickle',  // RFC 8840
 
     // DTLS
-    fingerprint: config.dtls.fingerprint ? {
-      type: config.dtls.fingerprint.algorithm || 'sha-256',
-      hash: config.dtls.fingerprint.value,
-    } : null,
+    // ONE a=fingerprint PER CERTIFICATE (RFC 8122 / W3C 4.9): a
+    // connection configured with several certificates must advertise all
+    // of their fingerprints, so the peer accepts whichever one we end up
+    // presenting in the DTLS handshake. We emitted only the first, which
+    // means a peer validating strictly would reject the handshake if the
+    // second certificate was used — the extra certificates were
+    // effectively unusable.
+    fingerprint: (config.dtls.fingerprints && config.dtls.fingerprints.length)
+      ? config.dtls.fingerprints.map(function (f) {
+          return { type: f.algorithm || 'sha-256', hash: f.value };
+        })
+      : (config.dtls.fingerprint ? {
+          type: config.dtls.fingerprint.algorithm || 'sha-256',
+          hash: config.dtls.fingerprint.value,
+        } : null),
     // Prefer the caller-pinned DTLS role (config.dtls.setup) when present —
     // this is the role negotiated/decided in connection_manager.js (e.g.
     // 'passive' for an ICE-lite peer, which must be the DTLS server and let
@@ -930,7 +986,14 @@ function buildAnswerMedia(offerMedia, config) {
     // computeAnswerDirection for the full intersection table.
     direction: computeAnswerDirection(
       offerMedia.direction,
-      !!config.localSsrc,
+      // "Can we send?" is about having a TRACK, not about an SSRC having
+      // been allocated yet — the SSRC is assigned while building this
+      // very description. An SRD-created transceiver that addTrack() just
+      // promoted to sendrecv has a track and no ssrc, and keying on the
+      // ssrc alone made us answer recvonly: the peer was told we would
+      // not send, and its transceiver settled at sendonly instead of
+      // sendrecv.
+      !!(config.localSsrc || config.hasLocalTrack),
       config.userPreferredDir
     ),
 
@@ -984,7 +1047,52 @@ function buildAnswerMedia(offerMedia, config) {
 
   // Codec negotiation
   var localCodecs = (offerMedia.type === 'audio') ? config.localAudioCodecs : config.localVideoCodecs;
+  // setCodecPreferences ALSO GOVERNS THE ANSWER (W3C 5.4). Round 99
+  // wired the preference order into the OFFER builder only, so an
+  // answerer that had expressed preferences echoed the offerer's full
+  // codec list instead — both the order and the FILTERING were lost, and
+  // a codec the application had deliberately excluded still came back in
+  // the answer. Applying the preference here restricts the local set
+  // BEFORE negotiation, so the intersection with the offer is taken in
+  // the application's order and contains nothing it did not ask for.
+  var _prefs = config.userPreferredCodecs;
+  if (_prefs && _prefs.length) {
+    var _ranked = [];
+    for (var _pi = 0; _pi < _prefs.length; _pi++) {
+      var _want = String(_prefs[_pi] && _prefs[_pi].mimeType || '').toLowerCase();
+      var _wantName = _want.indexOf('/') >= 0 ? _want.split('/')[1] : _want;
+      for (var _li = 0; _li < localCodecs.length; _li++) {
+        var _haveName = String(localCodecs[_li] && localCodecs[_li].name || '').toLowerCase();
+        if (_haveName && _haveName === _wantName && _ranked.indexOf(localCodecs[_li]) === -1) {
+          _ranked.push(localCodecs[_li]);
+        }
+      }
+    }
+    if (_ranked.length) localCodecs = _ranked;
+  }
   var negotiated = negotiateCodecs(offerMedia.codecs, localCodecs);
+  // ORDER BY THE ANSWERER'S PREFERENCE, not the offer's. negotiateCodecs
+  // walks the OFFER to build the intersection, so its output inherits the
+  // offerer's ranking — but W3C 5.4 makes setCodecPreferences the local
+  // application's statement about which codec it wants USED, and the
+  // answer is where that gets expressed. Filtering alone (above) removes
+  // what the app excluded; this puts what remains in the order it asked
+  // for. Payload types stay as the offer assigned them, since those are
+  // the offerer's to choose.
+  if (_prefs && _prefs.length && negotiated && negotiated.length > 1) {
+    var _rank = {};
+    for (var _ri = 0; _ri < _prefs.length; _ri++) {
+      var _rm = String(_prefs[_ri] && _prefs[_ri].mimeType || '').toLowerCase();
+      _rank[_rm.indexOf('/') >= 0 ? _rm.split('/')[1] : _rm] = _ri;
+    }
+    negotiated = negotiated.slice().sort(function (a, b) {
+      var ra = _rank[String(a.name || '').toLowerCase()];
+      var rb = _rank[String(b.name || '').toLowerCase()];
+      if (ra === undefined) ra = 1e6;
+      if (rb === undefined) rb = 1e6;
+      return ra - rb;
+    });
+  }
 
   // RFC 3264 §6: when codec negotiation yields nothing in common, the
   // stream MUST be rejected by setting the port to zero — never answered
@@ -1563,7 +1671,7 @@ function createOffer(config) {
     sdpObj.groups.push({ type: 'BUNDLE', mids: mids.join(' ') });
   }
 
-  return sdpTransform.write(sdpObj);
+  return _appendExtraFingerprints(sdpTransform.write(sdpObj), config.dtls && config.dtls.fingerprints);
 }
 
 

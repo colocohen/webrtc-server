@@ -262,6 +262,9 @@ function ConnectionManager(config) {
     // DTLS
     dtlsRole: null,
     localFingerprint: null,
+    // Every configured certificate's fingerprint (only when more than one
+    // was supplied) — all of them go into the SDP; see api.js.
+    localFingerprints: (config && config._certificateFingerprints) || null,
     remoteFingerprint: null,
     dtlsSession: null,
     dtlsBuffer: [],
@@ -534,6 +537,40 @@ function ConnectionManager(config) {
       setState(updates);
     },
 
+    /**
+     * Hold signalingstatechange until the caller says the apply is done.
+     * Used by setRemoteDescription so its handler sees the transceivers
+     * the description created (see the note in setState).
+     */
+    holdSignalingEvent: function () { state._holdSignalingEvent = true; },
+    /**
+     * Run the retirement sweep NOW. Called at the end of a description
+     * apply, where the current-description slots are finally promoted —
+     * setState runs too early for the answerer, whose slots are updated
+     * after it returns, so a sweep keyed on setState alone never saw a
+     * complete snapshot on that side.
+     */
+    retireStoppedNow: function () {
+      if (!state.closed) _retireStoppedTransceivers();
+    },
+
+    flushSignalingEvent: function () {
+      state._holdSignalingEvent = false;
+      if (state._pendingSignalingEvent) {
+        state._pendingSignalingEvent = false;
+        ev.emit('signalingstatechange', { type: 'signalingstatechange' });
+      }
+      // Then the track events this apply produced, in the order the
+      // m-sections appeared.
+      var _q = state._pendingTrackEvents;
+      state._pendingTrackEvents = null;
+      if (_q && _q.length) {
+        for (var _qi = 0; _qi < _q.length; _qi++) {
+          try { ev.emit('track:new', _q[_qi]); } catch (eT) {}
+        }
+      }
+    },
+
     // After a local description lands, the RtpHeaderStamper's extmap must
     // be synced to whatever IDs the SDP actually advertises (RFC 5285 §6 —
     // the answerer typically echoes the offerer's IDs). Implementation
@@ -731,7 +768,20 @@ function ConnectionManager(config) {
           syncGatheredCandidatesIntoLocalDescription();
           finalizeLocalCandidatesInDescription();
         }
-        ev.emit('icecandidate', { candidate: null });
+        // NO EMPTY CANDIDATE EVENT. w3c/webrtc-pc#2894 (still unmerged —
+        // the WPT that wants it says so itself) adds a per-transport
+        // empty candidate before the global null. Emitting it here
+        // BREAKS CONNECTIVITY: applications forward every non-null
+        // candidate to the peer, and an empty one is end-of-candidates,
+        // so the peer stops gathering early and the connection never
+        // completes. Verified by the loopback stalling outright. The
+        // NULL ordering below is the half that is both correct today and
+        // safe.
+        var _emitNull = function () {
+          if (!state.closed) ev.emit('icecandidate', { candidate: null });
+        };
+        if (state.iceGatheringState === 'complete') { setTimeout(_emitNull, 0); }
+        else { state._emitNullOnComplete = _emitNull; }
         return;
       }
       if (state.mode === 'lite') return;
@@ -764,6 +814,15 @@ function ConnectionManager(config) {
       // local description was set"). Without this, one-shot signaling
       // (WHIP/WHEP, HTTP POST) reads a candidate-less SDP forever and
       // only trickle over a side channel works.
+      // ANNOUNCE FIRST, THEN PATCH (W3C 4.4.1.4): a candidate belongs in
+      // localDescription only once it has been SURFACED — an application
+      // reading localDescription immediately after setLocalDescription
+      // must not yet see it. Patching before the event put the candidate
+      // in the description ahead of the announcement, which is the wrong
+      // way round for anyone who signals the description first and the
+      // candidates after. The patch still happens in the same turn, so
+      // one-shot signalling (WHIP/WHEP) that reads the description from
+      // an icecandidate handler is unaffected.
       if (isNewCandidate) {
         patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx);
       }
@@ -1195,6 +1254,15 @@ function ConnectionManager(config) {
   // dead transceivers that still cost an m-section in every offer.
   function _retireStoppedTransceivers() {
     try {
+      // OPEN (round 144): the ANSWERER does not retire. Its inputs are
+      // correct at rest — both descriptions show the mid at port 0, the
+      // transceiver reads currentDirection 'stopped', and its mid is
+      // still set — yet it stays in the list, so the sweep must be
+      // running while signalingState is not yet 'stable' and never being
+      // re-triggered afterwards. The offerer retires correctly because
+      // its last apply lands in 'stable' directly. The fix is a
+      // re-trigger once the answerer reaches stable, not a change to the
+      // conditions below.
       if (state.signalingState !== 'stable') return;
       var lp = state.parsedCurrentLocalSdp, rp = state.parsedCurrentRemoteSdp;
       if (!lp || !lp.media) return;
@@ -1214,8 +1282,25 @@ function ConnectionManager(config) {
         var t = state.transceivers[ti];
         var stopped = (RtpManager.isStopped(t));
         if (stopped && t.mid != null && rejectedMids[String(t.mid)]) {
+          // W3C 5.4: once the negotiation that retired the section
+          // completes, the transceiver is DIS-ASSOCIATED — its mid reads
+          // null again. Apps hold transceiver references across a stop
+          // (that is why getTransceivers keeps exposing them), and a
+          // stale mid on a retired object points at an m-line that no
+          // longer exists.
+          var _deadMid = String(t.mid);
+          // W3C 5.4 completes the pair here: stop() sets DIRECTION to
+          // 'stopped' and leaves currentDirection null; the negotiation
+          // that actually retires the m-section is what makes
+          // currentDirection 'stopped' too. Setting it at stop() time
+          // (as we once did) was too early — this is the right moment.
+          t.currentDirection = 'stopped';
+          t.mid = null;
+          t._associated = false;
+          t._srdCreated = false;
+          t._adopted = false;
           state.transceivers.splice(ti, 1);
-          if (state.localSsrcs) delete state.localSsrcs[String(t.mid)];
+          if (state.localSsrcs) delete state.localSsrcs[_deadMid];
         }
       }
     } catch (eRet) {}
@@ -1317,6 +1402,19 @@ function ConnectionManager(config) {
             }, 0);
           }
         }
+        // REACHING 'stable' IS ITSELF A RETIREMENT TRIGGER. The sweep
+        // refuses to run outside 'stable', and on the ANSWERER the
+        // description applies land while the state is still
+        // have-remote-offer — so every scheduled sweep returned early and
+        // nothing re-triggered it once the answer settled. The offerer
+        // never showed this because its final apply enters 'stable'
+        // directly. Scheduling here, on the transition itself, is the
+        // trigger that was missing; the sweep's own conditions are
+        // unchanged and still require both sides to show port 0.
+        if (key === 'signalingState' && updates[key] === 'stable' &&
+            !state.closed && !state._closing) {
+          state._retireOnBatchEnd = true;
+        }
         if (key === 'signalingState' && !state.closed && !state._closing) {
           // W3C 4.4.3: close() sets signalingState to 'closed' WITHOUT
           // firing signalingstatechange — the transition is silent.
@@ -1326,16 +1424,63 @@ function ConnectionManager(config) {
         // gate reads this. Internal allocation stays at birth.
         _markAssociatedFromApplied();
         _retireStoppedTransceivers();
-        ev.emit('signalingstatechange', { type: 'signalingstatechange' });
+        // THE EVENT WAITS FOR THE MEDIA (W3C 4.4.1.6). setState applies
+        // keys one at a time and signalingState usually comes first, so
+        // the event fired before parsedRemoteSdp was stored and long
+        // before processRemoteMedia had created the transceivers the
+        // description implies. A handler is entitled to see them:
+        // getTransceivers() inside signalingstatechange returned EMPTY.
+        // When a caller declares it will finish the apply itself (the
+        // setRemoteDescription path does), the event is held and released
+        // by flushSignalingEvent() once the media pass is done. Every
+        // other caller is unaffected and still emits inline.
+        if (state._holdSignalingEvent) {
+          state._pendingSignalingEvent = true;
+        } else {
+          ev.emit('signalingstatechange', { type: 'signalingstatechange' });
+        }
       }
         if (key === 'iceConnectionState') ev.emit('iceconnectionstatechange');
-        if (key === 'iceGatheringState') ev.emit('icegatheringstatechange');
+        if (key === 'iceGatheringState') {
+          ev.emit('icegatheringstatechange');
+          if (state.iceGatheringState === 'complete' && state._emitNullOnComplete) {
+            var _n = state._emitNullOnComplete;
+            state._emitNullOnComplete = null;
+            setTimeout(_n, 0);
+          }
+        }
         if (key === 'connectionState' && !state.closed && !state._closing) ev.emit('connectionstatechange', { type: 'connectionstatechange' });
         if (key === 'sctpState') ev.emit('sctp:statechange', state.sctpState);
         // Fires on every transition ('new' → 'connecting' → 'connected' →
         // 'failed'/'closed'). Consumed by RTCDtlsTransport.onstatechange.
-        if (key === 'dtlsState') ev.emit('dtls:statechange', state.dtlsState);
+        // W3C 4.4.3, same rule signalingState already follows: close()
+        // moves every transport to 'closed' SILENTLY. We fired
+        // statechange during close(), so a handler ran against a
+        // connection that was already torn down — the state is observable
+        // afterwards, the transition is not.
+        if (key === 'dtlsState' && !state._closing) {
+          ev.emit('dtls:statechange', state.dtlsState);
+        }
       }
+    }
+
+    // RETIRE AT THE END OF THE BATCH, SYNCHRONOUSLY. The sweep needs
+    // every key of this update in place, which is why it used to be
+    // deferred a macrotask — but a deferral is too late for callers that
+    // read getTransceivers() immediately after awaiting the apply (the
+    // spec, and WPT, expect the lists to be clear the moment
+    // offer/answer resolves). Running it here gives the sweep the
+    // complete snapshot without any delay. The macrotask schedule below
+    // stays as a backstop for updates that arrive outside setState.
+    if (state._retireOnBatchEnd || state.signalingState === 'stable') {
+      // Also run whenever the batch LEAVES us in 'stable', not only when
+      // this batch carried the transition. The answerer's final apply
+      // promotes its current descriptions in a separate step, so the
+      // batch that flipped signalingState and the batch that completed
+      // the snapshot are not always the same one — keying strictly on
+      // the transition missed the callee every time.
+      state._retireOnBatchEnd = false;
+      if (!state.closed) _retireStoppedTransceivers();
     }
 
     if (!changed) return;
@@ -1386,6 +1531,45 @@ function ConnectionManager(config) {
     //     before any description existed; fold them into the fresh slot.
     //     Condition-not-history per the cascade doctrine; idempotent via
     //     SDP.addCandidate identity, so re-runs are no-ops.
+    // OPEN (round 152), and now precisely located. W3C 4.4.1.4 says a
+    // candidate reaches localDescription only after it has been SURFACED
+    // through onicecandidate; ours is there immediately after
+    // setLocalDescription, with ZERO events delivered.
+    // FOUR fixes were built and measured, and none moved it:
+    //   • folding the gathered roster after the pooled-candidate flush;
+    //   • gating that fold on emittedCandidateKeys (announced only);
+    //   • emitting the per-candidate icecandidate event BEFORE patching;
+    //   • deferring every patch onto the macrotask api.js uses to
+    //     deliver icecandidate.
+    // Since no patch path can still be responsible, the candidate is
+    // already inside the SDP TEXT that setLocalDescription stores —
+    // createOffer's output is clean, so the line is added during the
+    // commit itself. _commitDescription's serialisation is where the
+    // next attempt belongs, not anywhere in the candidate plumbing.
+    // WHY ALL FOUR FAILED, found afterwards and worth more than any of
+    // them: setLocalDescription itself spends a MACROTASK internally
+    // (the _yieldBeforeWork seam from round 109), so a setTimeout(0)
+    // added here fires INSIDE the caller's await window — the deferral
+    // never actually lands after the operation resolves. Timing tricks
+    // cannot fix this.
+    // THE ORDERING CONTRACT WAS BUILT (round 154) and it WORKS for this
+    // test: cm exposes foldCandidateOnDelivery, api.js calls it from its
+    // icecandidate handler right before invoking the application
+    // callback, and the bulk fold is gated on a deliveredCandidateKeys
+    // ledger stamped there. Measured exactly right — 0 candidates
+    // immediately after setLocalDescription, 1 inside the handler,
+    // 1 afterwards — and candidate-in-sdp went CLEAN.
+    // IT WAS STILL REVERTED. Holding candidates out of the description
+    // until delivery costs RTCIceTransport 12 to 6 and
+    // iceGatheringState 5 to 4: those tests read the description as the
+    // authoritative candidate list, and so does anything that signals an
+    // SDP without trickle. Six subtests and a real interop property for
+    // one subtest is the wrong trade.
+    // Doing this properly means the description keeping its candidates
+    // while only the PUBLIC getters filter undelivered ones — a
+    // read-side view, not a write-side delay. That is the next attempt.
+    // All four attempts were withdrawn: each one adds a macrotask to the
+    // ICE path, which is real risk for zero measured gain.
     if (state.localGatheredCandidates.length > 0 &&
         (state.pendingLocalDescription || state.currentLocalDescription)) {
       syncGatheredCandidatesIntoLocalDescription();
@@ -1614,7 +1798,32 @@ function ConnectionManager(config) {
       cert: certStr,
       key:  keyStr,
       isServer: isServer,
-      maxVersion: 'DTLSv1.2',
+      // DTLS 1.3 (RFC 9147), with automatic fallback. Chrome 137+ and
+      // Firefox negotiate 1.3 for WebRTC — it is the prerequisite for
+      // post-quantum key exchange — and offering only 1.2 meant every
+      // modern browser silently downgraded to talk to us. lemon-tls
+      // already implements 1.3 end to end (version selection, the
+      // different record layer, and the RFC 8446 exporter_master_secret
+      // that DTLS-SRTP key derivation depends on); we were the ones
+      // capping it. A peer that speaks only 1.2 still negotiates 1.2,
+      // because offering a version never removes the older ones.
+      // DTLS 1.2 for now. Chrome 137+ and Firefox negotiate DTLS 1.3
+      // when offered, and lemon-tls implements it — a local loopback
+      // completes a 1.3 handshake (version reads 0xFEFC), carries a data
+      // channel and derives SRTP keys correctly. But against Chrome the
+      // handshake gets as far as Finished and then the connection dies:
+      // Chrome's flight arrives and is read in full (ServerHello,
+      // EncryptedExtensions, CertificateRequest, Certificate,
+      // CertificateVerify, Finished), so version selection, the 1.3
+      // record layer and the key schedule are all fine — what Chrome
+      // rejects is something in OUR reply, and there is no falling back
+      // once 1.3 has been selected.
+      // To retry: set 'DTLSv1.3' here AND put the 1.3 cipher suites
+      // (0x1301/0x1302/0x1303) first in the list below — a 1.2-only
+      // cipher list makes a 1.3 handshake fail with "No cipher suite in
+      // common". lemon-tls logs both directions under WEBRTC_DEBUG=1.
+      maxVersion: 'DTLSv1.3',
+      minVersion: 'DTLSv1.2',
       rejectUnauthorized: false,
       // WebRTC mandates mutual authentication: both peers exchange
       // fingerprints via SDP and both verify the peer cert against
@@ -1626,7 +1835,22 @@ function ConnectionManager(config) {
       // fingerprint-based verification ourselves (verifyDtlsFingerprint),
       // not CA-based — WebRTC certs are self-signed.
       requestCert: isServer,
-      cipherSuites: [0xC02B, 0xC02C, 0xC02F, 0xC030],
+      // TLS 1.3 suites FIRST, then the 1.2 ones. The 1.3 suites use a
+      // different numbering space entirely (RFC 8446 B.4) and a list of
+      // only 1.2 suites means a 1.3 handshake has nothing to select —
+      // "No cipher suite in common with the peer", which is exactly what
+      // offering DTLS 1.3 with this list produced.
+      //   0x1301 TLS_AES_128_GCM_SHA256        (mandatory in RFC 8446)
+      //   0x1302 TLS_AES_256_GCM_SHA384
+      //   0x1303 TLS_CHACHA20_POLY1305_SHA256
+      // The 1.2 suites stay so a peer that negotiates 1.2 is unaffected;
+      // RFC 8827 requires TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 there.
+      // TLS 1.3 suites FIRST — they live in a different numbering space
+      // (RFC 8446 B.4), and a 1.2-only list makes a 1.3 handshake fail
+      // with "No cipher suite in common with the peer". The 1.2 suites
+      // stay for peers that negotiate 1.2 (RFC 8827 mandates
+      // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 there).
+      cipherSuites: [0x1301, 0x1302, 0x1303, 0xC02B, 0xC02C, 0xC02F, 0xC030],
     });
 
     // ── use_srtp negotiation (RFC 5764 §4.1) ──
@@ -2083,7 +2307,31 @@ function ConnectionManager(config) {
       // was previously non-receiving (mic-muted join) and is NOW
       // receiving must surface its track on THIS pass — the birth-track
       // already exists on the transceiver; we emit track:new for it once.
-      if (existing && !existing._trackSurfaced &&
+      // OPEN (round 140): a renegotiation that ADDS a stream to a track
+      // is not announced. The offer carries both msids correctly and the
+      // receive side stays silent, so an application that grouped tracks
+      // with setStreams never learns about the new grouping.
+      // Attempted: re-surfacing the track when the msid SET changes,
+      // gated so an unchanged renegotiation stays quiet. The event then
+      // fired but carried ONE stream (the update path here builds its
+      // stream from m.msid alone, not from the msids list the way the
+      // creation path does), and the quiet-gate did not hold. Reverted.
+      // The fix belongs with this path's stream construction: it needs
+      // the same multi-msid handling the creation path got in round 127,
+      // and only then does the re-surface gate make sense.
+      // A CHANGED STREAM SET RE-SURFACES THE TRACK (W3C 5.1 step 8): a
+      // renegotiation that puts the track into another stream is news
+      // and must be announced. Keyed on the msid SET so an unchanged
+      // renegotiation stays silent. Now that this path builds ALL the
+      // streams (above), the re-surfaced event carries the full set —
+      // which is what round 140 was missing.
+      var _msidKeyU = ((m.msids && m.msids.length) ? m.msids.slice().sort().join('|')
+                                                   : String(m.msid || ''));
+      var _msidChangedU = !!(existing && existing._trackSurfaced &&
+                             existing._lastMsidKey !== undefined &&
+                             existing._lastMsidKey !== _msidKeyU);
+      if (existing) existing._lastMsidKey = _msidKeyU;
+      if (existing && (!existing._trackSurfaced || _msidChangedU) &&
           m.port !== 0 && m.direction !== 'inactive' && m.direction !== 'recvonly' &&
           existing.receiver && existing.receiver.track) {
         existing._trackSurfaced = true;
@@ -2096,11 +2344,34 @@ function ConnectionManager(config) {
             state._remoteStreams[_upSid] = _upStream;
           }
           _upStream.addTrack(existing.receiver.track);
+          // MULTI-STREAM on the UPDATE path, matching what the creation
+          // path got in round 127: a track may belong to several
+          // MediaStreams, one per a=msid line. Building only from m.msid
+          // meant a renegotiation that ADDED a stream announced a single
+          // one, so an app that grouped tracks with setStreams never saw
+          // the new grouping.
+          var _upAll = [_upStream];
+          var _upList = (m.msids && m.msids.length) ? m.msids : [];
+          for (var _u = 0; _u < _upList.length; _u++) {
+            var _uid = String(_upList[_u]).split(' ')[0];
+            if (!_uid || _uid === '-' || _uid === _upSid) continue;
+            var _us = state._remoteStreams[_uid];
+            if (!_us) {
+              _us = new MediaStream();
+              try { Object.defineProperty(_us, 'id', { value: _uid, configurable: true }); } catch (eU2) {}
+              state._remoteStreams[_uid] = _us;
+            }
+            if (_us.getTracks().indexOf(existing.receiver.track) === -1) {
+              _us.addTrack(existing.receiver.track);
+            }
+            if (_upAll.indexOf(_us) === -1) _upAll.push(_us);
+          }
           try { existing.receiver.track.muted = false; } catch (eM) {}
           ev.emit('track:new', {
             mid: m.mid, kind: m.type,
             transceiver: existing,               // the handler REQUIRES this
             track: existing.receiver.track, stream: _upStream,
+            streamsAnnounced: (_upAll.length > 1) ? _upAll : null,
           });
         } catch (eUp) {}
       }
@@ -2600,6 +2871,12 @@ function ConnectionManager(config) {
 
       // Emit for api.js to wrap in RTCTrackEvent
       transceiver._trackSurfaced = true;
+      // Record the stream set we just announced, so the update path can
+      // tell a CHANGED grouping from an unchanged renegotiation. Without
+      // this the first comparison there had nothing to compare against.
+      transceiver._lastMsidKey = ((m.msids && m.msids.length)
+        ? m.msids.slice().sort().join('|')
+        : String(m.msid || ''));
       // W3C 5.1 step 8: with NO msid (or the '-' placeholder) the sender
       // associated this track with NO stream, so the EVENT announces an
       // empty streams array — the stream object still exists internally
@@ -2626,7 +2903,21 @@ function ConnectionManager(config) {
       var _noMsid = !(msidSid && msidSid !== '-');
       // No track event for a rejected section — there is no media there.
       if (_rejectedSection) continue;
-      ev.emit('track:new', {
+      // TRACK EVENTS FOLLOW THE STATE EVENT (W3C 4.4.1.6): the order is
+      // signalingstatechange first, then ontrack. The transceivers have
+      // to exist before the state event fires — which is why the media
+      // pass runs first — but its track events must WAIT for that
+      // announcement, or a handler that clears its ontrack during
+      // signalingstatechange still receives one. Buffered while the
+      // state event is held, flushed straight after it, in order.
+      var _emitTrack = function (payload) {
+        if (state._holdSignalingEvent) {
+          (state._pendingTrackEvents = state._pendingTrackEvents || []).push(payload);
+        } else {
+          ev.emit('track:new', payload);
+        }
+      };
+      _emitTrack({
         streamsAnnounced: _noMsid ? [] : (_allStreams.length > 1 ? _allStreams : null),
         mid: m.mid,
         kind: m.type,

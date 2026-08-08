@@ -187,9 +187,25 @@ function RTCPeerConnection(config) {
     if (c0 && c0._cert && c0._key && !config.cert && !config.key) {
       // Pass through to ConnectionManager. RTCCertificate stores the raw
       // PEM strings in _cert / _key (see RTCCertificate constructor).
+      // The FIRST certificate is the one we present in the handshake,
+      // but every configured certificate's fingerprint must appear in the
+      // SDP (RFC 8122 / W3C 4.9) — otherwise a peer validating strictly
+      // would reject a handshake using any of the others, making the
+      // extra certificates useless.
+      var _allFps = [];
+      for (var _ci = 0; _ci < config.certificates.length; _ci++) {
+        var _c = config.certificates[_ci];
+        try {
+          var _fl = (_c && typeof _c.getFingerprints === 'function') ? _c.getFingerprints() : null;
+          if (_fl && _fl.length && _fl[0].value) {
+            _allFps.push({ algorithm: _fl[0].algorithm || 'sha-256', value: _fl[0].value });
+          }
+        } catch (eF) {}
+      }
       config = Object.assign({}, config, {
         cert: c0._cert,
         key:  c0._key,
+        _certificateFingerprints: (_allFps.length > 1) ? _allFps : null,
       });
     }
   }
@@ -1038,6 +1054,15 @@ function RTCPeerConnection(config) {
       // sets WEBRTC_SPEC_STRICT_REUSE=1 to measure the spec behavior.
       // The long-term idiomatic fix for engines is replaceTrack(null)
       // for mute — no renegotiation at all.
+      // DUAL-MODE, and the reasoning is now sharper than when this was
+      // first written. W3C 5.1 says a sender that has SENT is never
+      // recycled; the field mute pattern (removeTrack then addTrack,
+      // expecting the SAME transceiver back) needs exactly that recycling
+      // and breaks four regression legs without it — a duplicated m-line
+      // renders as a spinning tile. Field behaviour stays the default;
+      // WEBRTC_SPEC_STRICT_REUSE=1 selects the spec rule. The idiomatic
+      // fix for engines is replaceTrack(null) for mute, which needs no
+      // renegotiation at all and sidesteps the conflict entirely.
       if (process.env.WEBRTC_SPEC_STRICT_REUSE === '1' &&
           tc.sender && tc.sender._everSentDir) continue;
       if (RtpManager.isStopped(tc)) continue;
@@ -1048,6 +1073,14 @@ function RTCPeerConnection(config) {
     var internal;
     if (reused) {
       internal = reused;
+      // THE APPLICATION HAS CLAIMED THIS TRANSCEIVER. Rollback keeps a
+      // remote-created transceiver only if addTrack() adopted it — WPT
+      // pins this down precisely: replaceTrack() on an SRD-created
+      // transceiver still leaves it removable, while addTrack() followed
+      // by replaceTrack(null) keeps it. So the criterion is the ADOPTION
+      // ACT, not whether a track happens to be attached right now, which
+      // is what round 99 checked.
+      internal._appAdopted = true;
       internal.sender.track = track;
       // Promote direction to include send. 'recvonly' → 'sendrecv';
       // 'inactive' → 'sendonly'. Leave 'sendrecv'/'sendonly' alone.
@@ -1452,6 +1485,25 @@ function RTCPeerConnection(config) {
           'getStats: selector is not a sender or receiver of this connection',
           'InvalidAccessError'));
       }
+      // AMBIGUOUS SELECTOR (W3C 8.2): a track attached to BOTH a sender
+      // and a receiver on this connection does not identify which stats
+      // are wanted, so it is InvalidAccessError rather than a guess. We
+      // resolved it to whichever list matched first and silently returned
+      // half the answer.
+      var _selIsTrack = !!(_sel && _sel.kind && !_sel.getParameters);
+      if (_selIsTrack) {
+        var _inSenders = false, _inReceivers = false;
+        try {
+          var _sl = impl.getSenders(), _rl = impl.getReceivers();
+          for (var _si2 = 0; _si2 < _sl.length; _si2++) if (_sl[_si2] && _sl[_si2].track === _sel) { _inSenders = true; break; }
+          for (var _ri2 = 0; _ri2 < _rl.length; _ri2++) if (_rl[_ri2] && _rl[_ri2].track === _sel) { _inReceivers = true; break; }
+        } catch (eA) {}
+        if (_inSenders && _inReceivers) {
+          return Promise.reject(new DOMException(
+            'getStats: track is associated with both a sender and a receiver',
+            'InvalidAccessError'));
+        }
+      }
     }
     var _gsArgs = arguments, _gsSelf = this;
     return new Promise(function (res, rej) {
@@ -1489,10 +1541,15 @@ function RTCPeerConnection(config) {
     // Legacy callback-based form (deprecated & removed from Chrome in M120,
     // never supported by Firefox) is not implemented.
 
-    // W3C §4.4.1.10: if PC is closed, reject with InvalidStateError.
+    // A CLOSED CONNECTION STILL ANSWERS. The old "reject with
+    // InvalidStateError" rule was dropped from the spec, and the sender
+    // form is explicit about it ("should work with a closed
+    // PeerConnection but not have outbound-rtp objects"). Rejecting was
+    // a field hazard: every dashboard polls getStats on a timer, and the
+    // poll that lands just after the user hangs up became an unhandled
+    // rejection rather than a final, empty report.
     if (manager.state.closed) {
-      var closedErr = new DOMException('PC is closed', 'InvalidStateError');
-      return Promise.reject(closedErr);
+      return Promise.resolve(new Map());
     }
 
     var filter = null;   // { ssrc } or null
@@ -1823,6 +1880,22 @@ RTCPeerConnection.prototype.setLocalDescription = function (desc) {
   }
   // W3C §4.4.1.4 (WPT): SLD with a type but no sdp substitutes the LAST
   // createOffer/createAnswer result for that type.
+  // NO ARGUMENT AT ALL is the same case as {type} with no sdp (W3C
+  // 4.4.1.4): both mean "apply what I last created". We only handled the
+  // second form, so pc.setLocalDescription() built a BRAND NEW offer —
+  // observably different from the one createOffer() had just returned
+  // (a fresh o= session version), which breaks the documented
+  // create-then-apply pattern and any code comparing the two.
+  if (desc === undefined && this._manager && this._manager.state) {
+    var _stP = this._manager.state;
+    var _implied = (_stP.signalingState === 'have-remote-offer' ||
+                    _stP.signalingState === 'have-local-pranswer') ? 'answer' : 'offer';
+    if ((_implied === 'offer' && _stP._lastOffer) || (_implied === 'answer' && _stP._lastAnswer)) {
+      desc = { type: _implied };
+      arguments[0] = desc;
+      arguments.length = 1;
+    }
+  }
   if (desc && typeof desc === 'object' && (desc.sdp == null || desc.sdp === '')) {
     // SUBSTITUTE LATE. The last-created description is looked up when the
     // operation RUNS, not when it is queued: the documented way to pack
@@ -2496,6 +2569,34 @@ function RTCRtpSender(internal, track, manager) {
     if ((!currentParams.codecs || !currentParams.codecs.length) &&
         manager && manager.state && manager.state.currentRemoteDescription) {
       currentParams.codecs = (_codecsFromSdp(manager, internal.kind, internal.mid) || _defaultCodecs(internal.kind));
+    }
+    // HEADER EXTENSIONS FOLLOW THE SAME RULE as codecs: empty until the
+    // negotiation settles, then the set the SDP actually agreed on. We
+    // filled the codecs and left this at [] forever, so an application
+    // reading getParameters() after negotiation could see which codecs
+    // were chosen but never which extensions — and header extensions are
+    // exactly what an app inspects to know whether, say, transport-cc or
+    // the mid extension survived.
+    if ((!currentParams.headerExtensions || !currentParams.headerExtensions.length) &&
+        manager && manager.state && manager.state.currentLocalDescription) {
+      try {
+        var _p = manager.state.parsedCurrentLocalSdp;
+        var _sec = null;
+        if (_p && _p.media) {
+          for (var _hi = 0; _hi < _p.media.length; _hi++) {
+            if (String(_p.media[_hi].mid) === String(internal.mid)) { _sec = _p.media[_hi]; break; }
+          }
+        }
+        // the parsed section calls them `extensions`
+        var _ext = (_sec && (_sec.extensions || _sec.headerExtensions)) || [];
+        currentParams.headerExtensions = _ext.map(function (e) {
+          return {
+            uri: e.uri || e.value || '',
+            id: (e.id != null) ? e.id : e.value,
+            encrypted: !!e.encrypted,
+          };
+        }).filter(function (e) { return !!e.uri; });
+      } catch (eH) {}
     }
     // W3C 5.2: the transaction id is issued PER TASK, not per call —
     // back-to-back getParameters() within one turn of the event loop
@@ -4659,10 +4760,17 @@ function RTCSctpTransport(manager) {
     get: function() {
       var loc = manager.state.maxMessageSize;
       var rem = manager.state.remoteMaxMessageSize;
-      var negotiated = !!(manager.state.parsedRemoteSdp);
-      if (!negotiated) return loc;
+      // BEFORE NEGOTIATION the peer is unknown, and RFC 8841 says an
+      // endpoint that has not declared max-message-size accepts 65536.
+      // Reporting our local cap (262144) instead told the application it
+      // could send four times what the peer might accept — and the check
+      // in send() reads this same value, so an oversized message would
+      // have been let through rather than refused.
       if (rem == null) return Math.min(loc, 65536);
-      if (rem === 0) return loc;          // 0 = peer accepts any size
+      // RFC 8841: max-message-size:0 means the peer imposes NO limit, so
+      // the cap is entirely ours — and if we have none either, the
+      // answer is Infinity rather than some arbitrary default.
+      if (rem === 0) return (loc > 0) ? loc : Number.POSITIVE_INFINITY;
       return Math.min(loc, rem);
     },
   });
@@ -5175,6 +5283,16 @@ function RTCDataChannelEvent(type, init) {
 }
 
 function RTCPeerConnectionIceEvent(type, init) {
+  // WebIDL: `candidate` is an RTCIceCandidate?, so anything that is
+  // neither null nor an actual RTCIceCandidate is a TypeError at the
+  // binding layer. We accepted any object, which produced an event whose
+  // .candidate could not be passed to addIceCandidate — the error
+  // surfaced far from the mistake.
+  if (init && typeof init === 'object' && init.candidate != null &&
+      !(init.candidate instanceof RTCIceCandidate)) {
+    throw new TypeError(
+      'RTCPeerConnectionIceEvent: candidate must be an RTCIceCandidate or null');
+  }
   // W3C: this is a constructible Event — (type, eventInitDict), with type
   // REQUIRED (no arguments is a TypeError) and the standard Event flags
   // defaulting to false rather than undefined.
@@ -5938,7 +6056,7 @@ function _peerConnectionEntry(snapshot, now) {
 
 /* ── Certificate ───────────────────────────────────────────────────── */
 
-function _certificateEntry(fp, isLocal, now) {
+function _certificateEntry(fp, isLocal, now, pem) {
   // fp may be null, a string, or {algorithm, value} depending on source.
   if (!fp) return null;
   var algorithm = 'sha-256';
@@ -5954,7 +6072,28 @@ function _certificateEntry(fp, isLocal, now) {
     timestamp:            now,
     fingerprint:          value,
     fingerprintAlgorithm: algorithm,
-    base64Certificate:    '',                // DTLS lib would need to expose this
+    // THE DER, BASE64-ENCODED (W3C stats): this was left empty with a
+    // note that the DTLS layer would need to expose it — but the PEM is
+    // already on state, and base64Certificate is simply its body with
+    // the armour stripped. An empty value makes the whole certificate
+    // stat useless: a consumer cannot verify that the fingerprint it was
+    // given actually belongs to the certificate in use, which is the
+    // only reason the entry exists.
+    base64Certificate: (function () {
+      if (!pem) return '';
+      try {
+        // The local side holds PEM text; the peer's certificate arrives
+        // from the DTLS handshake as raw DER bytes. Accept either.
+        if (typeof pem !== 'string' && pem.length != null) {
+          return Buffer.from(pem).toString('base64');
+        }
+        var body = String(pem)
+          .replace(/-----BEGIN CERTIFICATE-----/g, '')
+          .replace(/-----END CERTIFICATE-----/g, '')
+          .replace(/[\r\n\s]/g, '');
+        return body;
+      } catch (eB) { return ''; }
+    })(),
   };
 }
 
@@ -6008,9 +6147,13 @@ function _buildStatsReport(manager, filter) {
   report.set(TRANSPORT_ID, tEntry);
 
   // certificates (always, if known)
-  var localCert = _certificateEntry(snapshot.localFingerprint, true, now);
+  var localCert = _certificateEntry(snapshot.localFingerprint, true, now, snapshot.cert);
   if (localCert) report.set(localCert.id, localCert);
-  var remoteCert = _certificateEntry(snapshot.remoteFingerprint, false, now);
+  // The peer's DER is captured during fingerprint verification
+  // (state.remoteCertificates) — the same bytes we hashed to check the
+  // fingerprint, so a consumer can repeat that check from the stats.
+  var _remPem = (snapshot.remoteCertificates && snapshot.remoteCertificates[0]) || null;
+  var remoteCert = _certificateEntry(snapshot.remoteFingerprint, false, now, _remPem);
   if (remoteCert) report.set(remoteCert.id, remoteCert);
 
   // candidates + candidate-pair (always, if we have a selected pair)

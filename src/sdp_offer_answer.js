@@ -567,6 +567,12 @@ class SdpOfferAnswer extends EventEmitter {
     try {
       var commit = _selfL._commitDescription(desc, 'local');
 
+      // Same rule as setRemoteDescription: hold the state event until
+      // this apply has finished committing directions, so a
+      // signalingstatechange handler reads the currentDirection the
+      // answer just negotiated rather than the value from before it.
+      var _heldSigL = !!(_selfL._deps.holdSignalingEvent);
+      if (_heldSigL) _selfL._deps.holdSignalingEvent();
       _selfL._deps.applyStateUpdates({ signalingState: commit.nextState });
 
       // Sync the outgoing-RTP extension stamper. The extension IDs we put
@@ -587,8 +593,14 @@ class SdpOfferAnswer extends EventEmitter {
       // ICE gathering is triggered reactively by the applyStateUpdates
       // cascade (cm.js detects signalingState change + localIceUfrag exists
       // → creates agent + gathers).
+      // Retire stopped transceivers now that this apply is COMPLETE —
+      // the current-description slots are promoted by now, which is what
+      // the sweep needs and what setState alone could not guarantee.
+      if (_selfL._deps.retireStoppedNow) _selfL._deps.retireStoppedNow();
+      if (_heldSigL) _selfL._deps.flushSignalingEvent();
       cb(null);
     } catch (e) {
+      if (_heldSigL) _selfL._deps.flushSignalingEvent();
       _selfL._restoreAtomicSnapshot(atomicSnap);
       cb(e);
     }
@@ -672,8 +684,11 @@ class SdpOfferAnswer extends EventEmitter {
         for (var _di = 0; _di < _lines.length; _di++) {
           var _key = _lines[_di].replace(/[\r\n]/g, '').trim();
           if (_seen[_key]) {
+            // OperationError, not InvalidAccessError: the description is
+            // malformed, which is a processing failure rather than a
+            // misuse of the API by the caller.
             return cb(new DOMException(
-              'setRemoteDescription: duplicate msid', 'InvalidAccessError'));
+              'setRemoteDescription: duplicate msid', 'OperationError'));
           }
           _seen[_key] = true;
         }
@@ -711,6 +726,15 @@ class SdpOfferAnswer extends EventEmitter {
       }
 
       // applyStateUpdates triggers cascades: ICE remote creds, DTLS role, etc.
+      // Hold the state event until the media pass below has created the
+      // transceivers this description implies — a signalingstatechange
+      // handler is entitled to see them (W3C 4.4.1.6), and it was firing
+      // against an empty list. Round 122 tried reordering the two calls
+      // instead and that broke the transport cascade that media
+      // processing depends on; holding just the EVENT keeps the cascade
+      // order intact.
+      var _heldSig = !!(_selfR._deps.holdSignalingEvent);
+      if (_heldSig) _selfR._deps.holdSignalingEvent();
       _selfR._deps.applyStateUpdates({
         signalingState:  commit.nextState,
         parsedRemoteSdp: commit.parsed,
@@ -736,6 +760,7 @@ class SdpOfferAnswer extends EventEmitter {
 
       // Process remote media tracks.
       _selfR._deps.processRemoteMedia(commit.parsed);
+      if (_heldSig) _selfR._deps.flushSignalingEvent();
 
       cb(null);
     } catch (e) {
@@ -784,7 +809,12 @@ class SdpOfferAnswer extends EventEmitter {
     // level). Absent attribute leaves null (getter assumes 65536).
     if (source === 'remote' && desc && desc.sdp) {
       var _mmsM = desc.sdp.match(/a=max-message-size:\s*(\d+)/);
+      // ZERO IS A VALUE, not an absence: max-message-size:0 means the
+      // peer imposes NO limit (RFC 8841), which is very different from
+      // the attribute being missing (where 65536 is assumed). Both used
+      // to collapse to the same null.
       state.remoteMaxMessageSize = _mmsM ? parseInt(_mmsM[1], 10) : null;
+      if (_mmsM && isNaN(state.remoteMaxMessageSize)) state.remoteMaxMessageSize = null;
     }
     // W3C: under rtcpMuxPolicy 'require' (the only modern value), a
     // remote description whose media sections do not declare a=rtcp-mux
@@ -1042,19 +1072,29 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       // there forever (engine: negotiation latched, no media). Apply the
       // rollback SYNCHRONOUSLY (it is a pure state operation) and
       // continue in-place.
-      try {
-        this._applyRollback('local');
-      } catch (rbErr) {
-        return cb(rbErr);
-      }
       // GLARE-PROOFNESS (W3C 4.4.1.6): the visit through 'stable' must be
-      // OBSERVABLE — apps (and WPT) await signalingstatechange and then
-      // run operations against the rolled-back state before the remote
-      // offer lands. Yield one macrotask so 'stable' is delivered first.
+      // OBSERVABLE. Both the rollback AND the apply now happen inside the
+      // deferred task: applying the rollback synchronously here emitted
+      // signalingstatechange('stable') DURING the setRemoteDescription
+      // call, and callers assign their handler on the NEXT line — so the
+      // one event the whole pattern is built around was missed, exactly
+      // the way a rollback's own event was missed before round 114. The
+      // rollback is still a pure state operation; it just runs one task
+      // later, where someone can see it.
       var _selfG = this;
       return setTimeout(function () {
         if (_selfG._deps.getClosed()) return;   // never-settle on close
-        _selfG._applySetRemote(desc, cb, true);   // this task IS the yield
+        try {
+          _selfG._applyRollback('local');
+        } catch (rbErr) {
+          return cb(rbErr);
+        }
+        // A second task so 'stable' is DELIVERED before the remote offer
+        // lands — one task carries the rollback, the next the apply.
+        setTimeout(function () {
+          if (_selfG._deps.getClosed()) return;
+          _selfG._applySetRemote(desc, cb, true);
+        }, 0);
       }, 0);
     }
     if (this._deps.getClosed()) {
@@ -1405,7 +1445,9 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
         // track to is no longer purely remote-created — addTrack reused
         // it, so the app holds a sender on it and rollback must KEEP it
         // (dis-associated, mid null) rather than delete the app's work.
-        if (t._srdCreated && !(t.sender && t.sender.track)) return false;
+        // Survival is decided by the ADOPTION ACT (addTrack), not by a
+        // track being attached at this instant — see _appAdopted.
+        if (t._srdCreated && !t._appAdopted) return false;
         // A survivor is FULLY dis-associated: the description that gave
         // it a mid is gone, so mid must read null again (the public
         // getter keys on the birth flags, and leaving _srdCreated set

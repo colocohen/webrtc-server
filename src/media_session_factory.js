@@ -126,7 +126,14 @@ function buildMediaForTransceiver(state, t) {
 
   // Transceivers without a sender SSRC (auto-created from peer-added
   // tracks) advertise recvonly without a=ssrc to keep Chrome happy.
-  var hasLocalSsrc = (t.sender.ssrc != null);
+  // A TRACK counts as "something to send" even before an SSRC has been
+  // allocated. An SRD-created transceiver that addTrack() has just
+  // promoted to sendrecv has a track but no ssrc yet, so the clamp below
+  // downgraded our ANSWER to recvonly — the peer was told we would not
+  // send, and the offerer's currentDirection settled at sendonly instead
+  // of sendrecv. The SSRC is assigned as part of building this very
+  // description, so keying the clamp on it alone was a chicken-and-egg.
+  var hasLocalSsrc = (t.sender.ssrc != null) || !!(t.sender && t.sender.track);
 
   // Direction resolution: respect the user's direction setting, but
   // clamp send-side directions when there's nothing to send.
@@ -447,7 +454,7 @@ function buildOffer(state, options) {
     sessionId:       state.localSessionId,
     sessionVersion:  state.localSdpVersion,
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
-    dtls:            { fingerprint: state.localFingerprint, setup: options.setup },
+    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup },
     media:           mediaSections,
     cname:           state.localCname,
     mode:            state.mode,
@@ -505,6 +512,7 @@ function buildAnswer(state, options) {
   // answer path. Fixed in coordination with sdp.js item 24 (a).
   var ssrcs = {};
   var directions = {};
+  var hasTrack = {};
   for (var i = 0; i < state.parsedRemoteSdp.media.length; i++) {
     var m = state.parsedRemoteSdp.media[i];
     if (m.type !== 'audio' && m.type !== 'video') continue;
@@ -521,6 +529,12 @@ function buildAnswer(state, options) {
     if (tr && tr.direction) {
       directions[m.mid] = tr.direction;
     }
+    // Does this transceiver have something to send RIGHT NOW? See the
+    // note at computeAnswerDirection: a track counts even before its
+    // SSRC exists.
+    if (tr && tr.sender && tr.sender.track) {
+      hasTrack[m.mid] = true;
+    }
   }
 
   // RFC 3264 §8 — same counter as buildOffer.
@@ -535,8 +549,20 @@ function buildAnswer(state, options) {
     // sess-id our own offers use via buildOffer).
     sessionId:       state.localSessionId,
     sessionVersion: state.localSdpVersion,
+    hasTracks:       hasTrack,
+    // per-mid preference lists, for the answer's codec filtering
+    codecPreferences: (function () {
+      var out = {};
+      for (var _ci = 0; _ci < state.transceivers.length; _ci++) {
+        var _t = state.transceivers[_ci];
+        if (_t && _t.mid != null && _t._codecPreferences && _t._codecPreferences.length) {
+          out[String(_t.mid)] = _t._codecPreferences;
+        }
+      }
+      return out;
+    })(),
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
-    dtls:            { fingerprint: state.localFingerprint, setup: options.setup },
+    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup },
     ssrcs:           ssrcs,
     directions:      directions,
     cname:           state.localCname,

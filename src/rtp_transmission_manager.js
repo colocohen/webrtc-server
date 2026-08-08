@@ -553,6 +553,17 @@ function applyDirectionsFromAnswer(state, parsed, isLocalAnswer) {
       dir = SDP.REVERSE_DIRECTION[dir] || dir;
     }
     t.currentDirection = dir;
+    // "HAS THIS SENDER EVER SENT?" — recorded HERE, at the moment a
+    // negotiation actually puts the transceiver into a sending
+    // direction. W3C 5.1: addTrack may reuse a transceiver whose sender
+    // is idle, but NOT one that has sent before — a peer that already
+    // saw media on that m-line must be told about the new track through
+    // a new section. The flag existed but was only set inside the
+    // receive-side mute pass, which never runs for a send-only peer, so
+    // a used sender was silently recycled.
+    if ((dir === 'sendrecv' || dir === 'sendonly') && t.sender) {
+      t.sender._everSentDir = true;
+    }
   }
   // FIELD DIAG: one line naming exactly what the answer committed —
   // if the sender is silent, this says whether the direction landed.
