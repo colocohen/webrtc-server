@@ -96,7 +96,6 @@ var _DBG = (typeof process !== 'undefined' &&
             process.env &&
             (process.env.WEBRTC_DEBUG === '1' ||
              process.env.WEBRTC_DEBUG === 'true'));
-var _DBG_ON = _DBG;  // cheap hot-path mirror
 function _diag() {
   if (!_DBG) return;
   if (typeof console !== 'undefined' && console.log) {
@@ -128,11 +127,6 @@ var DEPACKETIZERS = {
 /* ========================= ConnectionManager ========================= */
 
 function ConnectionManager(config) {
-  try {
-    if (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true') {
-      console.log('[cm-diag] BUILD-STAMP: R105-PIPELINE-RESTORED');
-    }
-  } catch (eS) {}
   if (!(this instanceof ConnectionManager)) return new ConnectionManager(config);
 
   config = config || {};
@@ -206,7 +200,7 @@ function ConnectionManager(config) {
     // Config
     iceServers: config.iceServers || DEFAULT_ICE_SERVERS,
     iceTransportPolicy: config.iceTransportPolicy || 'all',
-    bundlePolicy: config.bundlePolicy || 'balanced',
+    bundlePolicy: config.bundlePolicy || 'max-bundle',
     mode: resolvedMode,
     announcedAddresses: config.announcedAddresses || null,
 
@@ -236,15 +230,6 @@ function ConnectionManager(config) {
     remoteIcePwd: null,
     remoteIceLite: false,
     remoteCandidates: [],
-    // ── iceCandidatePoolSize pre-gathering (W3C §4.3.1) ──
-    // Candidates gathered before any local description exists are held in
-    // the roster (localGatheredCandidates) and surfaced only once a
-    // description is set — matching browser behavior, where pooled
-    // candidates never reach onicecandidate before setLocalDescription.
-    pregatherStarted: false,          // pregather() ran (agent up early)
-    pregatherFlushed: false,          // deferred candidates surfaced post-SLD
-    pregatherGatheringDone: false,    // agent finished gathering pre-SLD
-    emittedCandidateKeys: {},         // _candidateKey → true (dedupes flush vs live emission)
     // Local candidates gathered in the CURRENT gathering phase (full-ICE
     // mode only; lite candidates are read synchronously off the agent).
     // Consumed by:
@@ -561,7 +546,6 @@ function ConnectionManager(config) {
     // class uses this for the same diagnostics the original cm.js
     // setRemoteDescription emitted, so debugging output is unchanged.
     diag: _diag,
-    dbgOn: _DBG,
   });
 
   // SdpOfferAnswer fires 'negotiationneeded' through its own EventEmitter;
@@ -628,7 +612,6 @@ function ConnectionManager(config) {
       return resolvePeekKeyframeFn(codecName);
     },
     diag:  _diag,
-    dbgOn: _DBG,
     debug: _DBG,
   });
 
@@ -701,21 +684,7 @@ function ConnectionManager(config) {
     // done → send SDP") get their signal.
     iceAgent.on('candidate', function(candidate) {
       if (state.closed) return;
-
-      // Pre-gather phase (iceCandidatePoolSize): while no local description
-      // exists, candidates land in the roster ONLY. Patching is impossible
-      // (no SDP to patch) and emitting now would leak trickle events before
-      // the app has an offer to pair them with — browsers hold pooled
-      // candidates until setLocalDescription, and so do we. Cascade 2c
-      // flushes them (emission + end-of-candidates) once a description
-      // lands; cascade 2b independently folds the roster into the SDP.
-      var _hasLocalDesc = !!(state.pendingLocalDescription || state.currentLocalDescription);
-
       if (candidate === null) {
-        if (!_hasLocalDesc && state.pregatherStarted) {
-          state.pregatherGatheringDone = true;   // surfaced by cascade 2c
-          return;
-        }
         // Gathering complete. In full mode, finalize the local description
         // in place: a=end-of-candidates + default-candidate m=/c= promotion
         // (browser-parity — JSEP §4.1.13/14 + §5.2.2). Lite mode already
@@ -741,10 +710,6 @@ function ConnectionManager(config) {
       // up in descriptions or subsequent offers.
       var isNewCandidate = _rememberGatheredCandidate(candidate);
 
-      if (!_hasLocalDesc && state.pregatherStarted) {
-        return;   // deferred — cascade 2c emits it after SLD
-      }
-
       // Per RFC 8839 §5.1.1 + W3C: with BUNDLE the trickled candidate's
       // sdpMid should match the BUNDLE-tagged section — the first
       // non-rejected section in our local description. Hardcoding '0'
@@ -768,7 +733,6 @@ function ConnectionManager(config) {
         patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx);
       }
 
-      state.emittedCandidateKeys[_candidateKey(candidate)] = true;
       ev.emit('icecandidate', {
         candidate: SDP.buildCandidateString(candidate),
         sdpMid: bundleMid,
@@ -783,19 +747,6 @@ function ConnectionManager(config) {
 
     iceAgent.on('gatheringstatechange', function(newState) {
       if (state.closed) return;
-      // NO TRANSPORTS, NO GATHERING (W3C 4.4.1): a local description with
-      // no media and no data channel establishes no ICE transport, so
-      // there is nothing to gather for and iceGatheringState must stay
-      // 'new'. We ran the phase anyway and fired two events for a
-      // connection that could never produce a single candidate.
-      var _p = state.parsedLocalSdp;
-      var _hasTransports = false;
-      if (_p && _p.media) {
-        for (var _mi = 0; _mi < _p.media.length; _mi++) {
-          if (_p.media[_mi] && _p.media[_mi].port !== 0) { _hasTransports = true; break; }
-        }
-      }
-      if (!_hasTransports) return;
       // setState emits 'icegatheringstatechange' synchronously while
       // applying the update (before cascades run) — so a listener reading
       // localDescription inside the event observes whatever the SDP is at
@@ -804,71 +755,16 @@ function ConnectionManager(config) {
       // ordering, the flip raced the (separately-evented) finalize and a
       // fast reader saw a placeholder-port, candidate-less answer.
       if (newState === 'complete') {
-        state.iceGatheringEnded = true;
         syncGatheredCandidatesIntoLocalDescription();
         if (state.mode !== 'lite') {
           finalizeLocalCandidatesInDescription();
         }
-        // W3C 4.4.1: gathering-state transitions are QUEUED TASKS. Our
-        // agent gathers host candidates synchronously inside
-        // setLocalDescription, so flipping straight to 'complete' meant
-        // 'gathering' was never observable — every state-sequence test
-        // (and any app watching the phase) missed it. Publish
-        // 'gathering' first, then complete on the next macrotask.
-        // BOTH transitions are queued tasks: WPT reads gatheringState
-        // immediately after `await setLocalDescription()` and requires
-        // 'new' there, then observes 'gathering' and finally 'complete'.
-        // Publishing either flip synchronously inside SLD breaks that
-        // sequence, so the phase advances one macrotask at a time and
-        // stops dead if the connection closes in between.
-        setTimeout(function () {
-          if (state.closed) return;
-          if (state.iceGatheringState !== 'gathering') {
-            setState({ iceGatheringState: 'gathering' });
-          }
-          setTimeout(function () {
-            if (state.closed) return;   // close freezes the phase
-            setState({ iceGatheringState: 'complete' });
-          }, 0);
-        }, 0);
-        return;
-      }
-      if (newState === 'gathering') {
-        // Same queued-task rule as 'complete': the agent starts
-        // gathering synchronously inside setLocalDescription, but the
-        // observable transition belongs to a later task (W3C 4.4.1) —
-        // reading gatheringState right after `await sLD()` must still
-        // see 'new'.
-        setTimeout(function () {
-          if (state.closed) return;
-          setState({ iceGatheringState: 'gathering' });
-        }, 0);
-        return;
       }
       setState({ iceGatheringState: newState });
     });
 
-    iceAgent.on('selectedpair', function(pair, prev) {
+    iceAgent.on('selectedpair', function(pair) {
       if (state.closed) return;
-      // stats: selectedCandidatePairChanges counts nominations after the
-      // first one (W3C: it is 0 until a pair is selected, then counts
-      // subsequent switches).
-      state.selectedPairChanges = (state.selectedPairChanges || 0) + (prev ? 1 : 0);
-      // ── [ice-diag] ALWAYS-ON: selected-pair changes are rare and are the
-      // prime suspect for mid-session one-directional path death (all
-      // outbound DTLS/SRTP retargets instantly via agent.send()). Log the
-      // full 5-tuple of new AND previous so a switch is undeniable.
-      var _fmt = function (p) {
-        if (!p) return '(none)';
-        return (p.local && p.local.ip) + ':' + (p.local && p.local.port) +
-               ' [' + (p.local && p.local.type) + '] → ' +
-               (p.remote && p.remote.ip) + ':' + (p.remote && p.remote.port) +
-               ' [' + (p.remote && p.remote.type) + '] prio=' + p.priority;
-      };
-      _diag('[ice-diag] SELECTED PAIR ' + (prev ? 'SWITCH' : 'set') +
-                  ' @' + new Date().toISOString().slice(11, 23) +
-                  '\n[ice-diag]   new:  ' + _fmt(pair) +
-                  (prev ? '\n[ice-diag]   prev: ' + _fmt(prev) : ''));
       state.selectedPair = pair;
       state.remoteAddress = { address: pair.remote.ip, port: pair.remote.port };
       // Forward to manager event bus so RTCIceTransport.onselectedcandidatepairchange
@@ -885,24 +781,11 @@ function ConnectionManager(config) {
       if (state.closed) return;
       // err shape: { type: 'srflx'|'relay'|'mdns', server, address?, error }
       // Normalize to spec shape: { address, errorCode, errorText, port, url }
-      //
-      // errorCode semantics (W3C webrtc-pc §4.3.2 / RFC 5389): codes in
-      // 300-699 are STUN/TURN ERROR RESPONSES relayed from the server;
-      // 701 means the server never answered (timeout / unreachable / DNS
-      // failure) or gathering failed locally. Our agent's gather errors
-      // are plain Errors without a .code — previously mapped to 0, which
-      // no spec-following app filters for; every real-world failure
-      // (broken STUN server, dead TURN, CGNAT) is a 701.
       var e = err || {};
-      var _code = 701;
-      if (e.error && typeof e.error.code === 'number' &&
-          e.error.code >= 300 && e.error.code <= 699) {
-        _code = e.error.code;   // genuine STUN/TURN error response
-      }
       ev.emit('icecandidateerror', {
         url:       e.server || null,
         errorText: (e.error && (e.error.message || String(e.error))) || 'gather failed',
-        errorCode: _code,
+        errorCode: (e.error && typeof e.error.code === 'number') ? e.error.code : 0,
         address:   e.address || null,
         port:      null,
       });
@@ -916,20 +799,9 @@ function ConnectionManager(config) {
       // arrives at all, and which type the classifier assigned.
       if (!state._diagPktCounts) state._diagPktCounts = { dtls:0, rtp:0, rtcp:0, unknown:0 };
       state._diagPktCounts[type || 'unknown']++;
-
-      // ── [ice-diag] per-SOURCE tally: key = remote address:port + type.
-      // When a direction dies we'll see its source's counter freeze between
-      // dumps; when the peer switches sending ports a NEW source appears.
-      // Cheap (object bump per packet), dumped with the 5s counts below.
-      if (!state._diagSrcCounts) state._diagSrcCounts = {};
-      var _sk = rinfo.address + ':' + rinfo.port + '/' + (type || '?');
-      state._diagSrcCounts[_sk] = (state._diagSrcCounts[_sk] || 0) + 1;
-
       if (!state._diagPktCountsTimer) {
         state._diagPktCountsTimer = setInterval(function () {
           _diag('[cm-diag] demux counts:', JSON.stringify(state._diagPktCounts));
-          _diag('[ice-diag] sources @' + new Date().toISOString().slice(11, 23) +
-                      ' ' + JSON.stringify(state._diagSrcCounts));
         }, 5000);
         if (state._diagPktCountsTimer.unref) state._diagPktCountsTimer.unref();
       }
@@ -1186,109 +1058,6 @@ function ConnectionManager(config) {
 
   /* ====================== Reactive State ====================== */
 
-  // W3C 4.4.1 / JSEP 5.2.2 final step: once a negotiation COMPLETES
-  // (both descriptions applied, signalingState back to 'stable'), any
-  // transceiver that is stopped AND whose m-section was negotiated as
-  // rejected (port 0 on both sides) is REMOVED from [[Transceivers]].
-  // Without this the list grows forever — every stop() leaks a slot,
-  // and long-lived connections (an SFU rotating publishers) accumulate
-  // dead transceivers that still cost an m-section in every offer.
-  function _retireStoppedTransceivers() {
-    try {
-      if (state.signalingState !== 'stable') return;
-      var lp = state.parsedCurrentLocalSdp, rp = state.parsedCurrentRemoteSdp;
-      if (!lp || !lp.media) return;
-      var rejectedMids = {};
-      for (var li = 0; li < lp.media.length; li++) {
-        var lm = lp.media[li];
-        if (lm && lm.mid != null && lm.port === 0) rejectedMids[String(lm.mid)] = true;
-      }
-      if (rp && rp.media) {
-        for (var ri = 0; ri < rp.media.length; ri++) {
-          var rm = rp.media[ri];
-          // both sides must agree the section is dead
-          if (rm && rm.mid != null && rm.port !== 0) delete rejectedMids[String(rm.mid)];
-        }
-      }
-      for (var ti = state.transceivers.length - 1; ti >= 0; ti--) {
-        var t = state.transceivers[ti];
-        var stopped = (RtpManager.isStopped(t));
-        if (stopped && t.mid != null && rejectedMids[String(t.mid)]) {
-          state.transceivers.splice(ti, 1);
-          if (state.localSsrcs) delete state.localSsrcs[String(t.mid)];
-        }
-      }
-    } catch (eRet) {}
-  }
-
-  function _markAssociatedFromApplied() {
-    try {
-      var descs = [state.parsedLocalSdp, state.parsedRemoteSdp];
-      for (var di = 0; di < descs.length; di++) {
-        var d = descs[di];
-        if (!d || !d.media) continue;
-        for (var mi2 = 0; mi2 < d.media.length; mi2++) {
-          var midv = d.media[mi2].mid;
-          if (midv == null) continue;
-          for (var ti2 = 0; ti2 < state.transceivers.length; ti2++) {
-            var tW = state.transceivers[ti2];
-            if (String(tW.mid) !== String(midv)) continue;
-            // POISON GATE (the actor-3 root): a raw mid match may be a
-            // BIRTH-MID COLLISION — an app-created transceiver whose
-            // internal mid equals a remote m-line's mid. Only legitimate
-            // owners get marked: already-associated, SRD-created, or
-            // explicitly adopted. App-created transceivers gain
-            // association ONLY through the local-offer binding step.
-            // BOTH sides (the trap named cm:1150 on the LOCAL walk as
-            // the sixth setter): a raw mid match is never enough —
-            // association enters ONLY via SRD-creation, adoption, or
-            // the local-offer binding step.
-            if (!RtpManager.isLegitimateOwner(tW)) continue;
-            tW._associated = true;
-          }
-        }
-      }
-      // JSEP binding step — MUST run AFTER the marking loops (the
-      // answer-apply grab bug: binding before marking saw legitimate
-      // owners as unmarked, judged their m-lines orphaned, and grabbed
-      // the send transceiver). Marking first, binding second.: applying a LOCAL OFFER
-      // binds each not-yet-owned m-line to the first UNASSOCIATED
-      // transceiver of the same kind, in order — writing the assigned
-      // mid back onto the transceiver. Without this, a transceiver
-      // born mid-0 that the offer serialized as mid-3 stayed orphaned,
-      // and the peer's answer built a RECEIVER on our own send m-line.
-      var dLoc = state.parsedLocalSdp;
-      if (dLoc && dLoc.media) {
-        for (var bi = 0; bi < dLoc.media.length; bi++) {
-          var bm = dLoc.media[bi];
-          if (!bm || bm.mid == null) continue;
-          if (bm.type !== 'audio' && bm.type !== 'video') continue;
-          var owned = false;
-          for (var oi = 0; oi < state.transceivers.length; oi++) {
-            if (state.transceivers[oi]._associated &&
-                String(state.transceivers[oi].mid) === String(bm.mid)) { owned = true; break; }
-          }
-          if (owned) continue;
-          for (var ui = 0; ui < state.transceivers.length; ui++) {
-            var ut = state.transceivers[ui];
-            if (ut._associated) continue;
-            if (ut.kind !== bm.type) continue;
-            if (RtpManager.isStopped(ut)) continue;
-            // RE-KEY the send-side state (the mid-3 no-RTP bug): ssrc
-            // allocation lives in state.localSsrcs keyed by the BIRTH
-            // mid — rebinding the transceiver's mid without re-keying
-            // left the send machinery looking up an empty slot, so no
-            // a=ssrc in the offer and no RTP ever transmitted. (Same
-            // re-key the adoption path already does at its own site.)
-            RtpManager.rebindMid(state, ut, bm.mid);
-            ut._associated = true;
-            break;
-          }
-        }
-      }
-    } catch (eAssoc) {}
-  }
-
   function setState(updates) {
     if (!updates || typeof updates !== 'object') return;
     if (state.closed) return;
@@ -1302,35 +1071,10 @@ function ConnectionManager(config) {
         changed = true;
 
         // Emit state change events
-        if (key === 'parsedRemoteSdp' || key === 'parsedLocalSdp' ||
-            key === 'parsedCurrentRemoteSdp' || key === 'parsedCurrentLocalSdp') {
-          _markAssociatedFromApplied();
-          // The retirement sweep needs BOTH parsedCurrent{Local,Remote}Sdp
-          // in place. setState applies keys one at a time, so running it
-          // inline saw a half-updated snapshot and never retired
-          // anything — defer it one macrotask, past the whole apply.
-          if (!state._retireScheduled) {
-            state._retireScheduled = true;
-            setTimeout(function () {
-              state._retireScheduled = false;
-              if (!state.closed) _retireStoppedTransceivers();
-            }, 0);
-          }
-        }
-        if (key === 'signalingState' && !state.closed && !state._closing) {
-          // W3C 4.4.3: close() sets signalingState to 'closed' WITHOUT
-          // firing signalingstatechange — the transition is silent.
-        // WPT harvest (mid-null-until-associated): after any successful
-        // description apply, mark transceivers whose mid appears in an
-        // APPLIED description as associated — the public transceiver.mid
-        // gate reads this. Internal allocation stays at birth.
-        _markAssociatedFromApplied();
-        _retireStoppedTransceivers();
-        ev.emit('signalingstatechange', { type: 'signalingstatechange' });
-      }
+        if (key === 'signalingState') ev.emit('signalingstatechange');
         if (key === 'iceConnectionState') ev.emit('iceconnectionstatechange');
         if (key === 'iceGatheringState') ev.emit('icegatheringstatechange');
-        if (key === 'connectionState' && !state.closed && !state._closing) ev.emit('connectionstatechange', { type: 'connectionstatechange' });
+        if (key === 'connectionState') ev.emit('connectionstatechange');
         if (key === 'sctpState') ev.emit('sctp:statechange', state.sctpState);
         // Fires on every transition ('new' → 'connecting' → 'connected' →
         // 'failed'/'closed'). Consumed by RTCDtlsTransport.onstatechange.
@@ -1389,38 +1133,6 @@ function ConnectionManager(config) {
     if (state.localGatheredCandidates.length > 0 &&
         (state.pendingLocalDescription || state.currentLocalDescription)) {
       syncGatheredCandidatesIntoLocalDescription();
-    }
-
-    // 2c. iceCandidatePoolSize flush (W3C §4.3.1 / JSEP pooled candidates).
-    //     Trigger: first description committed after a pre-gather run.
-    //     Candidates gathered before ANY description existed were held
-    //     (see the 'candidate' handler gate) — surface them now as
-    //     icecandidate events, in gather order, exactly once (the
-    //     emittedCandidateKeys ledger also protects against overlap with
-    //     live-emitted candidates from a still-running gather). 2b above
-    //     already folded them into the SDP; this step is observability
-    //     only. If gathering had already finished pre-SLD, finish the
-    //     sequence the way a live completion would: finalize + null.
-    if (state.pregatherStarted && !state.pregatherFlushed &&
-        (state.pendingLocalDescription || state.currentLocalDescription) &&
-        state.mode !== 'lite') {
-      state.pregatherFlushed = true;
-      var _pgTarget = resolveBundleTarget();
-      for (var _pgi = 0; _pgi < state.localGatheredCandidates.length; _pgi++) {
-        var _pgc = state.localGatheredCandidates[_pgi];
-        var _pgk = _candidateKey(_pgc);
-        if (state.emittedCandidateKeys[_pgk]) continue;
-        state.emittedCandidateKeys[_pgk] = true;
-        ev.emit('icecandidate', {
-          candidate: SDP.buildCandidateString(_pgc),
-          sdpMid: _pgTarget.mid,
-          sdpMLineIndex: _pgTarget.idx,
-        });
-      }
-      if (state.pregatherGatheringDone) {
-        finalizeLocalCandidatesInDescription();
-        ev.emit('icecandidate', { candidate: null });
-      }
     }
 
     // 3. DTLS: ICE connected + role known → start handshake
@@ -1762,7 +1474,8 @@ function ConnectionManager(config) {
         onDtlsConnected(session);
         return;
       }
-      var toErr = new DOMException('DTLS handshake timed out after 30s (state still connecting)', 'OperationError');
+      var toErr = new Error('DTLS handshake timed out after 30s (state still connecting)');
+      toErr.name = 'OperationError';
       try { ev.emit('dtls:error', toErr); } catch (e) {}
       try { session.close(); } catch (e) {}
       setState({ dtlsState: 'failed', connectionState: 'failed' });
@@ -1910,10 +1623,6 @@ function ConnectionManager(config) {
     if (!leafDer) {
       return { ok: false, reason: 'leaf certificate has no DER bytes' };
     }
-    // Fulfill the long-documented contract: expose the peer chain's DER
-    // bytes for RTCDtlsTransport.getRemoteCertificates().
-    state.remoteCertificates = chain.map(function (c) { return c && c.cert; })
-      .filter(function (d) { return !!d; });
 
     // Map SDP algorithm names (RFC 8122 §5) to Node's hash names.
     // sha-1 is technically still allowed by RFC 8122 but actively
@@ -1979,7 +1688,8 @@ function ConnectionManager(config) {
       // Emit a structured error so apps can surface the failure to the
       // user. errorDetail uses the W3C webrtc-pc RTCErrorDetailType
       // enumeration value reserved for this case.
-      var fpErr = new DOMException('DTLS fingerprint verification failed: ' + verification.reason, 'OperationError');
+      var fpErr = new Error('DTLS fingerprint verification failed: ' + verification.reason);
+      fpErr.name = 'OperationError';
       fpErr.errorDetail = 'fingerprint-failure';
       try { ev.emit('dtls:error', fpErr); } catch (e) {}
       // Transition to failed states. Apps watching connectionState /
@@ -2036,117 +1746,9 @@ function ConnectionManager(config) {
   function processRemoteMedia(parsed) {
     for (var i = 0; i < parsed.media.length; i++) {
       var m = parsed.media[i];
-      // A REJECTED section (port 0) still MAPS to a transceiver — WPT
-      // asserts getTransceivers().length after such an offer — but it is
-      // born STOPPED and fires NO track event. Two rules ride on this
-      // flag below: no ontrack, and no resurrection of a transceiver the
-      // retirement sweep is about to collect.
-      var _rejectedSection = !!(m && m.port === 0);
-      // A rejected section in an ANSWER is the peer confirming OUR
-      // rejection — the transceiver already exists (stopped, awaiting
-      // retirement) and must not be recreated, or the sweep and this
-      // loop cancel out and the list never shrinks. In a remote OFFER a
-      // port-0 section is new information and does map to a transceiver
-      // (born stopped, no track event).
-      if (_rejectedSection && state.signalingState !== 'have-remote-offer') continue;
       if (m.type !== 'audio' && m.type !== 'video') continue;
 
       var existing = findTransceiverByMid(m.mid);
-      if (!existing) {
-        // JSEP offer-processing reuse (the true adoption site — the
-        // legacy loop below sits in a branch this path never reaches):
-        // claim the first UNASSOCIATED same-kind transceiver, unless
-        // adopting would strand a send intent on a no-send m-line.
-        // NOTE (round-87): WPT's *DoesntPair tests want a remote OFFER to
-        // never pair with a locally-created transceiver. Enforcing that
-        // BREAKS THE FIELD — the glare/perfect-negotiation legs of the
-        // regression went red immediately (the engine relies on its
-        // sendonly transceivers being adopted into the peer's m-lines).
-        // Field wins: pairing stays, with the send-strand compat guard
-        // below as the safety rule. Roughly six WPT subtests are the
-        // deliberate cost.
-        for (var _ja = 0; _ja < state.transceivers.length; _ja++) {
-          var _jt = state.transceivers[_ja];
-          if (_jt._associated) continue;
-          if (_jt.kind !== m.type) continue;
-          if (RtpManager.isStopped(_jt)) continue;
-          if (_jt.sender && _jt.sender.track &&
-              (m.direction === 'sendonly' || m.direction === 'inactive')) continue;
-          RtpManager.rebindMid(state, _jt, m.mid);
-          _jt._adopted = true;
-          _jt._associated = true;
-          existing = _jt;
-          break;
-        }
-      }
-      // DIRECTION-UPGRADE (real-world bug found by micro): a section that
-      // was previously non-receiving (mic-muted join) and is NOW
-      // receiving must surface its track on THIS pass — the birth-track
-      // already exists on the transceiver; we emit track:new for it once.
-      if (existing && !existing._trackSurfaced &&
-          m.port !== 0 && m.direction !== 'inactive' && m.direction !== 'recvonly' &&
-          existing.receiver && existing.receiver.track) {
-        existing._trackSurfaced = true;
-        try {
-          var _upSid = m.msid ? String(m.msid).split(' ')[0] : null;
-          if (!state._remoteStreams) state._remoteStreams = {};
-          var _upStream = (_upSid && state._remoteStreams[_upSid]) || new MediaStream();
-          if (_upSid && !state._remoteStreams[_upSid]) {
-            try { Object.defineProperty(_upStream, 'id', { value: _upSid, configurable: true }); } catch (eI) {}
-            state._remoteStreams[_upSid] = _upStream;
-          }
-          _upStream.addTrack(existing.receiver.track);
-          try { existing.receiver.track.muted = false; } catch (eM) {}
-          ev.emit('track:new', {
-            mid: m.mid, kind: m.type,
-            transceiver: existing,               // the handler REQUIRES this
-            track: existing.receiver.track, stream: _upStream,
-          });
-        } catch (eUp) {}
-      }
-
-      // Negotiated-RTX override (code-review finding: the birth-time
-      // setRtxMapping assumes PT 96/97; the comment there promised "the
-      // remoteSDP parser overrides these" — this IS that override, which
-      // did not previously exist). Once the remote description names the
-      // actual apt pairing for this m-section, re-register every video
-      // layer's RTX mapping with the negotiated rtx payload type.
-      // Idempotent: runs on every SRD, so renegotiations stay correct.
-      // Falls through silently when no apt is found (keeps the default).
-      if (existing && m.type === 'video' && existing.sender &&
-          existing.sender.layers && Array.isArray(m.rtp)) {
-        var _rtxPtByApt = {};
-        if (Array.isArray(m.fmtp)) {
-          for (var _fi = 0; _fi < m.fmtp.length; _fi++) {
-            var _am = /(?:^|;)\s*apt=(\d+)/.exec(m.fmtp[_fi].config || '');
-            if (_am) _rtxPtByApt[parseInt(_am[1], 10)] = m.fmtp[_fi].payload;
-          }
-        }
-        // Our sender's primary pt on this m-line: the remote's pt for our
-        // codec (offer/answer intersection — the wire pt follows the
-        // remote's numbering).
-        var _primaryPt = null;
-        for (var _ri = 0; _ri < m.rtp.length; _ri++) {
-          var _cn = (m.rtp[_ri].codec || '').toLowerCase();
-          if (_cn === 'vp8' || _cn === 'vp9' || _cn === 'h264' || _cn === 'h265' || _cn === 'av1') {
-            _primaryPt = m.rtp[_ri].payload;
-            break;   // first video codec in the remote's preference order
-          }
-        }
-        var _negRtxPt = (_primaryPt != null) ? _rtxPtByApt[_primaryPt] : null;
-        if (_negRtxPt != null) {
-          for (var _li = 0; _li < existing.sender.layers.length; _li++) {
-            var _L = existing.sender.layers[_li];
-            if (_L.ssrc != null && _L.rtxSsrc != null) {
-              mediaTransport.setRtxMapping(_L.ssrc, _L.rtxSsrc, _negRtxPt);
-            }
-          }
-          if (_negRtxPt !== 97) {
-            _diag('[cm-diag] negotiated RTX pt override: mid=' + m.mid +
-                  ' primary=' + _primaryPt + ' rtx=' + _negRtxPt);
-          }
-        }
-      }
 
       // Simulcast reconciliation (RFC 8853). If we offered simulcast on this
       // m-section, the peer's answer will carry a=simulcast:recv with the
@@ -2294,52 +1896,6 @@ function ConnectionManager(config) {
 
       if (!peerSends || (!hasRemoteSsrcs && !hasSimulcast)) {
         if (!existing) {
-          // JSEP §5.10 REUSE (real-bug fix): an unassociated, non-stopped
-          // local transceiver of the same kind is ADOPTED for this m-line
-          // instead of duplicating. MID is a free-form token (RFC 5888) —
-          // the remote's choice wins; we adopt it into the internal
-          // namespace and re-key everything hanging off the old mid.
-          for (var _ri = 0; _ri < state.transceivers.length; _ri++) {
-            var _rt = state.transceivers[_ri];
-            if (_rt._associated) continue;
-            if (_rt.kind !== m.type) continue;
-            if (RtpManager.isStopped(_rt)) continue;
-            // JSEP compatibility (the ADOPTION-SWALLOW field bug): a
-            // transceiver that intends to SEND must NOT be adopted into
-            // a remote m-line where we cannot send (their sendonly/
-            // inactive) — that strands the track on a recvonly answer
-            // and negotiationneeded never fires.
-            if (_rt.sender && _rt.sender.track &&
-                (m.direction === 'sendonly' || m.direction === 'inactive')) continue;
-            var _oldMid = _rt.mid;
-            if (String(_oldMid) === String(m.mid)) {
-              // Same-mid adoption: previously this skipped and RELIED on
-              // the raw association walk to mark it — the poison gate
-              // now blocks that path, so adoption must claim ownership
-              // here itself (no re-key needed).
-              _rt._adopted = true;
-              existing = _rt;
-              break;
-            }
-            _rt.mid = m.mid;
-            _rt._adopted = true;   // legitimate mid owner (poison gate)
-            if (state.localSsrcs && state.localSsrcs[_oldMid]) {
-              state.localSsrcs[m.mid] = state.localSsrcs[_oldMid];
-              delete state.localSsrcs[_oldMid];
-              if (state.localSsrcs[m.mid]) state.localSsrcs[m.mid].msid = state.localSsrcs[m.mid].msid; // keep
-            }
-            if (state.clientMidBySsrc) {
-              for (var _sk in state.clientMidBySsrc) {
-                if (String(state.clientMidBySsrc[_sk]) === String(_oldMid)) {
-                  state.clientMidBySsrc[_sk] = String(m.mid);
-                }
-              }
-            }
-            existing = _rt;
-            break;
-          }
-        }
-        if (!existing) {
           var _sender = {
             track: null, ssrc: null, rtxSsrc: null,
             layers: [{ rid: null, ssrc: null, rtxSsrc: null }],
@@ -2349,20 +1905,11 @@ function ConnectionManager(config) {
             }],
             _negotiatedCodecs: _senderCodecs,
           };
-          // WPT/spec: the receiver's track exists FROM transceiver
-          // creation (muted, live) — media later reuses this object.
-          var _birthTrack = null;
-          try {
-            _birthTrack = new MediaStreamTrack({ kind: m.type, label: 'remote ' + m.type });
-            _birthTrack.muted = true;
-          } catch (eBt) {}
           state.transceivers.push({
-            _srdCreated: true,   // rollback removes ONLY these (JSEP)
             mid: m.mid,
             sender:   _sender,
-            receiver: { track: _birthTrack },
-            // W3C 5.10: an SRD-created transceiver's direction is 'recvonly'
-            direction:        'recvonly',
+            receiver: { track: null },
+            direction:        _ourDirection,
             currentDirection: null,
             kind:             m.type,
             remoteCodecs:     m.codecs,
@@ -2411,16 +1958,9 @@ function ConnectionManager(config) {
             }],
             _negotiatedCodecs: _senderCodecs,
           },
-          receiver: { track: null } /* filled below or by track:new */,
-          direction: _rejectedSection ? 'stopped' : 'recvonly',  // W3C 5.10
+          receiver: { track: null },
+          direction: _ourDirection,
           currentDirection: null,
-          // Birth flags (the shape-2 gap, deferred since round 66): this
-          // transceiver was CREATED BY a remote m-line, so it legitimately
-          // owns that mid — rollback may remove it, the public mid getter
-          // must expose the mid, and every selector may steer it.
-          _srdCreated: true,
-          _associated: true,
-          _rejected: _rejectedSection,
           kind: m.type,
           remoteCodecs: m.codecs,
           remoteExtensions: m.extensions,
@@ -2528,65 +2068,13 @@ function ConnectionManager(config) {
         }
       }
 
-      // WPT: rejected m-sections (port 0) and non-receiving directions do
-      // not surface tracks NOW — but a later renegotiation may UPGRADE the
-      // direction (mic-unmute is the everyday case), so this is a per-pass
-      // veto, never a permanent one: we mark the section and fall through
-      // on the next pass that allows receiving.
-      var _allowRecvNow = !(m.port === 0 || m.direction === 'inactive' || m.direction === 'recvonly');
-      if (!_allowRecvNow) {
-        var _exT = null;
-        for (var _xi = 0; _xi < state.transceivers.length; _xi++) {
-          if (String(state.transceivers[_xi].mid) === String(m.mid)) { _exT = state.transceivers[_xi]; break; }
-        }
-        if (_exT) _exT._trackSurfaced = false;
-        continue;
-      }
       // Create MediaStreamTrack + MediaStream
-      var track = (transceiver.receiver && transceiver.receiver.track) ||
-        new MediaStreamTrack({
-          kind:  m.type,
-          // WPT/browser parity: remote tracks are labeled 'remote <kind>'
-          label: 'remote ' + m.type,
-        });
-      // media has (or is about to) arrive on this track
-      try { track.muted = false; } catch (eUm) {}
-      // WPT harvest: tracks sharing a remote msid must surface in the
-      // SAME MediaStream object (ontrack ordering tests compare object
-      // identity), and the stream's id must equal the remote msid token.
-      var msidSid = m.msid ? String(m.msid).split(' ')[0] : null;
-      if (!state._remoteStreams) state._remoteStreams = {};
-      var stream;
-      if (msidSid && msidSid !== '-' && state._remoteStreams[msidSid]) {
-        stream = state._remoteStreams[msidSid];
-      } else {
-        // W3C 5.1 step 8: a remote m-line with NO msid (or the '-'
-        // placeholder) means the sender associated the track with NO
-        // stream — the track event must carry an EMPTY streams array.
-        // Synthesising a stream here made every such event report one.
-        stream = new MediaStream();
-        if (msidSid && msidSid !== '-') {
-          try { Object.defineProperty(stream, 'id', { value: msidSid, configurable: true }); } catch (e) {}
-          state._remoteStreams[msidSid] = stream;
-        }
-      }
+      var track = new MediaStreamTrack({
+        kind:  m.type,
+        label: m.mid + '_' + m.type,
+      });
+      var stream = new MediaStream();
       stream.addTrack(track);
-      // MULTI-STREAM: the track belongs to EVERY stream its m-section
-      // named, not just the first. We added it to one, so an app that
-      // read stream2.getTracks() found it empty even though the track
-      // event correctly listed both streams.
-      var _joinList = (m.msids && m.msids.length) ? m.msids : [];
-      for (var _j = 0; _j < _joinList.length; _j++) {
-        var _jid = String(_joinList[_j]).split(' ')[0];
-        if (!_jid || _jid === '-' || _jid === msidSid) continue;
-        var _js = state._remoteStreams[_jid];
-        if (!_js) {
-          _js = new MediaStream();
-          try { Object.defineProperty(_js, 'id', { value: _jid, configurable: true }); } catch (eJ) {}
-          state._remoteStreams[_jid] = _js;
-        }
-        if (_js.getTracks().indexOf(track) === -1) _js.addTrack(track);
-      }
       transceiver.receiver.track = track;
 
       // The receive pipeline (jitter buffer → depacketizer → decoder → track._push)
@@ -2599,35 +2087,7 @@ function ConnectionManager(config) {
       }
 
       // Emit for api.js to wrap in RTCTrackEvent
-      transceiver._trackSurfaced = true;
-      // W3C 5.1 step 8: with NO msid (or the '-' placeholder) the sender
-      // associated this track with NO stream, so the EVENT announces an
-      // empty streams array — the stream object still exists internally
-      // (the receive pipeline and stream bookkeeping need it), it is
-      // simply not reported to the application.
-      // MULTI-STREAM (W3C 5.1 step 8): a track may belong to SEVERAL
-      // MediaStreams, one per a=msid line. Build (or reuse) a stream for
-      // each and announce them all — we only ever announced the first,
-      // so an app that received a track shared across two streams saw
-      // one and silently lost the grouping the sender intended.
-      var _allStreams = [];
-      var _msidList = (m.msids && m.msids.length) ? m.msids : (m.msid ? [m.msid] : []);
-      for (var _ms = 0; _ms < _msidList.length; _ms++) {
-        var _sid2 = String(_msidList[_ms]).split(' ')[0];
-        if (!_sid2 || _sid2 === '-') continue;
-        var _st2 = state._remoteStreams[_sid2];
-        if (!_st2) {
-          _st2 = new MediaStream();
-          try { Object.defineProperty(_st2, 'id', { value: _sid2, configurable: true }); } catch (eI2) {}
-          state._remoteStreams[_sid2] = _st2;
-        }
-        if (_allStreams.indexOf(_st2) === -1) _allStreams.push(_st2);
-      }
-      var _noMsid = !(msidSid && msidSid !== '-');
-      // No track event for a rejected section — there is no media there.
-      if (_rejectedSection) continue;
       ev.emit('track:new', {
-        streamsAnnounced: _noMsid ? [] : (_allStreams.length > 1 ? _allStreams : null),
         mid: m.mid,
         kind: m.type,
         track: track,
@@ -2652,10 +2112,9 @@ function ConnectionManager(config) {
     var layers = transceiver.sender.layers;
 
     // Register the RTX mapping for every layer so that incoming NACKs on
-    // any layer can be served via RFC 4588. PT 96/97 is the PRE-NEGOTIATION
-    // default; processRemoteMedia re-registers with the negotiated apt
-    // pairing on every SRD (the override this comment used to promise
-    // now actually exists — see 'Negotiated-RTX override' there).
+    // any layer can be served via RFC 4588. Assumes video PT=96/RTX PT=97
+    // for all layers; when a non-default codec negotiates, remoteSDP
+    // parser overrides these.
     if (kind === 'video') {
       for (var mi = 0; mi < layers.length; mi++) {
         mediaTransport.setRtxMapping(layers[mi].ssrc, layers[mi].rtxSsrc, 97);
@@ -2695,13 +2154,7 @@ function ConnectionManager(config) {
 
 
   function findTransceiverByMid(mid) {
-    // JSEP: a mid MATCH is only meaningful for ASSOCIATED transceivers —
-    // an unassociated local transceiver's internal birth-mid colliding
-    // with the remote's midspace must NOT capture an incoming m-line
-    // (the adoption path, with its compatibility rules, owns that case).
-    var t = RtpManager.findByMid(state, mid);
-    if (t && !RtpManager.isLegitimateOwner(t)) return null;
-    return t;
+    return RtpManager.findByMid(state, mid);
   }
 
   function findRemoteSsrcForMid(mid) {
@@ -2766,12 +2219,6 @@ function ConnectionManager(config) {
     // none of the close-transition events would fire. The cascades after
     // the loop are all guarded against the 'closed' state values, so
     // they're safe to run during this final transition.
-    // W3C 4.4.3: the transitions caused by close() are SILENT for the
-    // connection-level states — signalingstatechange and
-    // connectionstatechange must NOT fire (WPT asserts both). Transport
-    // cascades still need the values applied, so a dedicated flag marks
-    // this final transition and the emit sites above honour it.
-    state._closing = true;
     setState({
       signalingState:     'closed',
       iceConnectionState: 'closed',
@@ -2779,7 +2226,6 @@ function ConnectionManager(config) {
       dtlsState:          'closed',
       sctpState:          'closed',
     });
-    state._closing = false;
 
     state.closed = true;
     // Reject any in-flight or queued chain operations so their user-facing
@@ -2793,40 +2239,6 @@ function ConnectionManager(config) {
 
   this.state = state;
   this.ev = ev;
-
-  // ── iceCandidatePoolSize pre-gathering (W3C §4.3.1) ──
-  // Called by api.js at construction when the app configured a pool.
-  // Brings the ICE agent up and starts gathering IMMEDIATELY, so by the
-  // time the first offer/answer is created the candidates are already in
-  // the roster — shaving the STUN/portmap round-trips (hundreds of ms)
-  // off time-to-media. Cascade 1's `!iceAgent` guard makes the normal
-  // post-SLD path a no-op afterwards; the 'candidate' handler holds
-  // emission until a description exists (cascade 2c flushes).
-  //
-  // Lite mode: no-op — lite gathers synchronously at SDP-build time
-  // (prepareIceForSdp), there is nothing to prewarm.
-  //
-  // The agent's `controlling` guess is made from signalingState 'stable'
-  // (→ controlled); if this side later offers first, RFC 8445 §7.3.1.1
-  // role-conflict resolution corrects it via tie-breaker — the same
-  // mechanism the late-creation path already relies on (see
-  // ensureIceAgent's comment).
-  this.pregather = function () {
-    if (state.closed) return;
-    if (iceAgent) return;               // already up — nothing to prewarm
-    if (state.mode === 'lite') return;
-    ensureIceCredentials();             // generates ufrag/pwd; SDP build reuses them
-    ensureIceAgent();
-    iceAgent.setLocalParameters({
-      ufrag: state.localIceUfrag,
-      pwd:   state.localIcePwd,
-    });
-    if (config.router) {
-      config.router._registerAgent(iceAgent);
-    }
-    state.pregatherStarted = true;
-    iceAgent.gather();
-  };
 
   // Convenience: forward event-emitter interface so consumers don't have to
   // reach into `.ev`. This mirrors the typical EventEmitter surface.
@@ -2847,66 +2259,18 @@ function ConnectionManager(config) {
       sdpOA.createAnswer(options || {}, next);
     }, cb);
   };
-  // ICE role tracking — mirror libwebrtc's ACTUAL policy (verified via
-  // w3c/webrtc-stats#162): the role is set by the INITIAL offerer and
-  // re-determined ONLY on ICE restart, where the restart's offerer
-  // becomes controlling (RFC 5245 legacy — removed in RFC 8445, but
-  // browsers kept it). Our previous behavior (role frozen at agent
-  // birth, 8445-pure) desynced from Chrome across restart cycles: after
-  // a browser-initiated recovery restart the roles flipped on their side
-  // only, both ended up 'controlled', every consent check 487'd, and ICE
-  // reported 'disconnected' (the M2 party storm — see the agent's ROLE
-  // CONFLICT diag). Interop beats purity: follow 5245 like the browsers.
-  //
-  // Restart detection: the offer carries a DIFFERENT ice-ufrag than the
-  // one currently in force for that side. Non-restart renegotiations
-  // reuse the ufrag and MUST NOT move roles. Lite mode is exempt: a
-  // lite agent is ALWAYS controlled (RFC 8445 §6.1.1).
-  function _sdpFirstUfrag(sdp) {
-    var m = /a=ice-ufrag:([^\r\n]+)/.exec(sdp || '');
-    return m ? m[1].trim() : null;
-  }
-  function trackNegotiationRole(desc, weAreOfferer) {
-    if (!desc || desc.type !== 'offer' || !desc.sdp) return;  // answers never move roles
-    if (state.mode === 'lite') return;
-    var offered = _sdpFirstUfrag(desc.sdp);
-    if (offered == null) return;
-    var prev = weAreOfferer ? state.localIceUfrag : state.remoteIceUfrag;
-    var isRestart = (prev != null && offered !== prev);
-    // First negotiation: agent-birth heuristic already set the role; only
-    // explicit restarts re-determine it afterwards.
-    if (!isRestart) return;
-    if (iceAgent && typeof iceAgent.setRole === 'function') {
-      iceAgent.setRole(weAreOfferer);
-    }
-  }
-
   this.setLocalDescription = function (desc, cb) {
-    trackNegotiationRole(desc, true);
     sdpOA.chainOperation(function (next) {
       sdpOA.setLocalDescription(desc, next);
     }, cb);
   };
   this.setRemoteDescription = function (desc, cb) {
-    trackNegotiationRole(desc, false);
     sdpOA.chainOperation(function (next) {
       sdpOA.setRemoteDescription(desc, next);
     }, cb);
   };
   this.addIceCandidate = function (candidate, cb) {
     sdpOA.chainOperation(function (next) {
-      // W3C 4.4.2 step 3, evaluated WHEN THE OPERATION RUNS: a candidate
-      // (including the bare end-of-candidates form) needs a remote
-      // description to address. Run time is the only correct moment —
-      // with an idle chain after a rollback there is none and this
-      // rejects, while during glare the candidate queues behind the
-      // in-flight setRemoteDescription and finds one by the time it
-      // runs. Checking at call time gives one answer where two are
-      // needed.
-      if (!state.currentRemoteDescription && !state.pendingRemoteDescription) {
-        return next(new DOMException(
-          'addIceCandidate: no remote description', 'InvalidStateError'));
-      }
       sdpOA.addIceCandidate(candidate, next);
     }, cb);
   };

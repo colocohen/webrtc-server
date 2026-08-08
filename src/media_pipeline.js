@@ -479,7 +479,10 @@ function createVideoSendPipeline(opts) {
     o.targetBitrate = bitrate;
     o.frameWidth    = width;
     o.frameHeight   = height;
-    o.framesPerSecond = framerate;
+    // framesPerSecond is DERIVED at stats-read time (api.js) from the
+    // framesEncoded delta — do not write the configured framerate here:
+    // it reported the target instead of the measurement, and froze at
+    // that value forever once the encoder stalled.
 
     var pkts;
     try {
@@ -1163,6 +1166,8 @@ function createAudioSendPipeline(opts) {
     catch (e) { /* controller may be closed */ }
   }
 
+  var _lastEncErrMsg = null, _lastEncErrAt = 0, _encErrSuppressed = 0;
+
   var encoder = new AudioEncoder({
     output: function (chunk) {
       if (stopped) return;
@@ -1170,8 +1175,22 @@ function createAudioSendPipeline(opts) {
       else              _processChunkForSend(chunk);
     },
     error: function (err) {
+      // Rate-limited: a persistent per-frame failure (50 frames/sec)
+      // previously printed hundreds of identical lines and the constant
+      // throw+log churn is itself a jank source. Same message → once
+      // per 5s with a suppression count.
       if (typeof console !== 'undefined' && console.error) {
-        console.error('[media_pipeline] audio encoder error:', err && err.message || err);
+        var _m = (err && err.message) || String(err);
+        var _now = Date.now();
+        if (_m !== _lastEncErrMsg || (_now - _lastEncErrAt) > 5000) {
+          if (_encErrSuppressed > 0) {
+            console.error('[media_pipeline] audio encoder error: (repeated ' + _encErrSuppressed + ' more times)');
+          }
+          console.error('[media_pipeline] audio encoder error:', _m);
+          _lastEncErrMsg = _m; _lastEncErrAt = _now; _encErrSuppressed = 0;
+        } else {
+          _encErrSuppressed++;
+        }
       }
     },
   });
@@ -1218,18 +1237,51 @@ function createAudioSendPipeline(opts) {
     if (opts.fmtp.cbr != null)              _opusFmtp.cbr = parseInt(opts.fmtp.cbr, 10) === 1;
   }
 
-  encoder.configure({
-    codec:            codecInfo.decoderCodec,
-    sampleRate:       codecInfo.clockRate,
-    numberOfChannels: codecInfo.numberOfChannels,
-    bitrate:          bitrate,
-    opus:             _opusFmtp || undefined,
-  });
+  // ── Channel-count handling (RFC 7587 §7) ──
+  // The SDP's "opus/48000/2" is FIXED NOTATION describing the decoder's
+  // capability — it does NOT constrain the encoder's input. Opus packets
+  // are self-describing (mono/stereo lives in the TOC byte), and Chrome
+  // itself advertises /2 while happily sending mono from a mono mic.
+  // Configuring the encoder to the SDP's "2" and rejecting the track's
+  // real format made every mono source (most microphones, programmatic
+  // tracks) fail on EVERY frame: "audioData.numberOfChannels=1 does not
+  // match configured numberOfChannels=2", 50 throws/sec, audio dead at
+  // 0kbps. The encoder must follow the TRACK: configure with the default,
+  // then reconfigure to the actual channel count the moment a frame with
+  // a different one arrives (first frame for mono sources — before
+  // anything was encoded, so the FFmpeg restart cost is paid once and
+  // effectively at startup).
+  var _configuredChannels = codecInfo.numberOfChannels;
+  function _configureEncoder(channels) {
+    _configuredChannels = channels;
+    encoder.configure({
+      codec:            codecInfo.decoderCodec,
+      sampleRate:       codecInfo.clockRate,
+      numberOfChannels: channels,
+      bitrate:          bitrate,
+      opus:             _opusFmtp || undefined,
+    });
+  }
+  _configureEncoder(codecInfo.numberOfChannels);
 
   var onData = function (audioData) {
     if (stopped || !active) {
       try { if (audioData && typeof audioData.close === 'function') audioData.close(); } catch (e) {}
       return;
+    }
+    // Follow the track's real channel layout (see RFC 7587 note above).
+    var _ch = audioData && audioData.numberOfChannels;
+    if (_ch && _ch !== _configuredChannels) {
+      if (typeof console !== 'undefined' && console.log) {
+        console.log('[media_pipeline] audio track is ' + _ch + '-channel ' +
+          '(SDP notation says ' + codecInfo.numberOfChannels + ') — reconfiguring encoder to follow the track');
+      }
+      try { _configureEncoder(_ch); }
+      catch (e) {
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('[media_pipeline] audio encoder reconfigure failed:', e && e.message || e);
+        }
+      }
     }
     // RFC 6464 send side (RTP-5): level is a property of THIS frame, so
     // compute pre-encode and let the send loop attach it to the packets
@@ -1742,6 +1794,20 @@ function createVideoReceivePipeline(opts) {
   var depacketizer = new codecInfo.Depacketizer({
     output: function (chunk) {
       if (stopped) return;
+
+      // framesReceived (W3C webrtc-stats, video inbound-rtp): "total
+      // number of complete frames received on this RTP stream". This is
+      // the DEPACKETIZER-level counter — it advances whenever media is
+      // flowing, decode or no decode. That makes it the right liveness
+      // signal for SFU/forwarding mode, where the lazy decoder below
+      // never spins up and framesDecoded/framesPerSecond stay 0.
+      // Chrome reports this field; api.js surfaces it in getStats.
+      var _rs = manager.state.rtpStats[ssrc];
+      if (_rs) {
+        if (!_rs.framesReceived) _rs.framesReceived = 0;
+        _rs.framesReceived++;
+      }
+
       // Always enqueue to readable: encoded chunks are always available
       // for SFU forwarding, RTP rewriting, or any other in-flight use
       // case. The readable's bounded queue drops if the app isn't

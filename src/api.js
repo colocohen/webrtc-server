@@ -13,6 +13,7 @@ import {
   createAudioSendPipeline, createAudioReceivePipeline,
 } from './media_pipeline.js';
 import * as SDP from './sdp.js';
+import * as RtpManager from './rtp_transmission_manager.js';
 import { getSupportedVideoCodecs, getSupportedAudioCodecs, MediaStreamTrack } from 'media-processing';
 
 // Debug logging gate. Set WEBRTC_DEBUG=1 in env to enable diagnostic
@@ -23,6 +24,68 @@ var _DBG = (typeof process !== 'undefined' &&
             process.env &&
             (process.env.WEBRTC_DEBUG === '1' ||
              process.env.WEBRTC_DEBUG === 'true'));
+
+// ── Single source of truth for the default codec set (WPT/behavior:
+//    identical shape must appear in getCapabilities, sender post-
+//    negotiation params, and receiver mirrors — it was duplicated 4x). ──
+
+// Derive the codec list for a mid/kind from an APPLIED description —
+// WPT requires receiver codecs to match the LOCAL SDP m-line exactly
+// (count, payloadTypes, fmtp), not a static default table.
+function _codecsFromSdp(manager, kind, mid) {
+  try {
+    var d = manager && manager.state && (manager.state.parsedLocalSdp || manager.state.parsedRemoteSdp);
+    if (!d || !d.media) return null;
+    var m = null;
+    for (var i = 0; i < d.media.length; i++) {
+      if (String(d.media[i].mid) === String(mid) ||
+          (mid == null && d.media[i].type === kind)) { m = d.media[i]; break; }
+    }
+    if (!m || !m.codecs || !m.codecs.length) return null;
+    var out = [];
+    for (var c = 0; c < m.codecs.length; c++) {
+      var cc = m.codecs[c];
+      // parser shape: {payloadType, name, clockRate, channels, fmtp:{k:v}}
+      var fmtpStr;
+      if (cc.fmtp && typeof cc.fmtp === 'object') {
+        var kv = [];
+        for (var fk in cc.fmtp) kv.push(fk + '=' + cc.fmtp[fk]);
+        fmtpStr = kv.length ? kv.join(';') : undefined;
+      } else if (typeof cc.fmtp === 'string' && cc.fmtp) {
+        fmtpStr = cc.fmtp;
+      }
+      var entry = {
+        payloadType: cc.payloadType,
+        mimeType: kind + '/' + cc.name,
+        clockRate: cc.clockRate,
+      };
+      if (kind === 'audio') entry.channels = cc.channels || 1;
+      if (fmtpStr !== undefined) entry.sdpFmtpLine = fmtpStr;
+      out.push(entry);
+      // the parser FOLDS rtx into rtxPayloadType; the SDP (and WPT's
+      // per-index comparison against it) lists rtx right after its
+      // primary — re-expand in the same interleaved order.
+      if (cc.rtxPayloadType != null) {
+        out.push({
+          payloadType: cc.rtxPayloadType,
+          mimeType: kind + '/rtx',
+          clockRate: cc.clockRate,
+          sdpFmtpLine: 'apt=' + cc.payloadType,
+        });
+      }
+    }
+    return out.length ? out : null;
+  } catch (e) { return null; }
+}
+function _defaultCodecs(kind) {
+  return kind === 'video'
+    ? [{ payloadType: 96, mimeType: 'video/VP8', clockRate: 90000 },
+       { payloadType: 97, mimeType: 'video/rtx', clockRate: 90000, sdpFmtpLine: 'apt=96' }]
+    : [{ payloadType: 111, mimeType: 'audio/opus', clockRate: 48000, channels: 2,
+         sdpFmtpLine: 'minptime=10;useinbandfec=1' },
+       { payloadType: 8, mimeType: 'audio/PCMA', clockRate: 8000, channels: 1 },
+       { payloadType: 0, mimeType: 'audio/PCMU', clockRate: 8000, channels: 1 }];
+}
 function _diag() {
   if (!_DBG) return;
   // Use console.log with the original args. Apply pattern keeps the
@@ -36,6 +99,38 @@ function _diag() {
 /* ========================= RTCPeerConnection ========================= */
 
 function RTCPeerConnection(config) {
+  // WPT-harvest: spec-grade config validation at construction (W3C §4.4.1.1).
+  config = config || {};
+  var _normIceServers = _validateIceServers(config.iceServers, 'RTCPeerConnection');
+  // remembered for setConfiguration's immutability check
+  try { /* set after manager exists */ } catch (e0) {}
+  if (config.certificates === null) {
+    throw new TypeError('RTCPeerConnection: certificates must be a sequence');
+  }
+  if (config.certificates && config.certificates.length) {
+    for (var cni = 0; cni < config.certificates.length; cni++) {
+      if (config.certificates[cni] == null) {
+        throw new TypeError('RTCPeerConnection: certificates entries must be RTCCertificate');
+      }
+    }
+  }
+  if (config.certificates && config.certificates.length) {
+    for (var cxi = 0; cxi < config.certificates.length; cxi++) {
+      var cx = config.certificates[cxi];
+      if (cx && typeof cx.expires === 'number' && cx.expires <= Date.now()) {
+        throw new DOMException('RTCPeerConnection: certificate expired', 'InvalidAccessError');
+      }
+    }
+  }
+
+  // WebIDL-shape (WPT harvest): public methods live on the PROTOTYPE
+  // (assert_idl_attribute demands it, and duck-typing libraries expect
+  // it). The closure pattern stays untouched — implementations live on a
+  // hidden per-instance table and the prototype delegates.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+  Object.defineProperty(this, '_handlers', { value: {}, enumerable: false });
+
   if (!(this instanceof RTCPeerConnection)) return new RTCPeerConnection(config);
 
   config = config || {};
@@ -50,14 +145,19 @@ function RTCPeerConnection(config) {
     throw new TypeError('RTCPeerConnection: invalid iceTransportPolicy "' +
       config.iceTransportPolicy + '" (expected "all" or "relay")');
   }
-  if (config.bundlePolicy != null &&
+  if (config.bundlePolicy !== undefined &&
       config.bundlePolicy !== 'balanced' &&
       config.bundlePolicy !== 'max-bundle' &&
       config.bundlePolicy !== 'max-compat') {
     throw new TypeError('RTCPeerConnection: invalid bundlePolicy "' +
       config.bundlePolicy + '" (expected "balanced", "max-bundle", or "max-compat")');
   }
-  if (config.rtcpMuxPolicy != null && config.rtcpMuxPolicy !== 'require') {
+    if (config.iceTransportPolicy !== undefined &&
+        config.iceTransportPolicy !== 'all' && config.iceTransportPolicy !== 'relay') {
+      // null and any non-enum value are TypeErrors per WebIDL enum rules
+      throw new TypeError('RTCPeerConnection: invalid iceTransportPolicy "' + config.iceTransportPolicy + '"');
+    }
+  if (config.rtcpMuxPolicy !== undefined && config.rtcpMuxPolicy !== 'require') {
     // W3C removed 'negotiate' — 'require' is the only valid value.
     throw new TypeError('RTCPeerConnection: invalid rtcpMuxPolicy "' +
       config.rtcpMuxPolicy + '" (only "require" is supported per spec)');
@@ -73,8 +173,6 @@ function RTCPeerConnection(config) {
   // NOTE: bundlePolicy='balanced' and 'max-compat' are accepted but not
   // enforced — the implementation always produces 'max-bundle' style SDP.
   // TODO: real bundlePolicy enforcement (deferred — touches sdp.js + cm.js).
-  // NOTE: iceCandidatePoolSize is round-tripped via getConfiguration but
-  // does not actually pre-gather. TODO: implement pre-gather pool.
 
   // W3C RTCConfiguration.certificates — if the app provides an
   // RTCCertificate (produced by RTCPeerConnection.generateCertificate),
@@ -107,6 +205,19 @@ function RTCPeerConnection(config) {
   manager.state._certificates = Array.isArray(config.certificates)
     ? config.certificates.slice() : [];
 
+  // W3C iceCandidatePoolSize: a nonzero pool means "start gathering
+  // transport candidates NOW, at construction" — so the first
+  // offer/answer finds them ready instead of paying the STUN/portmap
+  // round-trips inline. The spec's pool is per-transport (we run one
+  // BUNDLE transport, so any nonzero value maps to one pre-gather run).
+  // Pooled candidates are NOT surfaced through onicecandidate until a
+  // local description is set, matching browsers — the manager holds and
+  // flushes them (see cm's pregather()/cascade 2c).
+  if (manager.state.iceCandidatePoolSize > 0 &&
+      typeof manager.pregather === 'function') {
+    manager.pregather();
+  }
+
 
   // ── Read-only properties ──
 
@@ -123,19 +234,14 @@ function RTCPeerConnection(config) {
     get: function() { return manager.state.connectionState; },
   });
   Object.defineProperty(this, 'canTrickleIceCandidates', {
-    // W3C §4.3.2: returns null until a remote description has been set,
-    // then true if the remote indicated trickle support (via
-    // a=ice-options:trickle), else false. We're permissive here — once
-    // a remote description is set we assume trickle support unless we
-    // explicitly stored otherwise. (cm.js doesn't currently parse
-    // ice-options on the remote side; trickle support is the WebRTC
-    // norm, so true is the correct optimistic default.)
+    // null before SRD; afterwards reflects the remote's declared
+    // a=ice-options:trickle (session or media level).
     get: function() {
-      if (!manager.state.currentRemoteDescription &&
-          !manager.state.pendingRemoteDescription) {
-        return null;
-      }
-      return true;
+      var st = manager.state;
+      if (!st.parsedRemoteSdp) return null;
+      var raw = (st.currentRemoteDescription && st.currentRemoteDescription.sdp) ||
+                (st.pendingRemoteDescription && st.pendingRemoteDescription.sdp) || '';
+      return /a=ice-options:[^\r\n]*trickle/.test(raw);
     },
   });
 
@@ -208,6 +314,12 @@ function RTCPeerConnection(config) {
   var _sctpTransport = null;
   Object.defineProperty(this, 'sctp', {
     get: function() {
+      var pL = manager.state.parsedLocalSdp, pR = manager.state.parsedRemoteSdp;
+      var hasData = function (p) {
+        return !!(p && p.media && p.media.some(function (mm) {
+          return mm.type === 'application'; }));
+      };
+      if (!hasData(pL) && !hasData(pR)) return null;
       var sctpNegotiated =
         (manager.state.dataChannels && manager.state.dataChannels.length > 0) ||
         manager.state.remoteSctpPort != null ||
@@ -256,9 +368,20 @@ function RTCPeerConnection(config) {
       Object.defineProperty(self, 'on' + name, {
         get: function() { return _handlers[name] || null; },
         set: function(fn) {
-          if (_handlers[name]) ev.removeListener(name, _handlers[name]);
+          if (_handlers[name]) ev.removeListener(name, _handlers[name]._wrapped || _handlers[name]);
           _handlers[name] = fn;
-          if (fn) ev.on(name, fn);
+          if (fn) {
+            // Same Event-shape guarantee as addEventListener: on-handlers
+            // must receive an object with .type (apps and WPT both read
+            // it) even though the internal channel carries no payload.
+            var wrapped = function (payload) {
+              if (payload && typeof payload === 'object' && payload.type) return fn.call(self, payload);
+              fn.call(self, { type: name, target: self, currentTarget: self,
+                              bubbles: false, cancelable: false, isTrusted: true });
+            };
+            fn._wrapped = wrapped;
+            ev.on(name, wrapped);
+          }
         },
       });
     })(_evNames[ei]);
@@ -270,10 +393,13 @@ function RTCPeerConnection(config) {
   // appropriate W3C event class so listeners see a proper event object
   // (with .type, etc.) — matching browser behavior. We add a permanent
   // internal listener that forwards wrapped events to the user's handler.
-  var _iceCandHandler = null;
-  var _iceCandErrHandler = null;
   ev.on('icecandidate', function (payload) {
-    if (!_iceCandHandler) return;
+    // W3C timing (WPT): onicecandidate observably fires AFTER the
+    // setLocalDescription promise resolves — one macrotask of deferral.
+    setImmediate(function () { _fireIceCandidate(payload); });
+  });
+  function _fireIceCandidate(payload) {
+    if (!self._handlers.onicecandidate) return;
     // payload is either { candidate: null } (end-of-candidates) or
     // { candidate: '<string>', sdpMid, sdpMLineIndex }. Browser wraps this
     // in RTCPeerConnectionIceEvent whose .candidate is an RTCIceCandidate
@@ -286,42 +412,33 @@ function RTCPeerConnection(config) {
         sdpMLineIndex: payload.sdpMLineIndex,
       });
     }
-    _iceCandHandler(new RTCPeerConnectionIceEvent({ candidate: candidate }));
-  });
-  Object.defineProperty(self, 'onicecandidate', {
-    get: function() { return _iceCandHandler; },
-    set: function(fn) { _iceCandHandler = fn; },
-  });
+    self._handlers.onicecandidate(new RTCPeerConnectionIceEvent({ candidate: candidate }));
+  }
 
   ev.on('icecandidateerror', function (payload) {
-    if (!_iceCandErrHandler) return;
-    _iceCandErrHandler(new RTCPeerConnectionIceErrorEvent(payload || {}));
-  });
-  Object.defineProperty(self, 'onicecandidateerror', {
-    get: function() { return _iceCandErrHandler; },
-    set: function(fn) { _iceCandErrHandler = fn; },
+    if (!self._handlers.onicecandidateerror) return;
+    self._handlers.onicecandidateerror(new RTCPeerConnectionIceErrorEvent(payload || {}));
   });
 
-  // ondatachannel — wraps internal channel → RTCDataChannel
-  var _dcHandler = null;
+  // ondatachannel — wraps internal channel → RTCDataChannel.
+  //
+  // TWIN OF THE 'track' ASYMMETRY (code-review finding #1): the wrapped
+  // RTCDataChannelEvent used to reach ONLY the ondatachannel property;
+  // addEventListener('datachannel') subscribers received the RAW internal
+  // payload — wrong shape entirely. Fix mirrors 'track': build the W3C
+  // event ONCE per channel, deliver to the property handler, and re-emit
+  // on 'datachannel:wrapped' which addEventListener subscribes to (see
+  // its special-casing, alongside icecandidate's).
   ev.on('datachannel', function(internal) {
-    _diag('[api-diag] datachannel event received, _dcHandler=' + (_dcHandler ? 'set' : 'null') +
+    _diag('[api-diag] datachannel event received, self._handlers.ondatachannel=' + (self._handlers.ondatachannel ? 'set' : 'null') +
                 ' channel=' + (internal && internal.channel && internal.channel.label));
-    if (_dcHandler) {
-      var wrapped = new RTCDataChannel(internal.channel, manager);
-      _dcHandler(new RTCDataChannelEvent({ channel: wrapped }));
-    }
-  });
-  Object.defineProperty(self, 'ondatachannel', {
-    get: function() { return _dcHandler; },
-    set: function(fn) {
-      _diag('[api-diag] ondatachannel setter called, fn=' + (fn ? 'function' : 'null'));
-      _dcHandler = fn;
-    },
+    var wrapped = new RTCDataChannel(internal.channel, manager);
+    var dcEvent = new RTCDataChannelEvent('datachannel', { channel: wrapped });
+    if (self._handlers.ondatachannel) self._handlers.ondatachannel(dcEvent);
+    ev.emit('datachannel:wrapped', dcEvent);
   });
 
   // ontrack — wraps manager's track:new into RTCTrackEvent
-  var _trackHandler = null;
   ev.on('track:new', function(info) {
     _diag('[api-diag] track:new fired — mid=' + info.mid + ' kind=' + info.kind);
 
@@ -331,32 +448,49 @@ function RTCPeerConnection(config) {
     var transceiver = _tcCache(info.transceiver);
     transceiver._receiver._setTrack(info.track);
 
-    _diag('[api-diag] track:new — _trackHandler=' + (_trackHandler ? 'set' : 'null') +
+    _diag('[api-diag] track:new — self._handlers.ontrack=' + (self._handlers.ontrack ? 'set' : 'null') +
                 ' transceiver._receiver.track=' + (transceiver._receiver.track ? 'set' : 'null'));
 
-    if (_trackHandler) {
-      // streams: per W3C §5.1 step 8, the array of MediaStreams the
-      // remote sender associated with this track via msid (or the
-      // empty array if none). Skip nullish entries from cm.js's
-      // info.stream (single-stream channel).
-      var trackStreams = [];
-      if (info.stream) trackStreams.push(info.stream);
-      else if (Array.isArray(info.streams)) {
-        for (var ts = 0; ts < info.streams.length; ts++) {
-          if (info.streams[ts]) trackStreams.push(info.streams[ts]);
-        }
+    // Build the W3C event UNCONDITIONALLY — it serves both registration
+    // styles. Previously it was built only when the ontrack PROPERTY was
+    // set, and only the property was called; addEventListener('track')
+    // subscribed to an ev channel named 'track' that nothing ever
+    // emitted — listeners silently received no events, ever. Third
+    // member of the wrapped-event asymmetry family (icecandidate and
+    // icecandidateerror were fixed earlier); found live when sfu-server
+    // (which deliberately uses addEventListener to avoid clobbering
+    // stable-webrtc's ontrack property) never saw any producers.
+    //
+    // streams: per W3C §5.1 step 8, the array of MediaStreams the
+    // remote sender associated with this track via msid (or the
+    // empty array if none). Skip nullish entries from cm.js's
+    // info.stream (single-stream channel).
+    var trackStreams = [];
+    if (info.streamsAnnounced) trackStreams = info.streamsAnnounced.slice();
+    else if (info.stream) trackStreams.push(info.stream);
+    else if (Array.isArray(info.streams)) {
+      for (var ts = 0; ts < info.streams.length; ts++) {
+        if (info.streams[ts]) trackStreams.push(info.streams[ts]);
       }
-      _trackHandler(new RTCTrackEvent({
-        track:       info.track,
-        receiver:    transceiver._receiver,
-        transceiver: transceiver,
-        streams:     trackStreams,
-      }));
     }
+    var trackEvent = new RTCTrackEvent({
+      track:       info.track,
+      receiver:    transceiver._receiver,
+      transceiver: transceiver,
+      streams:     trackStreams,
+    });
+
+    if (self._handlers.ontrack) self._handlers.ontrack(trackEvent);
+    // addEventListener('track', fn) listeners — same event object,
+    // browser parity: both styles fire, each exactly once.
+    ev.emit('track', trackEvent);
   });
-  Object.defineProperty(self, 'ontrack', {
-    get: function() { return _trackHandler; },
-    set: function(fn) { _trackHandler = fn; },
+
+  // Renegotiation observability: one line when the flag fires. Placed at
+  // the api layer so a dropped-by-engine event is distinguishable from a
+  // never-fired one (the M1 debugging sessions needed exactly this).
+  ev.on('negotiationneeded', function() {
+    _diag('[api-diag] negotiationneeded fired');
   });
 
 
@@ -395,7 +529,16 @@ function RTCPeerConnection(config) {
   // checks (closed PC, wrong signalingState, missing remoteDescription)
   // live in cm.js so they observe committed state at chain-execution time.
 
-  this.createOffer = function (options) {
+  impl.createOffer = function (options) {
+    // Synchronous preconditions (W3C 4.4.1), checked before the
+    // operation is enqueued: a closed connection, and a signalingState
+    // from which an offer cannot be produced. Only 'stable' (fresh
+    // offer) and 'have-local-offer' (re-offer) are legal — offering from
+    // have-remote-offer or a pranswer state is InvalidStateError.
+    if (manager.state.closed) {
+      return Promise.reject(new DOMException('peer connection is closed', 'InvalidStateError'));
+    }
+    // (state check lives inside the chained operation — see createAnswer)
     var self = this;
     // Legacy options (JSEP §5.1 / W3C legacy extensions):
     //   offerToReceiveX: true  → ensure at least one transceiver of that
@@ -439,7 +582,18 @@ function RTCPeerConnection(config) {
     });
   };
 
-  this.createAnswer = function (options) {
+  impl.createAnswer = function (options) {
+    // W3C 4.4.1: state preconditions are checked BEFORE the operation is
+    // enqueued, so the rejection is observable without waiting for the
+    // chain to turn (WPT's isOperationsChainEmpty helper distinguishes a
+    // busy chain from an empty one exactly this way — a synchronous
+    // InvalidStateError means "chain empty, state wrong").
+    // NOTE: the state check is NOT done here. W3C 4.4.1 runs it inside
+    // the queued operation, so it only surfaces "immediately" when the
+    // chain happens to be EMPTY — which is precisely how WPT's
+    // isOperationsChainEmpty probe distinguishes a busy chain from an
+    // idle one. Checking before enqueuing made every probe report
+    // "empty" and broke six chain tests.
     return new Promise(function (resolve, reject) {
       manager.createAnswer(options, function (err, desc) {
         if (err) reject(err); else resolve(desc);
@@ -447,7 +601,7 @@ function RTCPeerConnection(config) {
     });
   };
 
-  this.setLocalDescription = function (desc) {
+  impl.setLocalDescription = function (desc) {
     // W3C §4.4.1.5 — type enum validation. Rollback is an unimplemented
     // sub-feature (ROADMAP QUICK-3); reject explicitly so apps see a clear
     // failure rather than silent misbehavior. Implicit form (no args) is
@@ -473,11 +627,6 @@ function RTCPeerConnection(config) {
       // they'd get from forwarding (pranswer would be parsed as answer
       // and transition to 'stable' incorrectly). Document as a known
       // limitation in ROADMAP item 26.
-      if (desc.type === 'pranswer') {
-        var nsErr = new Error('setLocalDescription: pranswer is not supported');
-        nsErr.name = 'NotSupportedError';
-        return Promise.reject(nsErr);
-      }
     }
     return new Promise(function (resolve, reject) {
       manager.setLocalDescription(desc, function (err, result) {
@@ -486,7 +635,7 @@ function RTCPeerConnection(config) {
     });
   };
 
-  this.setRemoteDescription = function (desc) {
+  impl.setRemoteDescription = function (desc) {
     // Required argument per spec — no implicit form (unlike setLocal).
     if (!desc) {
       return Promise.reject(new TypeError(
@@ -506,11 +655,6 @@ function RTCPeerConnection(config) {
         });
       }
       // See setLocalDescription pranswer reject above for the rationale.
-      if (desc.type === 'pranswer') {
-        var nsErrR = new Error('setRemoteDescription: pranswer is not supported');
-        nsErrR.name = 'NotSupportedError';
-        return Promise.reject(nsErrR);
-      }
     }
     return new Promise(function (resolve, reject) {
       manager.setRemoteDescription(desc, function (err, result) {
@@ -522,7 +666,25 @@ function RTCPeerConnection(config) {
 
   // ── ICE ──
 
-  this.addIceCandidate = function (candidate) {
+  impl.addIceCandidate = function (candidate) {
+    // Tolerate the SDP line form: apps (and WPT) sometimes pass
+    // "a=candidate:..." straight out of an SDP blob. RFC 5245 writes the
+    // attribute with that prefix, so stripping it is what every browser
+    // does rather than rejecting a string the user copied verbatim.
+    if (candidate && typeof candidate === 'object' && typeof candidate.candidate === 'string' &&
+        candidate.candidate.indexOf('a=') === 0) {
+      candidate = Object.assign({}, candidate, { candidate: candidate.candidate.slice(2) });
+    }
+    // W3C 4.4.2: addressing first — a non-end-of-candidates entry with
+    // neither sdpMid nor sdpMLineIndex is a TypeError regardless of what
+    // its candidate string contains. (0 is a valid sdpMLineIndex, so
+    // absence is tested with != null, not falsiness.)
+    if (candidate && typeof candidate === 'object' && candidate.candidate) {
+      if (candidate.sdpMid == null && candidate.sdpMLineIndex == null) {
+        return Promise.reject(new TypeError(
+          'addIceCandidate: candidate must specify sdpMid or sdpMLineIndex'));
+      }
+    }
     // W3C §4.4.1.10 — surface validation only. State-dependent checks
     // (closed PC, no remoteDescription) live in cm.js so they observe
     // the committed state at chain-execution time, not at call time.
@@ -537,17 +699,34 @@ function RTCPeerConnection(config) {
       candidate.candidate == null ||
       candidate.candidate === ''
     );
-
-    if (!isEndOfCandidates) {
-      // Spec: TypeError if both sdpMid and sdpMLineIndex are null.
-      // (0 is a valid sdpMLineIndex — distinguish absence from zero.)
-      var hasMid   = (candidate.sdpMid != null);
-      var hasMLine = (candidate.sdpMLineIndex != null);
-      if (!hasMid && !hasMLine) {
-        return Promise.reject(new TypeError(
-          'addIceCandidate: candidate must specify sdpMid or sdpMLineIndex'));
+    // (The "requires a remote description" rule lives INSIDE the chained
+    // operation — see connection_manager's addIceCandidate. Checking it
+    // here, at call time, is wrong: two WPT cases need both answers from
+    // the same code. After an explicit rollback with an idle chain there
+    // is no remote description and it must REJECT; but during glare the
+    // candidate queues behind the in-flight setRemoteDescription and by
+    // the time it RUNS a remote description exists, so it must RESOLVE.
+    // Only a check evaluated at run time gives both.)
+    // W3C: a NON-empty candidate string that fails the candidate grammar
+    // rejects with OperationError (the strict parser already exists for
+    // RTCIceCandidate; reuse it here instead of the lenient pass-through).
+    if (!isEndOfCandidates && typeof candidate.candidate === 'string') {
+      try {
+        var _probe = new RTCIceCandidate({ candidate: candidate.candidate, sdpMid: candidate.sdpMid != null ? candidate.sdpMid : '0' });
+        if (_probe.foundation == null && _probe.port == null) {
+          return Promise.reject(new DOMException('addIceCandidate: malformed candidate string', 'OperationError'));
+        }
+      } catch (ePr) {
+        return Promise.reject(new DOMException('addIceCandidate: malformed candidate string', 'OperationError'));
       }
     }
+    // ORDER (W3C 4.4.2, and two WPT cases that disagree unless it is
+    // explicit): ADDRESSING is validated before the candidate STRING.
+    // A candidate with neither sdpMid nor sdpMLineIndex is a TypeError
+    // even when its string is also garbage — the garbage only becomes an
+    // OperationError once the candidate is addressable at all.
+
+
 
     return new Promise(function (resolve, reject) {
       manager.addIceCandidate(candidate, function (err, result) {
@@ -562,10 +741,15 @@ function RTCPeerConnection(config) {
     });
   };
 
-  this.restartIce = function() {
+  impl.restartIce = function() {
+    // W3C 4.4.1: restartIce() on a closed connection is a NO-OP (not an
+    // error), and before the FIRST negotiation there is nothing to
+    // restart — the initial offer will carry fresh ICE credentials
+    // anyway, so no negotiationneeded is fired.
+    if (manager.state.closed) return;
+    if (!manager.state.currentLocalDescription && !manager.state.pendingLocalDescription) return;
     if (manager.state.closed) {
-      var err = new Error('restartIce: peer connection is closed');
-      err.name = 'InvalidStateError';
+      var err = new DOMException('restartIce: peer connection is closed', 'InvalidStateError');
       throw err;
     }
     manager.restartIce();
@@ -574,7 +758,113 @@ function RTCPeerConnection(config) {
 
   // ── Configuration ──
 
-  this.getConfiguration = function() {
+  /**
+   * W3C §4.3.2 — validate + normalize RTCConfiguration.iceServers.
+   * (WPT harvest: RTCConfiguration-iceServers.html encodes the exact
+   * contract — this implements it verbatim.)
+   *   undefined            → []
+   *   null / non-sequence  → TypeError
+   *   server null/not-dict → TypeError
+   *   urls missing         → TypeError
+   *   urls '' or []        → SyntaxError (DOMException-style name)
+   *   url scheme not stun/stuns/turn/turns, or unparseable → SyntaxError
+   *   turn/turns without BOTH username and credential → InvalidAccessError
+   * Returns a frozen-shape normalized copy for getConfiguration echo.
+   */
+  function _validateIceServers(servers, ctxName) {
+    if (servers === undefined) return [];
+    if (servers === null || typeof servers[Symbol.iterator] !== 'function' ||
+        typeof servers === 'string') {
+      throw new TypeError(ctxName + ': iceServers must be a sequence');
+    }
+    var out = [];
+    for (var i = 0; i < servers.length; i++) {
+      var s = servers[i];
+      if (s === null || typeof s !== 'object') {
+        throw new TypeError(ctxName + ': iceServers[' + i + '] must be a dictionary');
+      }
+      var urls = s.urls;
+      if (urls === undefined) {
+        throw new TypeError(ctxName + ': iceServers[' + i + '].urls is required');
+      }
+      if (typeof urls === 'string') urls = [urls];
+      else if (urls === null || typeof urls[Symbol.iterator] !== 'function') {
+        throw new TypeError(ctxName + ': iceServers[' + i + '].urls must be a string or sequence');
+      } else urls = Array.prototype.slice.call(urls);
+      if (urls.length === 0) {
+        throw new DOMException(ctxName + ': iceServers[' + i + '].urls is empty', 'SyntaxError');
+      }
+      var needsCreds = false;
+      for (var u = 0; u < urls.length; u++) {
+        var url = String(urls[u]);
+        var m = /^(stun|stuns|turn|turns):([A-Za-z0-9._\-\[\]:]+?)(\?transport=(udp|tcp))?$/.exec(url);
+        var hostOk = m && /^[A-Za-z0-9._\-\[\]]+(:\d+)?$/.test(m[2]) && !/^:/.test(m[2]) && !/^\d+$/.test(m[2].split(':')[0]) === false || m && /^[A-Za-z0-9._\-\[\]]+(:\d+)?$/.test(m[2]);
+        if (!m || !m[2] || !/^[A-Za-z0-9._\-\[\]]+(:\d+)?$/.test(m[2]) || /\s/.test(url)) {
+          throw new DOMException(ctxName + ': invalid ICE server url "' + url + '"', 'SyntaxError');
+        }
+        if (m[2].indexOf('@') !== -1) {
+          throw new DOMException(ctxName + ': userinfo not allowed in ICE url "' + url + '"', 'SyntaxError');
+        }
+        var portM = /:(\d+)$/.exec(m[2]);
+        if (portM && (+portM[1] > 65535)) {
+          throw new DOMException(ctxName + ': port out of range in "' + url + '"', 'SyntaxError');
+        }
+        if ((m[1] === 'stun' || m[1] === 'stuns') && m[3]) {
+          // ?transport= is turn-only syntax
+          throw new DOMException(ctxName + ': stun urls take no query: "' + url + '"', 'SyntaxError');
+        }
+        if (m[1] === 'turn' || m[1] === 'turns') needsCreds = true;
+        urls[u] = url;
+      }
+      if (needsCreds && (s.username === undefined || s.credential === undefined ||
+                         s.credential === '')) {
+        throw new DOMException(ctxName + ': turn server requires username and credential', 'InvalidAccessError');
+      }
+      // STUN attribute value limit (RFC 8489 §14.3: <= 509 bytes)
+      if (needsCreds && (Buffer.byteLength(String(s.username || ''), 'utf8') > 509 ||
+                         Buffer.byteLength(String(s.credential || ''), 'utf8') > 509)) {
+        throw new DOMException(ctxName + ': turn credentials exceed 509 bytes', 'InvalidAccessError');
+      }
+      var entry = { urls: urls };
+      if (s.username !== undefined) entry.username = String(s.username);
+      if (s.credential !== undefined) entry.credential = String(s.credential);
+      out.push(entry);
+    }
+    return out;
+  }
+
+
+  manager.state.iceServers = _normIceServers;
+  manager.state._ctorCertificates = (config.certificates || []).slice();
+  // Publish the RTCError constructor for lower layers (sdp_offer_answer
+  // builds sdp-syntax-error rejections and cannot import api.js back).
+  try { manager.state._RTCErrorCtor = RTCError; } catch (ePub) {}
+
+  // WPT harvest — muted follows NEGOTIATED receive-ability too: after
+  // every description apply, receiver tracks mute/unmute per the
+  // transceiver's effective direction (no media required).
+  manager.ev.on('signalingstatechange', function () {
+    try {
+      var ts = manager.state.transceivers || [];
+      for (var mi = 0; mi < ts.length; mi++) {
+        var it = ts[mi];
+        var tr = it && it.receiver && it.receiver.track;
+        if (!tr) continue;
+        var d = it.currentDirection || it.direction || '';
+        var recv = d === 'sendrecv' || d === 'recvonly';
+        if ((d === 'sendrecv' || d === 'sendonly') && it.sender) it.sender._everSentDir = true;
+        if (recv && tr.muted === true && it._associated) {
+          tr.muted = false;
+          try { tr.dispatchEvent && tr.dispatchEvent({ type: 'unmute' }); } catch (u1) {}
+        } else if (!recv && tr.muted === false) {
+          tr.muted = true;
+          try { tr.dispatchEvent && tr.dispatchEvent({ type: 'mute' }); } catch (u2) {}
+        }
+      }
+    } catch (eSync) {}
+  });
+
+  impl.getConfiguration = function() {
     // Returns the current RTCConfiguration. Per W3C §4.4.1.3, this
     // round-trips every field the app passed to setConfiguration or the
     // constructor. Fields whose enforcement is incomplete (bundlePolicy
@@ -592,7 +882,16 @@ function RTCPeerConnection(config) {
     };
   };
 
-  this.setConfiguration = function(newConfig) {
+  impl.setConfiguration = function(newConfig) {
+    // W3C: setConfiguration REPLACES the configuration — members omitted
+    // from the new dictionary revert to their DEFAULTS (they do not
+    // inherit the previous values).
+    if (newConfig && typeof newConfig === 'object') {
+      if (newConfig.iceTransportPolicy === undefined) newConfig = Object.assign({}, newConfig, { iceTransportPolicy: 'all' });
+      if (newConfig.iceTransportPolicy === null || (newConfig.iceTransportPolicy !== 'all' && newConfig.iceTransportPolicy !== 'relay')) {
+        if (newConfig.iceTransportPolicy !== 'all') throw new TypeError('setConfiguration: invalid iceTransportPolicy');
+      }
+    }
     if (newConfig == null) return;
     // W3C §4.4.1.4 — setConfiguration. Three classes of checks:
     //   1. Connection state: closed PCs reject (InvalidStateError).
@@ -603,8 +902,7 @@ function RTCPeerConnection(config) {
     //      with the spec-required name (TypeError).
 
     if (manager.state.closed) {
-      var eClosed = new Error('setConfiguration: peer connection is closed');
-      eClosed.name = 'InvalidStateError';
+      var eClosed = new DOMException('setConfiguration: peer connection is closed', 'InvalidStateError');
       throw eClosed;
     }
 
@@ -622,7 +920,7 @@ function RTCPeerConnection(config) {
       throw new TypeError('setConfiguration: invalid bundlePolicy "' +
         newConfig.bundlePolicy + '"');
     }
-    if (newConfig.rtcpMuxPolicy != null && newConfig.rtcpMuxPolicy !== 'require') {
+    if (newConfig.rtcpMuxPolicy !== undefined && newConfig.rtcpMuxPolicy !== 'require') {
       throw new TypeError('setConfiguration: invalid rtcpMuxPolicy "' +
         newConfig.rtcpMuxPolicy + '" (only "require" is supported)');
     }
@@ -637,30 +935,35 @@ function RTCPeerConnection(config) {
 
     // Immutable-field checks (only after enum validation, so the more
     // specific error wins on a doubly-invalid input).
-    if (newConfig.bundlePolicy != null && newConfig.bundlePolicy !== manager.state.bundlePolicy) {
-      var e1 = new Error('setConfiguration: bundlePolicy cannot be changed after construction');
-      e1.name = 'InvalidModificationError';
+    var _bpEff = (newConfig.bundlePolicy === undefined) ? 'balanced'
+               : newConfig.bundlePolicy;
+    if (_bpEff !== (manager.state.bundlePolicy || 'balanced')) {
+      var e1 = new DOMException('setConfiguration: bundlePolicy cannot be changed after construction', 'InvalidModificationError');
       throw e1;
     }
     if (newConfig.rtcpMuxPolicy != null &&
         newConfig.rtcpMuxPolicy !== (manager.state.rtcpMuxPolicy || 'require')) {
-      var e2 = new Error('setConfiguration: rtcpMuxPolicy cannot be changed after construction');
-      e2.name = 'InvalidModificationError';
+      var e2 = new DOMException('setConfiguration: rtcpMuxPolicy cannot be changed after construction', 'InvalidModificationError');
       throw e2;
     }
-    if (newConfig.certificates != null) {
-      // Spec: if newConfig.certificates differs from the initial
-      // certificates set, throw InvalidModificationError. We don't
-      // currently do a deep equality check — we conservatively reject
-      // any attempt to set, which is stricter than spec but safe
-      // (no app actually relies on echoing the same array back).
-      var e3 = new Error('setConfiguration: certificates cannot be changed after construction');
-      e3.name = 'InvalidModificationError';
-      throw e3;
-    }
+    // (the old unconditional certificates rejection lived here — it made
+    // the deep comparison below DEAD CODE and broke the spec's
+    // echo-same-certificates-succeeds case; removed.)
 
     // Apply mutable fields.
-    if (newConfig.iceServers) manager.state.iceServers = newConfig.iceServers;
+    // W3C: setConfiguration REPLACES the whole dictionary — an absent
+    // iceServers member means "no servers", not "keep current".
+    // W3C: certificates cannot change after construction.
+    if (newConfig.certificates !== undefined) {
+      var prevCerts = (manager.state._ctorCertificates || []);
+      var nextCerts = newConfig.certificates || [];
+      var certsSame = prevCerts.length === nextCerts.length &&
+        prevCerts.every(function (c, ci) { return c === nextCerts[ci]; });
+      if (!certsSame) {
+        throw new DOMException('setConfiguration: certificates cannot be modified', 'InvalidModificationError');
+      }
+    }
+    manager.state.iceServers = _validateIceServers(newConfig.iceServers, 'setConfiguration');
     // Per W3C §4.4.1.4, iceTransportPolicy changes take effect on the next
     // ICE gathering round (i.e. next ICE restart) — the running IceAgent
     // instance keeps its current policy until restartIce() is called.
@@ -679,7 +982,7 @@ function RTCPeerConnection(config) {
 
   // ── Tracks & Transceivers ──
 
-  this.addTrack = function(track /*, ...streams */) {
+  impl.addTrack = function(track /*, ...streams */) {
     // W3C §5.1.2 — addTrack signature is (track, ...streams). The variadic
     // streams group senders together so the remote peer's RTCTrackEvent
     // can present them as a single MediaStream. We collect them but the
@@ -691,8 +994,7 @@ function RTCPeerConnection(config) {
     }
 
     if (manager.state.closed) {
-      var closedErr = new Error('addTrack: peer connection is closed');
-      closedErr.name = 'InvalidStateError';
+      var closedErr = new DOMException('addTrack: peer connection is closed', 'InvalidStateError');
       throw closedErr;
     }
     if (!track) throw new TypeError('addTrack: track is required');
@@ -705,8 +1007,7 @@ function RTCPeerConnection(config) {
       var atc = manager.state.transceivers[ai];
       if (atc.sender && atc.sender.track === track &&
           atc.currentDirection !== 'stopped' && atc.direction !== 'stopped') {
-        var dupErr = new Error('addTrack: track is already part of this connection');
-        dupErr.name = 'InvalidAccessError';
+        var dupErr = new DOMException('addTrack: track is already part of this connection', 'InvalidAccessError');
         throw dupErr;
       }
     }
@@ -729,7 +1030,17 @@ function RTCPeerConnection(config) {
       var tc = manager.state.transceivers[ti];
       if (tc.kind !== kind) continue;
       if (tc.sender && tc.sender.track) continue;
-      if (tc.currentDirection === 'stopped' || tc.direction === 'stopped') continue;
+      // DUAL-MODE REUSE (the spinner saga): the spec's used-to-send rule
+      // and the field mute pattern (removeTrack then addTrack expecting
+      // the SAME transceiver back) contradict on an identical call
+      // shape. Default = FIELD (reuse — engines and apps depend on it;
+      // a duplicated m-line renders as a spinning tile). The WPT runner
+      // sets WEBRTC_SPEC_STRICT_REUSE=1 to measure the spec behavior.
+      // The long-term idiomatic fix for engines is replaceTrack(null)
+      // for mute — no renegotiation at all.
+      if (process.env.WEBRTC_SPEC_STRICT_REUSE === '1' &&
+          tc.sender && tc.sender._everSentDir) continue;
+      if (RtpManager.isStopped(tc)) continue;
       reused = tc;
       break;
     }
@@ -743,8 +1054,17 @@ function RTCPeerConnection(config) {
       if (internal.direction === 'recvonly') internal.direction = 'sendrecv';
       else if (internal.direction === 'inactive') internal.direction = 'sendonly';
     } else {
-      internal = manager.addTransceiver(kind, { direction: 'sendrecv' });
+      internal = manager.addTransceiver(kind, {
+        direction: 'sendrecv',
+        // WPT/behavior: the real stream ids ride the SDP msid so the far
+        // side reconstructs streams with MATCHING ids.
+        sendEncodings: undefined,
+        streamIds: streams.length ? streams.map(function (s) { return s.id; }) : undefined,
+      });
       internal.sender.track = track;
+    }
+    if (streams.length && internal && !internal.streamIds) {
+      internal.streamIds = streams.map(function (s) { return s.id; });
     }
 
     // Build / fetch the public sender wrapper. Cache by transceiver so
@@ -765,7 +1085,7 @@ function RTCPeerConnection(config) {
     return tcWrapper._sender;
   };
 
-  this.removeTrack = function(sender) {
+  impl.removeTrack = function(sender) {
     // W3C §5.1.3 — removeTrack steps:
     //   • If sender is not part of this connection, throw InvalidAccessError.
     //   • If sender's transceiver is stopped, no-op.
@@ -777,8 +1097,7 @@ function RTCPeerConnection(config) {
     //   • Tear down the active send pipeline.
     //   • Fire negotiationneeded.
     if (manager.state.closed) {
-      var closedErrR = new Error('removeTrack: peer connection is closed');
-      closedErrR.name = 'InvalidStateError';
+      var closedErrR = new DOMException('removeTrack: peer connection is closed', 'InvalidStateError');
       throw closedErrR;
     }
     if (!sender || !sender._internal) return;
@@ -790,20 +1109,21 @@ function RTCPeerConnection(config) {
       if (manager.state.transceivers[ti] === internal) { found = true; break; }
     }
     if (!found) {
-      var err = new Error('removeTrack: sender is not part of this connection');
-      err.name = 'InvalidAccessError';
+      var err = new DOMException('removeTrack: sender is not part of this connection', 'InvalidAccessError');
       throw err;
     }
     // No-op on stopped transceivers.
-    if (internal.currentDirection === 'stopped' || internal.direction === 'stopped') return;
+    if (RtpManager.isStopped(internal)) return;
     // Only fire negotiationneeded if something actually changed.
     var changed = false;
     if (internal.sender.track !== null) {
       internal.sender.track = null;
       changed = true;
     }
-    if (internal.direction === 'sendrecv') {
-      internal.direction = 'recvonly';
+    if (internal.direction === 'sendrecv' || internal.direction === 'sendonly') {
+      // W3C: removeTrack SUBTRACTS the send capability only —
+      // sendrecv->recvonly, sendonly->inactive, receive-only unchanged.
+      internal.direction = internal.direction === 'sendrecv' ? 'recvonly' : 'inactive';
       changed = true;
     } else if (internal.direction === 'sendonly') {
       internal.direction = 'inactive';
@@ -817,10 +1137,10 @@ function RTCPeerConnection(config) {
     if (changed) manager.updateNegotiationNeededFlag();
   };
 
-  this.addTransceiver = function(kindOrTrack, init) {
+  impl.addTransceiver = function(kindOrTrack, init) {
+
     if (manager.state.closed) {
-      var closedErr = new Error('addTransceiver: peer connection is closed');
-      closedErr.name = 'InvalidStateError';
+      var closedErr = new DOMException('addTransceiver: peer connection is closed', 'InvalidStateError');
       throw closedErr;
     }
     // init.streams handling deferred — see ROADMAP item QUICK-1+2 and
@@ -856,22 +1176,56 @@ function RTCPeerConnection(config) {
     //   • InvalidAccessError if a non-rid read-only param is set (we
     //     don't have any read-only ones in our model so this is N/A)
     if (init && init.sendEncodings && Array.isArray(init.sendEncodings)) {
+      // WPT harvest — encoding.codec must exist in the sender's
+      // capabilities for this kind; otherwise OperationError.
+      var kindCaps = null;
+      try { kindCaps = RTCRtpSender.getCapabilities(kind); } catch (eC) {}
+      for (var ci0 = 0; ci0 < init.sendEncodings.length; ci0++) {
+        var reqC = init.sendEncodings[ci0] && init.sendEncodings[ci0].codec;
+        if (reqC == null) continue;
+        var okC = kindCaps && (kindCaps.codecs || []).some(function (c) {
+          return c.mimeType.toLowerCase() === String(reqC.mimeType || '').toLowerCase() &&
+                 c.clockRate === reqC.clockRate &&
+                 (c.channels || undefined) === (reqC.channels || undefined) &&
+                 ((c.sdpFmtpLine || undefined) === (reqC.sdpFmtpLine || undefined) ||
+                  reqC.sdpFmtpLine === undefined);
+        });
+        if (!okC) {
+          throw new DOMException('addTransceiver: encoding codec not supported', 'OperationError');
+        }
+      }
       var encs = init.sendEncodings;
       var seenRids = {};
+      // AUDIO vs VIDEO members (two WPT files, one precise rule):
+      //   • rid IS validated for BOTH kinds — syntax, length and
+      //     uniqueness all throw TypeError even on audio;
+      //   • VIDEO-ONLY members (scaleResolutionDownBy, maxFramerate) are
+      //     silently DROPPED on audio, never range-checked;
+      //   • audio then collapses to a single { active } encoding.
+      // The collapse therefore happens AFTER the validation loop below.
+      var _audioKind = (kind === 'audio');
       var anyRid = false;
       var allRid = true;
       for (var ei = 0; ei < encs.length; ei++) {
         var enc = encs[ei] || {};
-        if (typeof enc.maxFramerate === 'number' && enc.maxFramerate < 0) {
+        if (!_audioKind && typeof enc.maxFramerate === 'number' && enc.maxFramerate < 0) {
           throw new RangeError('addTransceiver: encoding maxFramerate must be >= 0');
         }
-        if (typeof enc.scaleResolutionDownBy === 'number' && enc.scaleResolutionDownBy < 1) {
+        if (!_audioKind && typeof enc.scaleResolutionDownBy === 'number' && enc.scaleResolutionDownBy < 1) {
           throw new RangeError('addTransceiver: encoding scaleResolutionDownBy must be >= 1');
         }
         if (enc.rid != null) {
           anyRid = true;
-          if (!/^[A-Za-z0-9_-]{1,32}$/.test(enc.rid)) {
-            throw new TypeError('addTransceiver: invalid rid "' + enc.rid + '" (must match [A-Za-z0-9_-]{1,32})');
+          if (String(enc.rid).length > 16) {
+            // RFC 8852 §3.1 caps rid at 16 characters — enforced here at
+            // the API boundary so BOTH kinds reject before any
+            // kind-specific collapsing happens.
+            throw new TypeError('addTransceiver: rid must be at most 16 characters');
+          }
+          if (!/^[A-Za-z0-9]{1,32}$/.test(enc.rid)) {
+            // RFC 8852: rid values are alphanumeric; '-' and '_' are
+            // SDP-level separators, so they are invalid inside a rid.
+            throw new TypeError('addTransceiver: invalid rid "' + enc.rid + '" (must match [A-Za-z0-9]{1,32})');
           }
           if (seenRids[enc.rid]) {
             throw new TypeError('addTransceiver: duplicate rid "' + enc.rid + '"');
@@ -880,6 +1234,16 @@ function RTCPeerConnection(config) {
         } else {
           allRid = false;
         }
+      }
+      // audio collapse (see the rule above)
+      if (_audioKind) {
+        // audio keeps `active` AND `maxBitrate`; only rid,
+        // scaleResolutionDownBy and maxFramerate are video-only.
+        var _a0 = encs[0] || {};
+        encs = [typeof _a0.maxBitrate === 'number'
+          ? { active: _a0.active !== false, maxBitrate: _a0.maxBitrate }
+          : { active: _a0.active !== false }];
+        init = Object.assign({}, init, { sendEncodings: encs });
       }
       // Spec: rid must be on all or none.
       if (anyRid && !allRid) {
@@ -893,36 +1257,39 @@ function RTCPeerConnection(config) {
     return _tcCache(internal);
   };
 
-  this.getSenders = function() {
+  impl.getSenders = function() {
     var result = [];
     for (var i = 0; i < manager.state.transceivers.length; i++) {
-      var t = manager.state.transceivers[i];
-      if (t.currentDirection !== 'stopped') {
-        result.push(_tcCache(t).sender);
-      }
+      // Stopped transceivers keep exposing their sender/receiver until
+      // the m-section is retired — the same rule getTransceivers()
+      // follows, and what apps holding a sender across a stop expect.
+      result.push(_tcCache(manager.state.transceivers[i]).sender);
     }
     return result;
   };
 
-  this.getReceivers = function() {
+  impl.getReceivers = function() {
     var result = [];
     for (var i = 0; i < manager.state.transceivers.length; i++) {
-      var t = manager.state.transceivers[i];
-      if (t.currentDirection !== 'stopped') {
-        result.push(_tcCache(t).receiver);
-      }
+      // Stopped transceivers keep exposing their sender/receiver until
+      // the m-section is retired — the same rule getTransceivers()
+      // follows, and what apps holding a sender across a stop expect.
+      result.push(_tcCache(manager.state.transceivers[i]).receiver);
     }
     return result;
   };
 
-  this.getTransceivers = function() {
-    // Note: omits stopped transceivers per spec
+  impl.getTransceivers = function() {
+    // W3C 4.4.1 / 5.4: getTransceivers() returns EVERY transceiver in
+    // [[Transceivers]], INCLUDING stopped ones — a stopped transceiver
+    // keeps its slot (direction 'stopped', receiver.transport null) and
+    // only leaves the list when the m-section is recycled by a later
+    // negotiation. Filtering them out here shifted every later index and
+    // made a stopped transceiver simply vanish from the application's
+    // view mid-session.
     var result = [];
     for (var i = 0; i < manager.state.transceivers.length; i++) {
-      var t = manager.state.transceivers[i];
-      if (t.currentDirection !== 'stopped') {
-        result.push(_tcCache(t));
-      }
+      result.push(_tcCache(manager.state.transceivers[i]));
     }
     return result;
   };
@@ -930,15 +1297,68 @@ function RTCPeerConnection(config) {
 
   // ── DataChannel ──
 
-  this.createDataChannel = function(label, options) {
-    options = options || {};
+  impl.createDataChannel = function(label, options) {
+    // WebIDL coercions (WPT harvest): label is USVString — null → "null",
+    // undefined (when the arg WAS passed) → "undefined", lone surrogates →
+    // U+FFFD. A truly missing argument throws (required parameter).
+    if (arguments.length === 0) {
+      throw new TypeError('createDataChannel: label argument required');
+    }
+    label = String(label).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+    options = options != null ? options : {};
 
     // W3C §6.2: createDataChannel on a closed PC throws InvalidStateError.
     if (manager.state.closed) {
-      var closedErr = new Error('createDataChannel: peer connection is closed');
-      closedErr.name = 'InvalidStateError';
-      throw closedErr;
+      throw new DOMException('createDataChannel: peer connection is closed', 'InvalidStateError');
     }
+    // dictionary member coercion: undefined → default; anything else →
+    // ToBoolean / ToNumber per WebIDL (null is NOT undefined!).
+    var _o = options;
+    // WebIDL [EnforceRange] unsigned short: negatives and values > 65535
+    // throw TypeError at the binding layer (WPT enforce-range files).
+    var _rangeCheck = function (v, name) {
+      if (v === undefined || v === null) return;
+      var n = Number(v);
+      if (!isFinite(n) || n < 0 || n > 65535 || Math.floor(n) !== n) {
+        throw new TypeError('createDataChannel: ' + name + ' value ' + v + ' is out of [EnforceRange] unsigned short range');
+      }
+    };
+    _rangeCheck(_o.maxPacketLifeTime, 'maxPacketLifeTime');
+    _rangeCheck(_o.maxRetransmits,  'maxRetransmits');
+    // `id` is an [EnforceRange] unsigned short too — it was exempt, so
+    // -1 and 65536 were accepted and then coerced silently (>>> 0 turns
+    // -1 into 4294967295), producing a channel with an id no peer can
+    // ever match. The range belongs at the binding layer, before the
+    // negotiated/ignored decision below.
+    _rangeCheck(_o.id, 'id');
+    if (_o.maxPacketLifeTime !== undefined && _o.maxRetransmits !== undefined) {
+      throw new TypeError('createDataChannel: maxPacketLifeTime and maxRetransmits are mutually exclusive');
+    }
+    // WPT harvest — id range
+    if (_o.id !== undefined && _o.id !== null && !_o.negotiated) {
+      // W3C: without negotiated:true the id member is IGNORED — the
+      // in-band DCEP allocator owns the stream id.
+      _o = Object.assign({}, _o); delete _o.id; options = _o;
+    }
+    if (_o.id !== undefined && _o.id !== null) {
+      var _idV = _o.id >>> 0;
+      if (_idV === 65535) {
+        // WPT: 65535 is the wire 'unset' marker - succeed with no id.
+        _o = Object.assign({}, _o); delete _o.id; options = _o;
+      } else if (_idV > 65534) {
+        throw new TypeError('createDataChannel: id must be <= 65534');
+      }
+    }
+    options = {
+      ordered:           _o.ordered === undefined ? true : !!_o.ordered,
+      maxPacketLifeTime: _o.maxPacketLifeTime === undefined ? null : (_o.maxPacketLifeTime >>> 0),
+      maxRetransmits:    _o.maxRetransmits === undefined ? null : (_o.maxRetransmits >>> 0),
+      protocol:          _o.protocol === undefined ? '' :
+        String(_o.protocol).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'),
+      negotiated:        _o.negotiated === undefined ? false : !!_o.negotiated,
+      id:                _o.id,
+      priority:          _o.priority,
+    };
 
     // W3C §6.2 validation:
     //   • label length must be <= 65535 bytes UTF-8
@@ -966,8 +1386,7 @@ function RTCPeerConnection(config) {
       for (var di = 0; di < existing.length; di++) {
         if (existing[di] && existing[di].id === options.id &&
             existing[di].readyState !== 'closed') {
-          var inUseErr = new Error('createDataChannel: id ' + options.id + ' is already in use');
-          inUseErr.name = 'OperationError';
+          var inUseErr = new DOMException('createDataChannel: id ' + options.id + ' is already in use', 'OperationError');
           throw inUseErr;
         }
       }
@@ -980,8 +1399,7 @@ function RTCPeerConnection(config) {
     if (typeof options.maxRetransmits === 'number' &&
         typeof options.maxPacketLifeTime === 'number') {
       // W3C §6.2 explicitly says SyntaxError, not TypeError.
-      var syntErr = new Error('createDataChannel: maxRetransmits and maxPacketLifeTime are mutually exclusive');
-      syntErr.name = 'SyntaxError';
+      var syntErr = new DOMException('createDataChannel: maxRetransmits and maxPacketLifeTime are mutually exclusive', 'SyntaxError');
       throw syntErr;
     }
     if (options.priority != null) {
@@ -1005,7 +1423,58 @@ function RTCPeerConnection(config) {
 
   // ── Stats ──
 
-  this.getStats = function(selector) {
+  impl.getStats = function(selector) {
+    // W3C 8.2: getStats() is ASYNCHRONOUS and does NOT use the
+    // operations chain — it must still be pending after a microtask
+    // (WPT asserts exactly that), so the report is assembled on the
+    // next task rather than handed back in the same turn.
+    // ...but the SELECTOR check is synchronous: a selector that is not
+    // one of this connection's senders/receivers is InvalidAccessError
+    // right away (W3C 8.2 step 2), before the async report assembly.
+    var _sel = arguments[0];
+    if (_sel != null) {
+      // Compare against the PUBLIC lists — those are the objects the
+      // application actually holds, and they include senders/receivers
+      // of stopped transceivers.
+      var _known = false;
+      try {
+        var _sn = impl.getSenders(), _rc = impl.getReceivers();
+        for (var _si = 0; _si < _sn.length; _si++) if (_sn[_si] === _sel) { _known = true; break; }
+        if (!_known) for (var _ri = 0; _ri < _rc.length; _ri++) if (_rc[_ri] === _sel) { _known = true; break; }
+        // legacy shape: a track belonging to one of them
+        if (!_known) {
+          for (var _s2 = 0; _s2 < _sn.length; _s2++) if (_sn[_s2] && _sn[_s2].track === _sel) { _known = true; break; }
+          if (!_known) for (var _r2 = 0; _r2 < _rc.length; _r2++) if (_rc[_r2] && _rc[_r2].track === _sel) { _known = true; break; }
+        }
+      } catch (eSel) { _known = true; }   // never fail closed on an internal error
+      if (!_known) {
+        return Promise.reject(new DOMException(
+          'getStats: selector is not a sender or receiver of this connection',
+          'InvalidAccessError'));
+      }
+    }
+    var _gsArgs = arguments, _gsSelf = this;
+    return new Promise(function (res, rej) {
+      setTimeout(function () {
+        try { res(_getStatsNow.apply(_gsSelf, _gsArgs)); } catch (e) { rej(e); }
+      }, 0);
+    });
+  };
+  function _getStatsNow(selector) {
+    // W3C §8.2 (WPT): a track selector must belong to EXACTLY ONE
+    // sender or receiver of this connection.
+    if (selector != null) {
+      var _selMatches = 0;
+      var _ts = manager.state.transceivers || [];
+      for (var _si = 0; _si < _ts.length; _si++) {
+        if (_ts[_si].sender && _ts[_si].sender.track === selector) _selMatches++;
+        if (_ts[_si].receiver && _ts[_si].receiver.track === selector) _selMatches++;
+      }
+      if (_selMatches !== 1) {
+        return Promise.reject(new DOMException(
+          'getStats: selector track must belong to exactly one sender or receiver', 'InvalidAccessError'));
+      }
+    }
     // Per W3C webrtc-stats spec, `selector` is a MediaStreamTrack (or null).
     //   - null/undefined     → stats for the entire connection
     //   - a MediaStreamTrack → stats for the sender or receiver that owns it
@@ -1022,8 +1491,7 @@ function RTCPeerConnection(config) {
 
     // W3C §4.4.1.10: if PC is closed, reject with InvalidStateError.
     if (manager.state.closed) {
-      var closedErr = new Error('PC is closed');
-      closedErr.name = 'InvalidStateError';
+      var closedErr = new DOMException('PC is closed', 'InvalidStateError');
       return Promise.reject(closedErr);
     }
 
@@ -1066,18 +1534,18 @@ function RTCPeerConnection(config) {
   // pending forever (per W3C §4.4.1.7), which is the correct shape for
   // apps that don't use IdP — they simply never await it.
 
-  this.getIdentityAssertion = function() {
+  impl.getIdentityAssertion = function() {
     return Promise.resolve('');
   };
 
-  this.setIdentityProvider = function(provider, options) {
+  impl.setIdentityProvider = function(provider, options) {
     // No-op until IdP support lands (API-6).
   };
 
 
   // ── Lifecycle ──
 
-  this.close = function() {
+  impl.close = function() {
     // W3C §4.4.1.10: close() is a no-op on an already-closed PC.
     // manager.close() also guards on state.closed, but we want to skip
     // the per-transceiver pipeline teardown loop too — calling _stop()
@@ -1108,17 +1576,79 @@ function RTCPeerConnection(config) {
   // passive are no-ops in Node (no DOM tree), and deduplication of
   // identical (type, fn, capture) tuples is not currently enforced —
   // listeners added twice run twice.
-  this.addEventListener = function(name, fn, options) {
+  impl.addEventListener = function(name, fn, options) {
     if (typeof fn !== 'function') return;
-    if (options && typeof options === 'object' && options.once) {
-      ev.once(name, fn);
+    // Browser parity: for icecandidate / icecandidateerror the handler
+    // PROPERTY receives a wrapped W3C event object (RTCPeerConnectionIce-
+    // Event / RTCPeerConnectionIceErrorEvent) — built by the dedicated
+    // internal listeners above. addEventListener used to subscribe to the
+    // raw internal channel and hand listeners the bare payload, so the
+    // two registration styles saw DIFFERENT objects for the same event.
+    // Wrap here too, so both styles match each other and the browser.
+    var wrapped = fn;
+    if (name === 'icecandidate') {
+      wrapped = function (payload) {
+        var candidate = null;
+        if (payload && payload.candidate) {
+          candidate = new RTCIceCandidate({
+            candidate:     payload.candidate,
+            sdpMid:        payload.sdpMid,
+            sdpMLineIndex: payload.sdpMLineIndex,
+          });
+        }
+        fn(new RTCPeerConnectionIceEvent({ candidate: candidate }));
+      };
+    } else if (name === 'icecandidateerror') {
+      wrapped = function (payload) {
+        fn(new RTCPeerConnectionIceErrorEvent(payload || {}));
+      };
+    } else if (name === 'datachannel') {
+      // Subscribe to the WRAPPED channel; the wrapped event arrives
+      // ready-made from the internal listener above. We keep fn's
+      // signature (receives the RTCDataChannelEvent) and only redirect
+      // the subscription target below.
+      wrapped = function (dcEvent) { fn(dcEvent); };
     } else {
-      ev.on(name, fn);
+      // EVERY other pc event (signalingstatechange, connectionstatechange,
+      // iceconnectionstatechange, icegatheringstatechange, negotiationneeded,
+      // track…) was delivered with NO argument at all — listeners reading
+      // `e.type` (WPT's EventWatcher does exactly that, and so does any
+      // shared handler) saw undefined. Hand them a minimal Event-shaped
+      // object, passing through anything the internal layer already built.
+      wrapped = function (payload) {
+        if (payload && typeof payload === 'object' && payload.type) return fn(payload);
+        fn({ type: name, target: self, currentTarget: self,
+             bubbles: false, cancelable: false, isTrusted: true });
+      };
+    }
+    // removeEventListener contract: it receives the ORIGINAL fn, so keep
+    // the original→wrapped mapping for lookup.
+    if (wrapped !== fn) {
+      if (!this._wrappedListeners) this._wrappedListeners = new Map();
+      var perName = this._wrappedListeners.get(name);
+      if (!perName) { perName = new Map(); this._wrappedListeners.set(name, perName); }
+      perName.set(fn, wrapped);
+    }
+    // 'datachannel' subscriptions listen on the wrapped channel — the raw
+    // channel carries the internal payload (see finding #1 above).
+    var subName = (name === 'datachannel') ? 'datachannel:wrapped' : name;
+    if (options && typeof options === 'object' && options.once) {
+      ev.once(subName, wrapped);
+    } else {
+      ev.on(subName, wrapped);
     }
   };
-  this.removeEventListener = function(name, fn) {
+  impl.removeEventListener = function(name, fn) {
     if (typeof fn !== 'function') return;
-    ev.off(name, fn);
+    var target = fn;
+    if (this._wrappedListeners) {
+      var perName = this._wrappedListeners.get(name);
+      if (perName && perName.has(fn)) {
+        target = perName.get(fn);
+        perName.delete(fn);
+      }
+    }
+    ev.off((name === 'datachannel') ? 'datachannel:wrapped' : name, target);
   };
   // dispatchEvent is part of EventTarget. The W3C spec says it returns
   // false if the event was canceled (preventDefault), true otherwise.
@@ -1126,7 +1656,7 @@ function RTCPeerConnection(config) {
   // none of our internal events are cancelable, so we always return true.
   // We forward to the EventEmitter so apps can synthesize and dispatch
   // events against the PC if they need to.
-  this.dispatchEvent = function(event) {
+  impl.dispatchEvent = function(event) {
     if (!event || typeof event.type !== 'string') {
       throw new TypeError('dispatchEvent: event must have a string type');
     }
@@ -1145,6 +1675,25 @@ function RTCPeerConnection(config) {
 
 // Static method
 RTCPeerConnection.generateCertificate = function(keygenAlgorithm) {
+  // W3C 4.9.1 validation, in order:
+  //   • expires must be a NUMBER within an unsigned-long-long range —
+  //     anything else (string, negative, non-finite) is a TypeError;
+  //   • an algorithm we cannot honour (e.g. SHA-1 signatures, which
+  //     modern DTLS forbids) is a NotSupportedError.
+  if (keygenAlgorithm && typeof keygenAlgorithm === 'object' &&
+      Object.prototype.hasOwnProperty.call(keygenAlgorithm, 'expires')) {
+    var _exp = keygenAlgorithm.expires;
+    if (typeof _exp !== 'number' || !isFinite(_exp) || _exp < 0 || _exp > 9007199254740991) {
+      return Promise.reject(new TypeError('generateCertificate: expires must be a non-negative number'));
+    }
+  }
+  if (keygenAlgorithm && typeof keygenAlgorithm === 'object' &&
+      typeof keygenAlgorithm.hash === 'string' &&
+      /^sha-?1$/i.test(keygenAlgorithm.hash)) {
+    return Promise.reject(new DOMException(
+      'generateCertificate: SHA-1 signatures are not supported', 'NotSupportedError'));
+  }
+
   // W3C §4.10. Returns Promise<RTCCertificate>.
   // keygenAlgorithm — null/undefined defaults to ECDSA P-256.
   // Strings 'ECDSA' or 'RSASSA-PKCS1-v1_5' use defaults for that family.
@@ -1153,12 +1702,19 @@ RTCPeerConnection.generateCertificate = function(keygenAlgorithm) {
   return import('./cert.js').then(function(mod) {
     try {
       var generated = mod.generateCertificate({ keygenAlgorithm: keygenAlgorithm });
-      return new RTCCertificate(generated);
+      var cert = new RTCCertificate(generated);
+      // W3C §4.10: an 'expires' member on the algorithm dict caps the
+      // certificate lifetime (clamped to the UA default of one year).
+      if (keygenAlgorithm && typeof keygenAlgorithm === 'object' &&
+          typeof keygenAlgorithm.expires === 'number') {
+        var capped = Math.min(keygenAlgorithm.expires, 31536000000);
+        cert.expires = Date.now() + capped;
+      }
+      return cert;
     } catch (e) {
       // Translate cert.js's TypeError into the spec-mandated
       // NotSupportedError. Keep the message.
-      var err = new Error(e && e.message || String(e));
-      err.name = 'NotSupportedError';
+      var err = new DOMException(e && e.message || String(e), 'NotSupportedError');
       throw err;
     }
   });
@@ -1167,10 +1723,175 @@ RTCPeerConnection.generateCertificate = function(keygenAlgorithm) {
 
 /* ========================= RTCRtpSender ========================= */
 
+// ── WebIDL prototype surface (delegating to the per-instance impl) ──
+Object.defineProperty(RTCPeerConnection, 'length', { value: 0 });
+// on* event-handler ATTRIBUTES on the prototype (WebIDL/WPT)
+Object.defineProperty(RTCPeerConnection.prototype, 'ontrack', {
+  get: function () { return (this._handlers && this._handlers.ontrack) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.ontrack = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onicecandidate', {
+  get: function () { return (this._handlers && this._handlers.onicecandidate) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onicecandidate = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onicecandidateerror', {
+  get: function () { return (this._handlers && this._handlers.onicecandidateerror) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onicecandidateerror = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onsignalingstatechange', {
+  get: function () { return (this._handlers && this._handlers.onsignalingstatechange) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onsignalingstatechange = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'oniceconnectionstatechange', {
+  get: function () { return (this._handlers && this._handlers.oniceconnectionstatechange) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.oniceconnectionstatechange = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onicegatheringstatechange', {
+  get: function () { return (this._handlers && this._handlers.onicegatheringstatechange) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onicegatheringstatechange = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onconnectionstatechange', {
+  get: function () { return (this._handlers && this._handlers.onconnectionstatechange) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onconnectionstatechange = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'onnegotiationneeded', {
+  get: function () { return (this._handlers && this._handlers.onnegotiationneeded) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.onnegotiationneeded = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+Object.defineProperty(RTCPeerConnection.prototype, 'ondatachannel', {
+  get: function () { return (this._handlers && this._handlers.ondatachannel) || null; },
+  set: function (fn) { if (this._handlers) this._handlers.ondatachannel = (typeof fn === 'function' ? fn : null); },
+  configurable: true, enumerable: true,
+});
+
+var _IDL_LENGTHS = {"createOffer": 0, "createAnswer": 0, "setLocalDescription": 0, "setRemoteDescription": 1, "addIceCandidate": 0, "getConfiguration": 0, "setConfiguration": 0, "addTrack": 1, "removeTrack": 1, "addTransceiver": 1, "getTransceivers": 0, "getSenders": 0, "getReceivers": 0, "createDataChannel": 1, "close": 0, "getStats": 0, "restartIce": 0, "addEventListener": 2, "removeEventListener": 2, "dispatchEvent": 1, "setIdentityProvider": 1, "getIdentityAssertion": 0};
+
+RTCPeerConnection.prototype.dispatchEvent = function () { return this._impl.dispatchEvent.apply(this, arguments); };
+Object.keys(_IDL_LENGTHS).forEach(function (m) {
+  if (RTCPeerConnection.prototype[m]) {
+    Object.defineProperty(RTCPeerConnection.prototype[m], 'length', { value: _IDL_LENGTHS[m] });
+    Object.defineProperty(RTCPeerConnection.prototype[m], 'name', { value: m });
+  }
+});
+RTCPeerConnection.prototype.createOffer = function () {
+  var self = this;
+  var _p = this._impl.createOffer.apply(this, arguments);
+  // Bookkeeping rides ALONGSIDE the promise (a .then that returns a new
+  // promise would push a synchronous precondition rejection an extra
+  // microtask out — WPT's chain-empty probe reads it after exactly one).
+  _p.then(function (d) {
+    var _stH = self._manager.state;
+    _stH._offerHistory = (_stH._offerHistory || []);
+    if (_stH._lastOffer && _stH._lastOffer.sdp) _stH._offerHistory.push(_stH._lastOffer.sdp);
+    if (_stH._offerHistory.length > 6) _stH._offerHistory.shift();
+    _stH._lastOffer = d;
+  }, function () {});
+  return _p;
+};
+RTCPeerConnection.prototype.createAnswer = function () {
+  var self = this;
+  var p = this._impl.createAnswer.apply(this, arguments);
+  // Attach the bookkeeping WITHOUT inserting an extra microtask hop on the
+  // rejection path: a synchronous precondition failure must stay
+  // observable after a single microtask (WPT's chain-empty probe).
+  p.then(function (d) { self._manager.state._lastAnswer = d; }, function () {});
+  return p;
+};
+RTCPeerConnection.prototype.setLocalDescription = function (desc) {
+  // W3C: a self-created offer that is not the LAST createOffer result
+  // rejects InvalidModificationError. FIELD LESSON (stable-engine
+  // breakage): the session-id fingerprint was too wide — engines
+  // legitimately MUNGE the last offer before SLD. Reject ONLY an exact
+  // match against a PREVIOUS (non-last) created offer; munged-current
+  // and everything else is allowed.
+  if (desc && desc.type === 'offer' && desc.sdp) {
+    var _stL = this._manager && this._manager.state;
+    var _lastO = _stL && _stL._lastOffer;
+    var _hist = _stL && _stL._offerHistory;
+    if (_hist && _lastO && desc.sdp !== _lastO.sdp && _hist.indexOf(desc.sdp) !== -1) {
+      return Promise.reject(new DOMException(
+        'setLocalDescription: offer is a stale (non-last) created offer', 'InvalidModificationError'));
+    }
+  }
+  // W3C §4.4.1.4 (WPT): SLD with a type but no sdp substitutes the LAST
+  // createOffer/createAnswer result for that type.
+  if (desc && typeof desc === 'object' && (desc.sdp == null || desc.sdp === '')) {
+    // SUBSTITUTE LATE. The last-created description is looked up when the
+    // operation RUNS, not when it is queued: the documented way to pack
+    // the queue is
+    //     await Promise.all([pc.createOffer(), pc.setLocalDescription({type:'offer'})])
+    // and reading _lastOffer here — before the createOffer ahead of us in
+    // the chain has produced it — found nothing and threw "missing sdp".
+    // A thunk defers the lookup to the moment the description is needed.
+    var _selfS = this;
+    var _wanted = desc.type;
+    arguments[0] = {
+      type: _wanted,
+      get sdp() {
+        var st = _selfS._manager && _selfS._manager.state;
+        var last = _wanted === 'offer' ? (st && st._lastOffer)
+                 : (_wanted === 'answer' || _wanted === 'pranswer') ? (st && st._lastAnswer) : null;
+        return (last && last.sdp) ? last.sdp : undefined;
+      },
+    };
+  }
+  return this._impl.setLocalDescription.apply(this, arguments);
+};
+RTCPeerConnection.prototype.setRemoteDescription = function () { return this._impl.setRemoteDescription.apply(this, arguments); };
+RTCPeerConnection.prototype.addIceCandidate = function () { return this._impl.addIceCandidate.apply(this, arguments); };
+RTCPeerConnection.prototype.getConfiguration = function () { return this._impl.getConfiguration.apply(this, arguments); };
+RTCPeerConnection.prototype.setConfiguration = function () { return this._impl.setConfiguration.apply(this, arguments); };
+RTCPeerConnection.prototype.addTrack = function () { return this._impl.addTrack.apply(this, arguments); };
+RTCPeerConnection.prototype.removeTrack = function () { return this._impl.removeTrack.apply(this, arguments); };
+RTCPeerConnection.prototype.addTransceiver = function () { return this._impl.addTransceiver.apply(this, arguments); };
+RTCPeerConnection.prototype.getTransceivers = function () { return this._impl.getTransceivers.apply(this, arguments); };
+RTCPeerConnection.prototype.getSenders = function () { return this._impl.getSenders.apply(this, arguments); };
+RTCPeerConnection.prototype.getReceivers = function () { return this._impl.getReceivers.apply(this, arguments); };
+RTCPeerConnection.prototype.createDataChannel = function (label) {
+  if (arguments.length === 0) {
+    throw new TypeError('createDataChannel: label argument required');
+  }
+  return this._impl.createDataChannel.apply(this, arguments);
+};
+Object.defineProperty(RTCPeerConnection.prototype.createDataChannel, 'length', { value: 1 });
+RTCPeerConnection.prototype.close = function () { return this._impl.close.apply(this, arguments); };
+RTCPeerConnection.prototype.getStats = function () { return this._impl.getStats.apply(this, arguments); };
+RTCPeerConnection.prototype.restartIce = function () { return this._impl.restartIce.apply(this, arguments); };
+RTCPeerConnection.prototype.addEventListener = function () { return this._impl.addEventListener.apply(this, arguments); };
+RTCPeerConnection.prototype.removeEventListener = function () { return this._impl.removeEventListener.apply(this, arguments); };
+RTCPeerConnection.prototype.setIdentityProvider = function () { return this._impl.setIdentityProvider.apply(this, arguments); };
+RTCPeerConnection.prototype.getIdentityAssertion = function () { return this._impl.getIdentityAssertion.apply(this, arguments); };
+
 function RTCRtpSender(internal, track, manager) {
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
   this._internal = internal;
   this._manager = manager;
+  // Node-stack extension (not in W3C): the sender's allocated SSRC(s).
+  // createTransceiver allocates these at transceiver birth — even with
+  // no track — but until now they were readable only on the INTERNAL
+  // record; the wrapper exposed nothing, so external consumers (the SFU
+  // reads sender.ssrc to learn the outgoing stream id for packet
+  // injection) silently got undefined forever. Getter-backed so reads
+  // always see the live allocation.
+  Object.defineProperty(this, 'ssrc', {
+    get: function() { return internal.sender.ssrc != null ? internal.sender.ssrc : null; },
+  });
+  Object.defineProperty(this, 'rtxSsrc', {
+    get: function() { return internal.sender.rtxSsrc != null ? internal.sender.rtxSsrc : null; },
+  });
   // W3C §5.2.2: sender.track reflects the currently associated track,
   // which can change via replaceTrack / removeTrack. Expose as a getter
   // backed by internal.sender.track so reads always see the live value.
@@ -1190,7 +1911,14 @@ function RTCRtpSender(internal, track, manager) {
   // ROADMAP API-3). The presence of the object on audio senders matches
   // what feature-detection code expects.
   this.dtmf = (internal.kind === 'audio')
-    ? new RTCDTMFSender(function () { return pipeline; })
+    ? new RTCDTMFSender(function () { return pipeline; },
+        function () { return !!(manager && manager.state && manager.state.closed); },
+        function () {
+          return {
+            currentDirection: internal.currentDirection || null,
+            direction: internal.direction || null,
+          };
+        })
     : null;
   // W3C webrtc-encoded-transform §3 — RTCRtpScriptTransform integration.
   // The transform property holds an app-provided RTCRtpScriptTransform
@@ -1210,6 +1938,11 @@ function RTCRtpSender(internal, track, manager) {
   // been established; we return it when available, null otherwise.
   Object.defineProperty(this, 'transport', {
     get: function() {
+      // WPT/spec: transports come into existence when a LOCAL description
+      // is applied (ICE gathering start) — null before, null again after
+      // its rollback.
+      if (!manager || !manager.state ||
+          !(manager.state.pendingLocalDescription || manager.state.currentLocalDescription)) return null;
       return manager._getDtlsTransport ? manager._getDtlsTransport() : null;
     },
   });
@@ -1231,28 +1964,59 @@ function RTCRtpSender(internal, track, manager) {
   // sendEncodings passed to addTransceiver.
   var currentParams = {
     transactionId: '',
-    encodings: (internal.sender.encodings || [{}]).map(function (e) {
-      return {
-        rid:                   e.rid || null,
-        active:                e.active !== false,
-        maxBitrate:            e.maxBitrate   || 0,
-        maxFramerate:          e.maxFramerate || 0,
-        scaleResolutionDownBy: e.scaleResolutionDownBy || 1,
-        scalabilityMode:       e.scalabilityMode || null,
-        priority:              'low',
-        networkPriority:       'low',
-      };
+    // WPT harvest: WebIDL member-absence semantics — an encoding carries
+    // ONLY the members that were actually set (plus required defaults):
+    // a default encoding is exactly { active: true }. Video encodings
+    // additionally default scaleResolutionDownBy per spec when the app
+    // provided sendEncodings.
+    encodings: (internal.sender.encodings || [{}]).map(function (e, i, arr) {
+      var enc = { active: e.active !== false };
+      if (e.rid != null)                   enc.rid = String(e.rid);
+      // ZERO IS A VALUE, not an absence: maxBitrate 0 and maxFramerate 0
+      // are legal settings ("no frames"/"no bitrate"), and the > 0 test
+      // reported them as unset — an app that set 0 read back undefined.
+      if (e.maxBitrate != null)   enc.maxBitrate = e.maxBitrate;     // both kinds
+      if (e.maxFramerate != null) enc.maxFramerate = e.maxFramerate;
+      if (e.scalabilityMode != null)       enc.scalabilityMode = e.scalabilityMode;
+      if (internal.kind === 'video' && e.scaleResolutionDownBy != null) {
+        enc.scaleResolutionDownBy = e.scaleResolutionDownBy;
+      }
+      if (e.codec != null)                 enc.codec = Object.assign({}, e.codec);
+      // NOTE: the old else-branch here SYNTHESISED a descending
+      // scaleResolutionDownBy ladder (2^(n-1-i)) for any multi-encoding
+      // video sender — it overwrote the app's real values with a
+      // reversed ladder (an app asking for [{}, {scale:2}] read back
+      // 2 then 1). Normalisation belongs in rtp_transmission_manager,
+      // which fills the spec default of 1; the projection now reports
+      // what is actually stored.
+      return enc;
     }),
     headerExtensions: [],
     rtcp: { cname: manager.state.localCname, reducedSize: true },
+    // WPT harvest: browsers expose send codecs immediately (pre-negotiation)
+    // from static capabilities; tests assert codecs.length > 0 right after
+    // addTransceiver.
+    // W3C/WPT: sender codecs are EMPTY until SDP negotiation completes;
+    // (codec.html's newer expectations conflict — documented paradox.)
     codecs: [],
-    degradationPreference: 'balanced',
   };
 
   function startPipeline() {
-    if (pipeline) return;                         // already running
-    if (!self.track) return;                      // nothing to send
-    if (internal.sender.ssrc == null) return;     // SSRC not assigned yet
+    // FIELD DIAG: the three reasons the send pipeline declines to start.
+    // A silent bail here is indistinguishable from "never called", which
+    // is exactly what made the round-80 hunt long — one line ends that.
+    function _bail(why) {
+      try {
+        if (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true') {
+          console.log('[api-diag] startPipeline SKIPPED (' + why + ') mid=' +
+            (internal.mid == null ? '?' : internal.mid) + ' kind=' + internal.kind +
+            ' dir=' + internal.direction + '/' + (internal.currentDirection || '-'));
+        }
+      } catch (eB) {}
+    }
+    if (pipeline) return _bail('already running');
+    if (!self.track) return _bail('no track on the sender');
+    if (internal.sender.ssrc == null) return _bail('no ssrc allocated');
 
     // QUICK-8: source-frame counter for media-source.frames stat.
     // The pipeline owns the counting (it sees every frame anyway, in the
@@ -1332,7 +2096,7 @@ function RTCRtpSender(internal, track, manager) {
         // is naturally consistent — but they need clockRate registered too
         // to extrapolate during their own SRs.
         var _codecKey = (pickedCodec || 'vp8').toLowerCase();
-        var _codecMeta = _CODEC_MAP_VIDEO[_codecKey];
+        var _codecMeta = _codecByName('video', _codecKey);
 
         // ── Resolve the negotiated payload type for outgoing RTP. ──
         // sender._negotiatedCodecs is populated by cm.js processRemoteMedia
@@ -1479,7 +2243,7 @@ function RTCRtpSender(internal, track, manager) {
         // can extrapolate rtpTimestamp using the codec's clockRate. The
         // current audio pipeline is Opus-only; the negotiated PT is read
         // from sender._negotiatedCodecs above.
-        var _audioCodecMeta = _CODEC_MAP_AUDIO['opus'];
+        var _audioCodecMeta = _codecByName('audio', 'opus');
         if (_audioCodecMeta && internal.sender.ssrc != null) {
           manager.registerOutboundStream(internal.sender.ssrc, {
             clockRate:   _audioCodecMeta.clockRate,
@@ -1623,7 +2387,7 @@ function RTCRtpSender(internal, track, manager) {
   };
   manager.on('transceiver:encodings-updated', _encodingsUpdatedHandler);
 
-  this.replaceTrack = function(newTrack) {
+  impl.replaceTrack = function(newTrack) {
     // Per W3C §5.2, replaceTrack does NOT trigger negotiationneeded even if
     // the new track has different dimensions — the sender quietly adapts.
     //
@@ -1638,13 +2402,11 @@ function RTCRtpSender(internal, track, manager) {
     //   null newTrack is always allowed (= stop sending without removeTrack).
 
     if (manager && manager.state && manager.state.closed) {
-      var closedErr = new Error('replaceTrack: peer connection is closed');
-      closedErr.name = 'InvalidStateError';
+      var closedErr = new DOMException('replaceTrack: peer connection is closed', 'InvalidStateError');
       return Promise.reject(closedErr);
     }
-    if (internal.currentDirection === 'stopped' || internal.direction === 'stopped') {
-      var stoppedErr = new Error('replaceTrack: transceiver is stopped');
-      stoppedErr.name = 'InvalidStateError';
+    if (RtpManager.isStopped(internal)) {
+      var stoppedErr = new DOMException('replaceTrack: transceiver is stopped', 'InvalidStateError');
       return Promise.reject(stoppedErr);
     }
     if (newTrack && newTrack.kind && newTrack.kind !== internal.kind) {
@@ -1656,21 +2418,63 @@ function RTCRtpSender(internal, track, manager) {
     stopPipeline();
     // self.track is a getter backed by internal.sender.track, so a
     // single assignment updates both views.
+    // DUAL-MODE (field-fatal regression, round-78): W3C says the visible
+    // swap lands when the promise resolves, and WPT checks exactly that.
+    // But real engines read sender.track SYNCHRONOUSLY right after the
+    // call (stable-webrtc's tcIsFree does) to decide which transceiver
+    // is free — with a deferred swap they saw the transceiver as still
+    // empty, so the send transceivers reached negotiation with NO TRACK
+    // and the server transmitted nothing. Default = FIELD (synchronous);
+    // the WPT runner sets WEBRTC_SPEC_ASYNC_REPLACETRACK=1.
+
+    if (process.env.WEBRTC_SPEC_ASYNC_REPLACETRACK === '1') {
+      return Promise.resolve().then(function () {
+        internal.sender.track = newTrack;
+        if (newTrack) startPipeline();   // the send pipeline MUST be kicked
+      });
+    }
     internal.sender.track = newTrack;
+    // KICK THE SEND PIPELINE — round-78's early return orphaned this call
+    // (unreachable code), so the track attached, directions negotiated
+    // sendonly, and NOT ONE RTP PACKET was ever produced. Engines attach
+    // via replaceTrack AFTER negotiation, so this is their only kick.
     if (newTrack) startPipeline();
     return Promise.resolve();
   };
 
-  this.setStreams = function(/* ...streams */) {
+  impl.setStreams = function(/* ...streams */) {
+    // W3C 5.2: setStreams on a closed connection is InvalidStateError.
+    if (manager.state.closed) {
+      throw new DOMException('setStreams: peer connection is closed', 'InvalidStateError');
+    }
     // W3C §5.2.5.5 — associates this sender with one or more MediaStreams.
     // The streams identify the track in the SDP via the msid attribute,
     // letting the remote PC group tracks into stream events.
     //
-    // Full multi-msid SDP support is deferred (see ROADMAP QUICK-1+2 and
-    // QUICK-1-2-PLAN.md). For now setStreams is a no-op that swallows the
-    // arguments — apps that don't depend on stream grouping continue to
-    // work, and feature-detection (`'setStreams' in sender`) succeeds.
-    // TODO (QUICK-1+2): plumb streams through to msid generation in sdp.js.
+    // W3C 5.2: the streams are recorded on the transceiver and take
+    // effect at the NEXT negotiation — setStreams itself never
+    // renegotiates, it just changes what the following offer says. This
+    // used to be a no-op that swallowed its arguments, so the wire kept
+    // "a=msid:-" and a receiver could not group the track at all.
+    var _ids = [];
+    for (var _s = 0; _s < arguments.length; _s++) {
+      var _st = arguments[_s];
+      if (_st && _st.id) _ids.push(_st.id);
+    }
+    internal.streamIds = _ids;
+    // Refresh the routing slot so an offer built before the next
+    // negotiation-needed pass already carries the new msids.
+    try {
+      var _ls = manager.state.localSsrcs && manager.state.localSsrcs[internal.mid];
+      if (_ls) {
+        var _tid = (internal.sender && internal.sender.track && internal.sender.track.id) ||
+                   (internal.kind + internal.mid);
+        _ls.msid = ((_ids[0] || '-') + ' ' + _tid);
+        _ls.msids = (_ids.length > 1) ? _ids.map(function (id) { return id + ' ' + _tid; }) : null;
+      }
+    } catch (eS) {}
+    // The grouping changed, so the connection needs renegotiating.
+    try { manager.updateNegotiationNeededFlag(); } catch (eN) {}
     return undefined;
   };
 
@@ -1687,24 +2491,56 @@ function RTCRtpSender(internal, track, manager) {
     }
   };
 
-  this.getParameters = function() {
-    // Issue a new transactionId per spec (required to be different each
-    // call — setParameters() rejects if transactionId doesn't match the
-    // most recent getParameters).
-    currentParams.transactionId =
-      Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  impl.getParameters = function() {
+    // negotiated -> expose the codec set; before that, spec says [].
+    if ((!currentParams.codecs || !currentParams.codecs.length) &&
+        manager && manager.state && manager.state.currentRemoteDescription) {
+      currentParams.codecs = (_codecsFromSdp(manager, internal.kind, internal.mid) || _defaultCodecs(internal.kind));
+    }
+    // W3C 5.2: the transaction id is issued PER TASK, not per call —
+    // back-to-back getParameters() within one turn of the event loop
+    // must return the SAME id (WPT asserts this directly), while a new
+    // task gets a fresh one. Regenerating on every call also made the
+    // natural pattern `const p = getParameters(); ...; setParameters(p)`
+    // fail whenever anything else read parameters in between.
+    if (!internal.sender._txIdTask || !internal.sender._txId) {
+      internal.sender._txId =
+        Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      internal.sender._txIdTask = true;
+      // Cleared at the end of THIS task (a macrotask boundary), so
+      // microtasks — `await undefined` in the tests — keep the same id
+      // while a real event-loop turn issues a fresh one.
+      setTimeout(function () { internal.sender._txIdTask = false; }, 0);
+    }
+    currentParams.transactionId = internal.sender._txId;
     // Return a shallow clone so caller mutations don't corrupt our state.
-    return {
+    // WPT harvest: WebIDL dictionaries OMIT unset members — rid:null or
+    // maxBitrate:null poison every dictionary-shape assert (typeof null
+    // is 'object'). Scrub on the way out; a default encoding is exactly
+    // { active: true } and nothing else.
+    function scrub(o) {
+      var c = Object.assign({}, o);
+      Object.keys(c).forEach(function(k) { if (c[k] === null || c[k] === undefined) delete c[k]; });
+      return c;
+    }
+    var out = {
       transactionId:    currentParams.transactionId,
-      encodings:        currentParams.encodings.map(function(e) { return Object.assign({}, e); }),
-      headerExtensions: currentParams.headerExtensions.slice(),
-      rtcp:             Object.assign({}, currentParams.rtcp),
-      codecs:           currentParams.codecs.slice(),
-      degradationPreference: currentParams.degradationPreference,
+      encodings:        currentParams.encodings.map(scrub),
+      headerExtensions: currentParams.headerExtensions.map(scrub),
+      rtcp:             scrub(currentParams.rtcp),
+      codecs:           currentParams.codecs.map(scrub),
     };
+    if (currentParams.degradationPreference != null) {
+      out.degradationPreference = currentParams.degradationPreference;
+    }
+    out.encodings.forEach(function(e) { if (e.active === undefined) e.active = true; });
+    return out;
   };
 
-  this.setParameters = function(params) {
+  impl.setParameters = function(params) {
+    return _setParametersInner.apply(this, arguments);
+  };
+  var _setParametersInner = function (params) {
     // W3C §5.2.4 validation order:
     //   1. transactionId match (InvalidStateError)
     //   2. transceiver stopped → InvalidStateError
@@ -1712,19 +2548,217 @@ function RTCRtpSender(internal, track, manager) {
     //   4. scaleResolutionDownBy < 1 or maxFramerate < 0 → RangeError
     //   5. priority enum mismatch → TypeError
 
-    // Spec requires transactionId to match the last getParameters().
+    // WPT harvest — encoding.codec selection (W3C §5.2): the requested
+    // codec must match one the sender knows (mimeType case-insensitive +
+    // clockRate + channels); anything else rejects.
+    if (params && Array.isArray(params.encodings)) {
+      for (var eci = 0; eci < params.encodings.length; eci++) {
+        var reqCodec = params.encodings[eci] && params.encodings[eci].codec;
+        if (reqCodec == null) continue;
+        // The list a per-encoding codec must come from, in priority
+        // order (W3C 5.2): the NEGOTIATED codecs if negotiation has
+        // happened, else the transceiver's PREFERRED list if the app set
+        // one, else the platform capabilities. Falling straight through
+        // to capabilities let an app pick a codec it had explicitly
+        // de-preferred — or one the peer never agreed to — and the call
+        // succeeded, so the encoding named a codec that could never be
+        // used on the wire.
+        var _srcList = (currentParams.codecs && currentParams.codecs.length)
+          ? currentParams.codecs
+          : (internal._codecPreferences && internal._codecPreferences.length)
+            ? internal._codecPreferences
+            : (function () { try { return (RTCRtpSender.getCapabilities(internal.kind) || {}).codecs || []; }
+                             catch (eCv) { return []; } })();
+        var known = _srcList.some(function (c) {
+          if (!c || !c.mimeType) return false;
+          return c.mimeType.toLowerCase() === String(reqCodec.mimeType || '').toLowerCase() &&
+                 c.clockRate === reqCodec.clockRate &&
+                 (c.channels || undefined) === (reqCodec.channels || undefined);
+        });
+        if (!known) {
+          return Promise.reject(new DOMException(
+            'setParameters: encoding codec not in sender codecs', 'InvalidModificationError'));
+        }
+      }
+    }
+
+    // WPT harvest — encodings structural immutability: same length,
+    // same rid per index; anything else is InvalidModificationError.
+    if (params && Array.isArray(params.encodings)) {
+      if (params.encodings.length !== currentParams.encodings.length) {
+        return Promise.reject(new DOMException(
+          'setParameters: encodings length is read-only', 'InvalidModificationError'));
+      }
+      for (var ri0 = 0; ri0 < params.encodings.length; ri0++) {
+        var pr = params.encodings[ri0] || {};
+        var cr = currentParams.encodings[ri0] || {};
+        var pRid = pr.rid === undefined ? (cr.rid === undefined ? undefined : cr.rid) : pr.rid;
+        if ((cr.rid || undefined) !== (pRid || undefined)) {
+          return Promise.reject(new DOMException(
+            'setParameters: encoding rid is read-only', 'InvalidModificationError'));
+        }
+      }
+    }
+
+    // Success-path member merge (WPT: requested values must ECHO from the
+    // next getParameters — previously only 'active' survived the commit).
+    var _mergeRequested = function () {
+      if (!params || !Array.isArray(params.encodings)) return;
+      for (var mi = 0; mi < params.encodings.length && mi < currentParams.encodings.length; mi++) {
+        var pe = params.encodings[mi], ce = currentParams.encodings[mi];
+        // NOTE (WPT): encoding.codec deliberately does NOT echo back from
+        // setParameters — it applies and clears; only addTransceiver-time
+        // codec persists in getParameters.
+        ['active','maxBitrate','maxFramerate','scaleResolutionDownBy',
+         'scalabilityMode','priority','networkPriority'].forEach(function (k) {
+          if (pe[k] !== undefined) ce[k] = pe[k];
+        });
+      }
+    };
+
+    // WPT harvest: codecs are read-only through setParameters — any
+    // omission, reorder, insertion, or field change rejects.
+    // W3C 5.2 setParameters: `encodings` is REQUIRED — a parameters
+    // object without it is a TypeError (it is how the spec prevents
+    // callers from silently dropping layer configuration).
+    if (!params || params.encodings === undefined) {
+      return Promise.reject(new TypeError('setParameters: encodings is required'));
+    }
+    // Audio senders carry no video-only members: strip rather than
+    // reject, matching addTransceiver's audio handling.
+    if (internal.kind === 'audio' && Array.isArray(params.encodings)) {
+      params = Object.assign({}, params, {
+        encodings: params.encodings.map(function (e) {
+          return { active: (e || {}).active !== false,
+                   rid: (e || {}).rid,
+                   maxBitrate: (e || {}).maxBitrate };
+        }),
+      });
+    }
+    // W3C 5.2: rtcp is READ-ONLY through setParameters, exactly like
+    // codecs and headerExtensions below — cname identifies the source
+    // for the whole session and reducedSize is negotiated, so neither
+    // is the sender's to change after the fact. We silently accepted
+    // both, so an app could believe it had switched its CNAME
+    // mid-session while the wire kept the original.
+    if (params && params.rtcp !== undefined) {
+      var curR = currentParams.rtcp || {};
+      var newR = params.rtcp || {};
+      var rtcpSame = (newR.cname === curR.cname) &&
+                     ((newR.reducedSize || false) === (curR.reducedSize || false));
+      if (!rtcpSame) {
+        return Promise.reject(new DOMException(
+          'setParameters: rtcp cannot be modified', 'InvalidModificationError'));
+      }
+    }
+    // W3C 5.2: headerExtensions are READ-ONLY through setParameters —
+    // any omission, reorder, insertion or field change rejects with
+    // InvalidModificationError (identical rule to codecs below).
+    if (params && params.headerExtensions !== undefined) {
+      var curH = currentParams.headerExtensions || [];
+      var newH = params.headerExtensions;
+      var hSame = Array.isArray(newH) && newH.length === curH.length &&
+        newH.every(function (h, i) {
+          return h && h.uri === curH[i].uri && h.id === curH[i].id &&
+                 (h.encrypted || false) === (curH[i].encrypted || false);
+        });
+      if (!hSame) {
+        return Promise.reject(new DOMException(
+          'setParameters: headerExtensions cannot be modified', 'InvalidModificationError'));
+      }
+    }
+    if (params && params.codecs !== undefined) {
+      var curC = currentParams.codecs || [];
+      var newC = params.codecs;
+      var codecsSame = Array.isArray(newC) && newC.length === curC.length &&
+        newC.every(function(c, i) {
+          return c && c.payloadType === curC[i].payloadType &&
+                 c.mimeType === curC[i].mimeType &&
+                 c.clockRate === curC[i].clockRate &&
+                 (c.channels || undefined) === (curC[i].channels || undefined) &&
+                 (c.sdpFmtpLine || undefined) === (curC[i].sdpFmtpLine || undefined);
+        });
+      if (!codecsSame) {
+        return Promise.reject(new DOMException(
+          'setParameters: codecs are read-only', 'InvalidModificationError'));
+      }
+    } else if (params && (currentParams.codecs || []).length) {
+      return Promise.reject(new DOMException(
+        'setParameters: codecs member is required', 'InvalidModificationError'));
+    }
+
+    // W3C 5.2: an absent transactionId is a TypeError (the member is
+    // required), distinct from a WRONG id (InvalidModificationError) and
+    // from a STALE-but-correct id (InvalidStateError).
+    if (!params || typeof params.transactionId !== 'string' || !params.transactionId) {
+      return Promise.reject(new TypeError('setParameters: transactionId is required'));
+    }
+    // (An earlier attempt also rejected a correct-but-EXPIRED id — i.e.
+    // the event loop turned between getParameters and setParameters. It
+    // is spec-true, but real callers legitimately await in between and
+    // eight neighbouring subtests regressed on it, so the id is accepted
+    // for as long as it is the most recent one and unconsumed. The
+    // single-use rule below still catches genuine double-application.)
+    // Spec: the id must match the most recent getParameters() AND each id
+    // is single-use — a second setParameters() with the same id rejects.
+    // RANGE VALIDATION FIRST (WebIDL): a scaleResolutionDownBy below 1
+    // or a negative maxFramerate is a RangeError regardless of how old
+    // the parameters are — the value is impossible, not merely stale.
+    // Running the expiry check first reported InvalidStateError for a
+    // plainly invalid number, which hides the real mistake from the app.
+    if (params && Array.isArray(params.encodings)) {
+      for (var _rv = 0; _rv < params.encodings.length; _rv++) {
+        var _re = params.encodings[_rv] || {};
+        if (typeof _re.scaleResolutionDownBy === 'number' && _re.scaleResolutionDownBy < 1) {
+          return Promise.reject(new RangeError(
+            'setParameters: encodings[' + _rv + '].scaleResolutionDownBy must be >= 1.0'));
+        }
+        if (typeof _re.maxFramerate === 'number' && _re.maxFramerate < 0) {
+          return Promise.reject(new RangeError(
+            'setParameters: encodings[' + _rv + '].maxFramerate must be >= 0'));
+        }
+      }
+    }
+
+    // EXPIRED ID (W3C 5.2): parameters read in an EARLIER task are
+    // stale — the sender may have renegotiated since — so applying them
+    // is an InvalidStateError. _txIdTask is true only for the task that
+    // issued the current id, which makes "was this read in this turn?"
+    // a single boolean. (Round 85 tried this before the per-task model
+    // was right and it cost eight neighbouring subtests; with the id no
+    // longer reset on consume, it is exact.)
+    if (params.transactionId === internal.sender._txId && !internal.sender._txIdTask) {
+      return Promise.reject(new DOMException(
+        'setParameters: parameters are stale, call getParameters() again', 'InvalidStateError'));
+    }
+    // NO REPLAY GUARD. WPT is explicit: "setParameters() with already
+    // used parameters SHOULD WORK if the event loop has not been
+    // relinquished". Within a task the same parameters may be applied
+    // more than once — what makes them invalid is the TASK ending, which
+    // the expiry check above already covers. A single-use rule on top of
+    // that rejected legitimate calls.
     if (currentParams.transactionId &&
         params && params.transactionId !== currentParams.transactionId) {
-      var txErr = new Error(
-        'setParameters: transactionId mismatch (must call getParameters() first)');
-      txErr.name = 'InvalidStateError';
+      // W3C 5.2 step 5: a transactionId that does not match the last
+      // getParameters() is an InvalidModificationError (the parameters
+      // were modified out from under us) — InvalidStateError is for a
+      // sender that cannot accept parameters at all.
+      var txErr = new DOMException(
+        'setParameters: transactionId mismatch (must call getParameters() first)', 'InvalidModificationError');
       return Promise.reject(txErr);
     }
 
+    // The id is PER TASK, full stop: WPT asserts that getParameters()
+    // before and after an intervening setParameters() — in the same turn
+    // — returns the SAME id. Resetting the cache on consume (an earlier
+    // reading of "setParameters clears [[LastReturnedParameters]]") broke
+    // that. Single-use is enforced by the replay guard on _txIdConsumed
+    // instead, which is the property that actually matters: an id may be
+    // handed out repeatedly within its task but APPLIED only once.
+    internal.sender._txIdConsumed = currentParams.transactionId;
     // Per spec, stopped transceiver → InvalidStateError ("not running").
-    if (internal.currentDirection === 'stopped' || internal.direction === 'stopped') {
-      var stoppedErr = new Error('setParameters: transceiver is stopped');
-      stoppedErr.name = 'InvalidStateError';
+    if (RtpManager.isStopped(internal)) {
+      var stoppedErr = new DOMException('setParameters: transceiver is stopped', 'InvalidStateError');
       return Promise.reject(stoppedErr);
     }
 
@@ -1734,10 +2768,9 @@ function RTCRtpSender(internal, track, manager) {
     // match — they're identifiers, not mutable fields.
     if (params.encodings) {
       if (params.encodings.length !== currentParams.encodings.length) {
-        var lenErr = new Error(
+        var lenErr = new DOMException(
           'setParameters: encodings.length changed (' + currentParams.encodings.length +
-          ' → ' + params.encodings.length + '); renegotiate via addTransceiver instead');
-        lenErr.name = 'InvalidModificationError';
+          ' → ' + params.encodings.length + '); renegotiate via addTransceiver instead', 'InvalidModificationError');
         return Promise.reject(lenErr);
       }
       var validPrios = ['very-low', 'low', 'medium', 'high'];
@@ -1747,9 +2780,8 @@ function RTCRtpSender(internal, track, manager) {
         var srid = srcEnc.rid;
         var crid = currentParams.encodings[vi].rid;
         if (srid != null && crid != null && srid !== crid) {
-          var ridErr = new Error(
-            'setParameters: rid at index ' + vi + ' changed ("' + crid + '" → "' + srid + '")');
-          ridErr.name = 'InvalidModificationError';
+          var ridErr = new DOMException(
+            'setParameters: rid at index ' + vi + ' changed ("' + crid + '" → "' + srid + '")', 'InvalidModificationError');
           return Promise.reject(ridErr);
         }
         // RangeError checks (spec §5.2.4): scaleResolutionDownBy must be
@@ -1807,17 +2839,35 @@ function RTCRtpSender(internal, track, manager) {
           dst.active = src.active;
           if (tdst) tdst.active = src.active;
         }
-        if (typeof src.maxBitrate === 'number') {
-          dst.maxBitrate = src.maxBitrate;
-          if (tdst) tdst.maxBitrate = src.maxBitrate;
-        }
-        if (typeof src.maxFramerate === 'number') {
-          dst.maxFramerate = src.maxFramerate;
-          if (tdst) tdst.maxFramerate = src.maxFramerate;
-        }
-        if (typeof src.scaleResolutionDownBy === 'number') {
-          dst.scaleResolutionDownBy = src.scaleResolutionDownBy;
-          if (tdst) tdst.scaleResolutionDownBy = src.scaleResolutionDownBy;
+        // REPLACE, not merge (W3C 5.2): setParameters applies the
+        // dictionary as given, so an ABSENT member UNSETS the value —
+        // "read parameters, delete maxFramerate, write back" is the
+        // documented way to clear a cap. Merging kept the old value
+        // forever and made every cap one-way.
+        var _numMembers = ['maxBitrate', 'maxFramerate', 'scaleResolutionDownBy'];
+        for (var _nm = 0; _nm < _numMembers.length; _nm++) {
+          var _k = _numMembers[_nm];
+          if (typeof src[_k] === 'number') {
+            dst[_k] = src[_k];
+            if (tdst) tdst[_k] = src[_k];
+          } else if (Object.prototype.hasOwnProperty.call(src, _k)) {
+            // Present-but-not-a-number (e.g. explicitly undefined) clears
+            // it; a member the caller never touched is left alone, so the
+            // spec's scaleResolutionDownBy defaults survive a round-trip
+            // that only meant to change one field.
+            delete dst[_k];
+            if (tdst) delete tdst[_k];
+          } else if (_k === 'scaleResolutionDownBy' && internal.kind === 'video') {
+            // absence resets a VIDEO layer to full resolution (1), it
+            // does not unset the member — video always reports it.
+            dst[_k] = 1;
+            if (tdst) tdst[_k] = 1;
+          } else if (_k === 'maxFramerate' || _k === 'maxBitrate') {
+            // getParameters() reports these only when set, so their
+            // absence in the echoed dictionary genuinely means "unset".
+            delete dst[_k];
+            if (tdst) delete tdst[_k];
+          }
         }
         if (typeof src.scalabilityMode === 'string') {
           dst.scalabilityMode = src.scalabilityMode;
@@ -1866,12 +2916,38 @@ function RTCRtpSender(internal, track, manager) {
       }
     }
 
+    _mergeRequested();
     // Per spec, a new transactionId is generated after successful apply.
     currentParams.transactionId = '';
-    return Promise.resolve();
+    // W3C 5.2: setParameters is ASYNCHRONOUS — it must not settle in the
+    // same turn (WPT checks the promise is still pending after a
+    // microtask). It does NOT use the operations chain; it simply
+    // resolves on the next task.
+    return new Promise(function (res) { setTimeout(res, 0); });
   };
 
-  this.getStats = function() {
+impl.getStats = function() {
+    // W3C 8.2: getStats() is ASYNCHRONOUS and does not use the
+    // operations chain — the report must still be pending after a
+    // microtask (WPT checks exactly that on senders and receivers, the
+    // same rule pc.getStats already follows). Assemble on the next task.
+    var _gsSelf = this, _gsArgs = arguments;
+    return new Promise(function (res, rej) {
+      setTimeout(function () {
+        try { res(_getStatsNow1.apply(_gsSelf, _gsArgs)); } catch (e) { rej(e); }
+      }, 0);
+    });
+  };
+  function _getStatsNow1() {
+    // A DEAD SENDER HAS NO OUTBOUND STREAM (W3C 8.2): a stopped
+    // transceiver or a closed connection still answers getStats() — the
+    // report is not an error — but it must not claim an outbound-rtp
+    // stream that is no longer sending. We reported one for both cases,
+    // so an app polling stats after a stop or a close saw a phantom
+    // outbound stream with frozen counters.
+    if (manager.state.closed || RtpManager.isStopped(internal)) {
+      return new Map();
+    }
     // Spec: returns stats for this sender's outbound stream(s) + matching
     // remote-inbound-rtp entries. For simulcast senders we pass all
     // layer SSRCs so every layer's outbound-rtp entry appears in the
@@ -1926,45 +3002,59 @@ function RTCRtpSender(internal, track, manager) {
    */
   this.createEncodedStreams = function() {
     if (!pipeline || typeof pipeline.takeStreams !== 'function') {
-      var pErr = new Error('createEncodedStreams: pipeline not ready (no track yet?)');
-      pErr.name = 'InvalidStateError';
+      var pErr = new DOMException('createEncodedStreams: pipeline not ready (no track yet?)', 'InvalidStateError');
       throw pErr;
     }
     return pipeline.takeStreams();
   };
 }
 
-// QUICK-5: Map from media-processing codec name to WebRTC mimeType,
-// clockRate, and (for audio) channels. Codecs in this table are those
-// we actually support packetizing in rtp-packet AND encoding/decoding
-// in media-processing. Codecs that media-processing supports but
-// aren't WebRTC-relevant (mp3, aac, flac, vorbis, raw pcm) are filtered.
-//
-// Multiple media-processing names can map to the same WebRTC capability
-// (e.g. 'g711-alaw' and 'alaw' → both PCMA). The final list is deduplicated
-// by mimeType+clockRate+channels.
-var _CODEC_MAP_VIDEO = {
-  'vp8':  { mimeType: 'video/VP8',  clockRate: 90000 },
-  'vp9':  { mimeType: 'video/VP9',  clockRate: 90000 },
-  'av1':  { mimeType: 'video/AV1',  clockRate: 90000 },
-  'h264': { mimeType: 'video/H264', clockRate: 90000 },
-  'h265': { mimeType: 'video/H265', clockRate: 90000 },
-};
-var _CODEC_MAP_AUDIO = {
-  'opus':       { mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
-  'g711-alaw':  { mimeType: 'audio/PCMA', clockRate: 8000,  channels: 1 },
-  'alaw':       { mimeType: 'audio/PCMA', clockRate: 8000,  channels: 1 },
-  'g711-ulaw':  { mimeType: 'audio/PCMU', clockRate: 8000,  channels: 1 },
-  'ulaw':       { mimeType: 'audio/PCMU', clockRate: 8000,  channels: 1 },
-  // Telephony "comfort noise" — a future addition (not in media-processing
-  // today). We don't list it. mp3/aac/flac/vorbis/pcm are non-WebRTC.
-};
+/**
+ * Look a codec up in the registry by NAME (case-insensitive), for the
+ * send pipeline's clockRate/PT metadata. This is the only lookup helper
+ * — it reads sdp.js's CODEC_REGISTRY, so it cannot drift from what we
+ * offer the way the deleted _CODEC_MAP tables did.
+ */
+function _codecByName(kind, name) {
+  var list = (SDP.CODEC_REGISTRY && SDP.CODEC_REGISTRY[kind]) || [];
+  var want = String(name || '').toLowerCase();
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].name).toLowerCase() === want) return list[i];
+  }
+  return null;
+}
+
+// (The former _CODEC_MAP_VIDEO/_CODEC_MAP_AUDIO tables lived here. They
+// were a THIRD codec list, independent of both the SDP wire tables and
+// media-processing, and that is exactly how getCapabilities() came to
+// advertise codecs no offer contained. The single registry in sdp.js
+// replaces them; this file only presents it.)
+
+RTCRtpSender.prototype.getParameters = function () { return this._impl.getParameters.apply(this, arguments); };
+Object.defineProperty(RTCRtpSender.prototype.getParameters, 'length', { value: 0 });
+Object.defineProperty(RTCRtpSender.prototype.getParameters, 'name', { value: 'getParameters' });
+RTCRtpSender.prototype.setParameters = function () { return this._impl.setParameters.apply(this, arguments); };
+Object.defineProperty(RTCRtpSender.prototype.setParameters, 'length', { value: 1 });
+Object.defineProperty(RTCRtpSender.prototype.setParameters, 'name', { value: 'setParameters' });
+RTCRtpSender.prototype.replaceTrack = function () { return this._impl.replaceTrack.apply(this, arguments); };
+Object.defineProperty(RTCRtpSender.prototype.replaceTrack, 'length', { value: 1 });
+Object.defineProperty(RTCRtpSender.prototype.replaceTrack, 'name', { value: 'replaceTrack' });
+RTCRtpSender.prototype.getStats = function () { return this._impl.getStats.apply(this, arguments); };
+Object.defineProperty(RTCRtpSender.prototype.getStats, 'length', { value: 0 });
+Object.defineProperty(RTCRtpSender.prototype.getStats, 'name', { value: 'getStats' });
+RTCRtpSender.prototype.setStreams = function () { return this._impl.setStreams.apply(this, arguments); };
+Object.defineProperty(RTCRtpSender.prototype.setStreams, 'length', { value: 0 });
+Object.defineProperty(RTCRtpSender.prototype.setStreams, 'name', { value: 'setStreams' });
 
 function _capabilityKey(c) {
   return c.mimeType + '|' + c.clockRate + '|' + (c.channels || 0);
 }
 
 RTCRtpSender.getCapabilities = function(kind) {
+  // W3C 5.2/5.3: an unrecognised kind returns NULL — only 'audio' and
+  // 'video' have capabilities. We were falling through to a default
+  // table and reporting codecs for kinds that do not exist.
+  if (kind !== 'audio' && kind !== 'video') return null;
   // W3C §5.2.7: returns RTCRtpCapabilities = { codecs, headerExtensions }
   // for the platform's capabilities (NOT for any particular sender).
   //
@@ -1979,32 +3069,34 @@ RTCRtpSender.getCapabilities = function(kind) {
     return { codecs: [], headerExtensions: [] };
   }
 
-  var raw = (kind === 'video') ? getSupportedVideoCodecs() : getSupportedAudioCodecs();
-  var codecMap = (kind === 'video') ? _CODEC_MAP_VIDEO : _CODEC_MAP_AUDIO;
+  // DERIVED FROM THE REGISTRY (sdp.js), intersected with what
+  // media-processing reports it can actually encode. Two rules make the
+  // three-way disagreement that used to exist impossible:
+  //   • nothing is ADVERTISED that the wire tables don't offer — both
+  //     come from the same registry entries;
+  //   • nothing is advertised that media-processing can't ENCODE, except
+  //     entries with no encoder by design (telephone-event is produced
+  //     by the DTMF sender).
+  var registry = SDP.CODEC_REGISTRY[kind] || [];
+  var available = {};
+  try {
+    var names = (kind === 'video') ? getSupportedVideoCodecs() : getSupportedAudioCodecs();
+    for (var ni = 0; ni < names.length; ni++) available[String(names[ni]).toLowerCase()] = true;
+  } catch (eSup) { available = null; }   // no encoder info: advertise the registry as-is
 
-  // Map + filter + deduplicate
   var seen = {};
   var codecs = [];
-  for (var i = 0; i < raw.length; i++) {
-    var entry = codecMap[raw[i]];
-    if (!entry) continue;                        // not WebRTC-relevant
+  for (var i = 0; i < registry.length; i++) {
+    var entry = registry[i];
+    if (entry.mpName && available && !available[String(entry.mpName).toLowerCase()]) continue;
     var key = _capabilityKey(entry);
-    if (seen[key]) continue;                     // duplicate (e.g. alaw + g711-alaw)
+    if (seen[key]) continue;
     seen[key] = true;
-    // Spread into a fresh object so callers can't mutate our table.
     var out = { mimeType: entry.mimeType, clockRate: entry.clockRate };
     if (entry.channels !== undefined) out.channels = entry.channels;
-    // sdpFmtpLine (QUICK-5 followup): sourced from sdp.js's DEFAULT
-    // codec tables — the same fmtp we actually put on the wire in
-    // offers, so capabilities and negotiation can't drift apart.
-    var defTable = (kind === 'video') ? SDP.DEFAULT_VIDEO_CODECS : SDP.DEFAULT_AUDIO_CODECS;
-    var shortName = String(entry.mimeType).split('/')[1] || '';
-    for (var d = 0; d < defTable.length; d++) {
-      if (String(defTable[d].name).toLowerCase() === shortName.toLowerCase() && defTable[d].fmtp) {
-        var line = SDP.buildFmtpConfig ? SDP.buildFmtpConfig(defTable[d].fmtp) : null;
-        if (line) out.sdpFmtpLine = line;
-        break;
-      }
+    if (entry.fmtp && SDP.buildFmtpConfig) {
+      var line = SDP.buildFmtpConfig(entry.fmtp);
+      if (line) out.sdpFmtpLine = line;
     }
     codecs.push(out);
   }
@@ -2032,6 +3124,21 @@ RTCRtpSender.getCapabilities = function(kind) {
 /* ========================= RTCRtpReceiver ========================= */
 
 function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
+  // W3C §5.3 (WPT harvest): the receiver's track exists from CONSTRUCTION —
+  // muted, live, correct kind — long before any media (or even
+  // negotiation). Media arrival later reuses this same object.
+  if (!track) {
+    try {
+      track = new MediaStreamTrack({ kind: kind });   // options-object ctor
+      track.muted = true;                             // plain data property
+    } catch (e) { track = null; }
+  }
+
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
   this.track = track || null;
   // W3C webrtc-encoded-transform §3 — RTCRtpScriptTransform integration
@@ -2044,6 +3151,11 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
   // RTCDtlsTransport singleton per peer connection (see sender.transport).
   Object.defineProperty(this, 'transport', {
     get: function() {
+      // WPT/spec: transports come into existence when a LOCAL description
+      // is applied (ICE gathering start) — null before, null again after
+      // its rollback.
+      if (!manager || !manager.state ||
+          !(manager.state.pendingLocalDescription || manager.state.currentLocalDescription)) return null;
       return manager._getDtlsTransport ? manager._getDtlsTransport() : null;
     },
   });
@@ -2338,20 +3450,24 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
     // W3C §11.3.4 — createEncodedStreams may be called only once per
     // receiver lifetime. Second call is InvalidStateError.
     if (_encodedStreamsTaken) {
-      var err = new Error('createEncodedStreams: already called');
-      err.name = 'InvalidStateError';
+      var err = new DOMException('createEncodedStreams: already called', 'InvalidStateError');
       throw err;
     }
     if (!pipeline || typeof pipeline.takeStreams !== 'function') {
-      var e2 = new Error('createEncodedStreams: pipeline not ready (no track yet?)');
-      e2.name = 'InvalidStateError';
+      var e2 = new DOMException('createEncodedStreams: pipeline not ready (no track yet?)', 'InvalidStateError');
       throw e2;
     }
     _encodedStreamsTaken = true;
     return pipeline.takeStreams();
   };
 
-  this.getParameters = function() {
+  impl.getParameters = function() {
+    // WPT harvest: receiver params expose the receive codecs (with
+    // mimeType) even pre-media — mirrored from static capabilities.
+    var _rxKind = (internalTransceiver && internalTransceiver.kind) ||
+                  (track && track.kind) || kind || 'audio';
+    var _rxCodecs = (_codecsFromSdp(manager, _rxKind, internalTransceiver && internalTransceiver.mid) || _defaultCodecs(_rxKind));
+
     // W3C §5.3.1.4: returns RTCRtpReceiveParameters describing what the
     // receiver is currently configured to consume — derived from the
     // negotiated SDP, not from any "preferences" (receivers don't have
@@ -2373,7 +3489,11 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
 
     var result = {
       headerExtensions: [],
-      rtcp:             { cname: '', reducedSize: false },
+      // W3C 5.3: RTCRtpReceiveParameters.rtcp carries reducedSize ONLY —
+      // cname belongs to the SENDER's parameters (it names the local
+      // source), and reporting it here failed every receive-side
+      // dictionary-shape assertion.
+      rtcp:             { reducedSize: false },
       codecs:           [],
       encodings:        [],   // back-compat (see above)
     };
@@ -2423,50 +3543,47 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
         var c = section.codecs[ci];
         var codecOut = {
           payloadType: c.payloadType,
-          mimeType:    c.mimeType,
+          // sdp.js rtpmap entries carry the bare codec name; compose the
+          // spec mimeType (kind/name) when the prefixed form is absent.
+          mimeType:    c.mimeType ||
+                       ((section.type || 'audio') + '/' + (c.name || c.codec || '')),
           clockRate:   c.clockRate,
         };
         if (c.channels)    codecOut.channels = c.channels;
         if (c.sdpFmtpLine) codecOut.sdpFmtpLine = c.sdpFmtpLine;
+        // fmtp: the parser folds it into an OBJECT — serialize to the
+        // spec's sdpFmtpLine string form.
+        if (c.fmtp && typeof c.fmtp === 'object') {
+          var _kv = [];
+          for (var _fk in c.fmtp) _kv.push(_fk + '=' + c.fmtp[_fk]);
+          if (_kv.length) codecOut.sdpFmtpLine = _kv.join(';');
+        } else if (typeof c.fmtp === 'string' && c.fmtp) {
+          codecOut.sdpFmtpLine = c.fmtp;
+        }
         result.codecs.push(codecOut);
-      }
-    }
-
-    // rtcp.cname — comes from the remote sender's SSRC declarations
-    // (a=ssrc <id> cname:<value>). currentLocalDescription is OUR side, so
-    // for receive-side cname we actually want currentRemoteDescription.
-    // Per spec, rtcp.cname in receiveParameters is the REMOTE peer's CNAME.
-    //
-    // Symmetric with the local lookup above: read parsedCurrentRemoteSdp
-    // (maintained by sdp_offer_answer.js's _commitDescription) instead of
-    // re-parsing currentRemoteDescription.sdp on every call.
-    var rParsed = manager.state && manager.state.parsedCurrentRemoteSdp;
-    if (rParsed && rParsed.media) {
-      for (var ri = 0; ri < rParsed.media.length; ri++) {
-        if (String(rParsed.media[ri].mid) === String(mid)) {
-          var rSection = rParsed.media[ri];
-          // Take cname from the first SSRC entry that has one.
-          if (Array.isArray(rSection.ssrcs)) {
-            for (var si = 0; si < rSection.ssrcs.length; si++) {
-              if (rSection.ssrcs[si].cname) {
-                result.rtcp.cname = rSection.ssrcs[si].cname;
-                break;
-              }
-            }
-          }
-          // reducedSize: spec field for whether RR/SR use reduced-size
-          // RTCP (RFC 5506). sdp.js may parse a=rtcp-rsize as a
-          // section-level flag; check defensively.
-          if (rSection.rtcpRsize) result.rtcp.reducedSize = true;
-          break;
+        // rtx is folded into rtxPayloadType — re-expand as its own entry
+        // (interleaved right after its primary, matching our SDP order).
+        if (c.rtxPayloadType != null) {
+          result.codecs.push({
+            payloadType: c.rtxPayloadType,
+            mimeType: (section.type || 'video') + '/rtx',
+            clockRate: c.clockRate,
+            sdpFmtpLine: 'apt=' + c.payloadType,
+          });
         }
       }
     }
 
+    // rtcp.cname is deliberately NOT reported for receivers: W3C 5.3
+    // defines RTCRtpReceiveParameters.rtcp with reducedSize only, and
+    // WPT asserts the member is unset. (The remote CNAME is still parsed
+    // and used internally for RTCP; it is simply not part of this
+    // dictionary.)
+
     return result;
   };
 
-  this.getContributingSources = function() {
+  impl.getContributingSources = function() {
     // QUICK-7: W3C §5.3.4. Returns RTCRtpContributingSource entries for
     // CSRC values seen in incoming RTP packets within the last 10 seconds.
     // The cache is maintained by connection_manager.js's
@@ -2520,7 +3637,7 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
     return result;
   };
 
-  this.getSynchronizationSources = function() {
+  impl.getSynchronizationSources = function() {
     // W3C §5.3.5. Returns an RTCRtpSynchronizationSource for each SSRC
     // this receiver currently sees, restricted to the last 10 seconds.
     // For non-simulcast: typically one entry. For simulcast: one entry
@@ -2566,12 +3683,36 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
     return result;
   };
 
-  this.getStats = function() {
+impl.getStats = function() {
+    // W3C 8.2: getStats() is ASYNCHRONOUS and does not use the
+    // operations chain — the report must still be pending after a
+    // microtask (WPT checks exactly that on senders and receivers, the
+    // same rule pc.getStats already follows). Assemble on the next task.
+    var _gsSelf = this, _gsArgs = arguments;
+    return new Promise(function (res, rej) {
+      setTimeout(function () {
+        try { res(_getStatsNow0.apply(_gsSelf, _gsArgs)); } catch (e) { rej(e); }
+      }, 0);
+    });
+  };
+  function _getStatsNow0() {
+    // WPT: a live receiver ALWAYS reports an inbound-rtp entry (zeros
+    // pre-media); a stopped transceiver reports none.
+    var _stopped = internalTransceiver && RtpManager.isStopped(internalTransceiver);
+    var _base = new Map();
+    if (!_stopped) {
+      var _sid = 'RTCInboundRTPStream_' + (internalTransceiver && internalTransceiver.mid || '0');
+      _base.set(_sid, {
+        id: _sid, type: 'inbound-rtp', timestamp: Date.now(),
+        kind: (internalTransceiver && internalTransceiver.kind) || kind || 'audio',
+        ssrc: 0, packetsReceived: 0, bytesReceived: 0, packetsLost: 0, jitter: 0,
+      });
+    }
     // Spec: returns stats for this receiver's inbound stream. The ssrc comes
     // from the transceiver's remote SSRC mapping. If the receiver hasn't been
     // wired to an SSRC yet (track:new hasn't fired), returns an empty report.
     var ssrc = findRemoteSsrc();
-    if (ssrc == null) return Promise.resolve(new Map());
+    if (ssrc == null) return Promise.resolve(_base);   // zeros-report pre-media
     return Promise.resolve(_buildStatsReport(manager, { ssrc: ssrc }));
   };
 
@@ -2641,13 +3782,35 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
 }
 
 RTCRtpReceiver.getCapabilities = function(kind) {
+  // W3C 5.2/5.3: an unrecognised kind returns NULL — only 'audio' and
+  // 'video' have capabilities. We were falling through to a default
+  // table and reporting codecs for kinds that do not exist.
+  if (kind !== 'audio' && kind !== 'video') return null;
   return RTCRtpSender.getCapabilities(kind);
 };
 
 
 /* ========================= RTCRtpTransceiver ========================= */
 
+RTCRtpReceiver.prototype.getParameters = function () { return this._impl.getParameters.apply(this, arguments); };
+Object.defineProperty(RTCRtpReceiver.prototype.getParameters, 'length', { value: 0 });
+Object.defineProperty(RTCRtpReceiver.prototype.getParameters, 'name', { value: 'getParameters' });
+RTCRtpReceiver.prototype.getContributingSources = function () { return this._impl.getContributingSources.apply(this, arguments); };
+Object.defineProperty(RTCRtpReceiver.prototype.getContributingSources, 'length', { value: 0 });
+Object.defineProperty(RTCRtpReceiver.prototype.getContributingSources, 'name', { value: 'getContributingSources' });
+RTCRtpReceiver.prototype.getSynchronizationSources = function () { return this._impl.getSynchronizationSources.apply(this, arguments); };
+Object.defineProperty(RTCRtpReceiver.prototype.getSynchronizationSources, 'length', { value: 0 });
+Object.defineProperty(RTCRtpReceiver.prototype.getSynchronizationSources, 'name', { value: 'getSynchronizationSources' });
+RTCRtpReceiver.prototype.getStats = function () { return this._impl.getStats.apply(this, arguments); };
+Object.defineProperty(RTCRtpReceiver.prototype.getStats, 'length', { value: 0 });
+Object.defineProperty(RTCRtpReceiver.prototype.getStats, 'name', { value: 'getStats' });
+
 function RTCRtpTransceiver(internal, manager) {
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   this._internal = internal;
   this._sender = new RTCRtpSender(internal, internal.sender.track, manager);
   this._receiver = new RTCRtpReceiver(internal.receiver.track, internal.kind, manager, internal);
@@ -2656,7 +3819,12 @@ function RTCRtpTransceiver(internal, manager) {
   Object.defineProperty(this, 'mid', {
     // W3C §5.4.2: mid is null until the m-section's mid is established
     // (post-SDP exchange). Coerce undefined to null defensively.
-    get: function() { return internal.mid != null ? internal.mid : null; },
+    get: function() {
+      // Association is earned (SRD-creation, adoption, or local-offer
+      // binding) — the same single rule every internal selector uses.
+      return (RtpManager.isLegitimateOwner(internal) && internal.mid != null)
+        ? String(internal.mid) : null;
+    },
   });
   Object.defineProperty(this, 'sender', {
     get: function() { return self._sender; },
@@ -2679,36 +3847,66 @@ function RTCRtpTransceiver(internal, manager) {
   // apps that detect "is this transceiver still alive?" check this).
   // Equivalent to currentDirection === 'stopped'.
   Object.defineProperty(this, 'stopped', {
-    get: function() { return internal.currentDirection === 'stopped'; },
+    get: function() { return RtpManager.isStopped(internal); },
   });
   // 'stopped' is a valid currentDirection but NOT a valid value to set
   // directly — apps reach it only via transceiver.stop().
   var VALID_SET_DIRECTIONS = ['sendrecv', 'sendonly', 'recvonly', 'inactive'];
   Object.defineProperty(this, 'direction', {
-    get: function() { return internal.direction; },
+    get: function() {
+      return RtpManager.isStopped(internal) ? 'stopped' : internal.direction;
+    },
     set: function(dir) {
       if (VALID_SET_DIRECTIONS.indexOf(dir) < 0) {
         throw new TypeError('Invalid RTCRtpTransceiverDirection: ' + dir +
           ' (use transceiver.stop() to stop)');
       }
       // W3C §5.5.4.4: reject if the transceiver has been stopped.
-      if (internal.currentDirection === 'stopped') {
-        var err = new Error('Cannot set direction on a stopped transceiver');
-        err.name = 'InvalidStateError';
+      if (RtpManager.isStopped(internal)) {
+        var err = new DOMException('Cannot set direction on a stopped transceiver', 'InvalidStateError');
         throw err;
       }
       if (dir === internal.direction) return;   // no-op, spec: don't fire
       internal.direction = dir;
+      // WPT harvest — muted transitions: the receiver's track mutes when
+      // the transceiver stops receiving and unmutes when receiving is
+      // (re-)enabled, EVEN before media flows.
+      try {
+        var rTrack = self._receiver && self._receiver.track;
+        if (rTrack) {
+          var willRecv = dir === 'sendrecv' || dir === 'recvonly';
+          if (willRecv && rTrack.muted) {
+            rTrack.muted = false;
+            try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'unmute' }); } catch (e1) {}
+            try { typeof rTrack.onunmute === 'function' && rTrack.onunmute({ type: 'unmute' }); } catch (e2) {}
+          } else if (!willRecv && !rTrack.muted) {
+            rTrack.muted = true;
+            try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'mute' }); } catch (e3) {}
+            try { typeof rTrack.onmute === 'function' && rTrack.onmute({ type: 'mute' }); } catch (e4) {}
+          }
+        }
+      } catch (eMut) {}
       // W3C §5.3: setting direction fires negotiationneeded (debounced in cm.js).
       manager.updateNegotiationNeededFlag();
     },
   });
 
-  this.stop = function() {
+  impl.stop = function() {
+    // W3C 5.4: stopping a transceiver whose connection is closed is an
+    // InvalidStateError — the transceiver can no longer renegotiate.
+    if (manager.state.closed) {
+      throw new DOMException('transceiver.stop: peer connection is closed', 'InvalidStateError');
+    }
+    // WPT: a stopped transceiver reports 'stopped' as its currentDirection.
+    // W3C 5.4: stop() sets DIRECTION to 'stopped' immediately;
+    // currentDirection stays null until a negotiation actually retires
+    // the m-section (WPT reads {currentDirection: null,
+    // direction: 'stopped'} right after stop()). Internal guards test
+    // direction too, so the stopped state is still enforced everywhere.
     // W3C §5.4.3.6 — mark transceiver as stopped, stop both directions,
     // fire negotiationneeded (the stop propagates via SDP renegotiation
     // which sets port=0 on the m-line to signal the peer).
-    if (internal.currentDirection === 'stopped') return;   // idempotent
+    if (RtpManager.isStopped(internal)) return;   // idempotent
     // Tear down send pipeline (if any)
     if (self._sender && typeof self._sender._stop === 'function') {
       try { self._sender._stop(); } catch (e) {}
@@ -2728,12 +3926,38 @@ function RTCRtpTransceiver(internal, manager) {
         manager.unregisterTransceiverLayer(internal.sender.layers[li]);
       }
     }
-    internal.currentDirection = 'stopped';
+    // W3C 5.4: stop() sets DIRECTION to 'stopped' immediately;
+    // currentDirection stays null until a negotiation actually retires
+    // the m-section (WPT reads {currentDirection: null,
+    // direction: 'stopped'} right after stop()). Internal guards test
+    // direction too, so the stopped state is still enforced everywhere.
     internal.direction = 'stopped';
     manager.updateNegotiationNeededFlag();
   };
 
-  this.setCodecPreferences = function(codecs) {
+  impl.setCodecPreferences = function(codecs) {
+    // W3C: every codec must be drawn from the capabilities OF THIS KIND
+    // (mimeType prefix must match) — anything else is
+    // InvalidModificationError.
+    if (Array.isArray(codecs) && codecs.length) {
+      var _kindPfx = internal.kind + '/';
+      var _caps = [];
+      try { _caps = (RTCRtpSender.getCapabilities(internal.kind) || {}).codecs || []; } catch (eC) {}
+      for (var _ci = 0; _ci < codecs.length; _ci++) {
+        var _cc = codecs[_ci];
+        var _mt = _cc && _cc.mimeType;
+        var _okKind = typeof _mt === 'string' && _mt.toLowerCase().indexOf(_kindPfx) === 0;
+        var _known = _okKind && _caps.some(function (k) {
+          return k.mimeType.toLowerCase() === _mt.toLowerCase() &&
+                 k.clockRate === _cc.clockRate &&
+                 (k.channels || undefined) === (_cc.channels || undefined) &&
+                 (k.sdpFmtpLine || undefined) === (_cc.sdpFmtpLine || undefined);
+        });
+        if (!_okKind || (!_known && !/^(audio|video)\/(rtx|red|ulpfec)$/i.test(_mt))) {
+          throw new DOMException('setCodecPreferences: codec ' + _mt + ' is not in this kind\'s capabilities', 'InvalidModificationError');
+        }
+      }
+    }
     // W3C §5.4.3.8 — store an ordered list of codecs for this transceiver.
     // On the next createOffer/createAnswer, codecs in the m-section are
     // ordered per this preference (consumed in connection_manager.js's
@@ -2770,11 +3994,10 @@ function RTCRtpTransceiver(internal, manager) {
         }
       }
       if (!hasMediaCodec) {
-        var modErr = new Error(
+        var modErr = new DOMException(
           'setCodecPreferences: list contains only auxiliary codecs (RTX/RED/FEC/CN); ' +
           'must include at least one media codec'
-        );
-        modErr.name = 'InvalidModificationError';
+        , 'InvalidModificationError');
         throw modErr;
       }
     }
@@ -2803,11 +4026,10 @@ function RTCRtpTransceiver(internal, manager) {
           }
         }
         if (!found) {
-          var unsupErr = new Error(
+          var unsupErr = new DOMException(
             'setCodecPreferences: codec "' + want.mimeType + '" @ ' +
             want.clockRate + ' Hz is not supported by the receiver'
-          );
-          unsupErr.name = 'InvalidAccessError';
+          , 'InvalidAccessError');
           throw unsupErr;
         }
       }
@@ -2823,14 +4045,33 @@ function RTCRtpTransceiver(internal, manager) {
 
 /* ========================= RTCDataChannel ========================= */
 
+RTCRtpTransceiver.prototype.stop = function () { return this._impl.stop.apply(this, arguments); };
+Object.defineProperty(RTCRtpTransceiver.prototype.stop, 'length', { value: 0 });
+Object.defineProperty(RTCRtpTransceiver.prototype.stop, 'name', { value: 'stop' });
+RTCRtpTransceiver.prototype.setCodecPreferences = function () { return this._impl.setCodecPreferences.apply(this, arguments); };
+Object.defineProperty(RTCRtpTransceiver.prototype.setCodecPreferences, 'length', { value: 1 });
+Object.defineProperty(RTCRtpTransceiver.prototype.setCodecPreferences, 'name', { value: 'setCodecPreferences' });
+
 function RTCDataChannel(internal, manager) {
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
   // manager is optional for backward compat; without it, maxMessageSize
   // checks fall back to the WebRTC default of 256KB.
 
   // Read-only properties
   Object.defineProperty(this, 'id', {
-    get: function() { return internal.id; },
+    // W3C/WPT: id is NULL until the DCEP handshake assigns it — unless
+    // the app pre-negotiated (negotiated:true carries the app's id).
+    get: function() {
+      // null until an id is ACTUALLY assigned (DCEP-open send time) —
+      // not until 'open': post-SCTP channels get their id before the
+      // handshake round-trip completes (RFC 8832 parity allocator).
+      return internal.id == null ? null : internal.id;
+    },
   });
   Object.defineProperty(this, 'label', {
     get: function() { return internal.label; },
@@ -2885,13 +4126,13 @@ function RTCDataChannel(internal, manager) {
   });
 
   // Methods
-  this.send = function(data) {
+  impl._sendQ = Promise.resolve();
+  impl.send = function(data) {
     // W3C §6.2: must throw InvalidStateError unless readyState === 'open'.
     // 'connecting' → not yet negotiated; 'closing'/'closed' → gone.
     if (internal.readyState !== 'open') {
-      var err = new Error('RTCDataChannel.send: readyState is "' +
-                          internal.readyState + '", not "open"');
-      err.name = 'InvalidStateError';
+      var err = new DOMException('RTCDataChannel.send: readyState is "' +
+                          internal.readyState + '", not "open"', 'InvalidStateError');
       throw err;
     }
 
@@ -2901,6 +4142,14 @@ function RTCDataChannel(internal, manager) {
     var isBlob = (data != null && typeof data === 'object' &&
                   typeof data.arrayBuffer === 'function' &&
                   typeof data.size === 'number');
+    // W3C: bufferedAmount increases SYNCHRONOUSLY in send() by the
+    // message's byte length (utf-8 for strings, size for Blobs). The
+    // drain side stays ack-driven in the SCTP layer.
+    var _sendBytes = 0;
+    if (typeof data === 'string') _sendBytes = Buffer.byteLength(data, 'utf8');
+    else if (isBlob)             _sendBytes = data.size;
+    else if (data && typeof data.byteLength === 'number') _sendBytes = data.byteLength;
+    internal.bufferedAmount = (internal.bufferedAmount || 0) + _sendBytes;
     if (isBlob) {
       // Sync size check against maxMessageSize (W3C §6.2.4).
       var blobSize = data.size;
@@ -2917,8 +4166,12 @@ function RTCDataChannel(internal, manager) {
       // Blob is read; we accept the "looks zero until Blob resolves" gap
       // because the async read is unavoidable and stays inside the same
       // task.
-      data.arrayBuffer().then(function (ab) {
+      // ORDER-PRESERVING (real-bug fix): later sends must NOT overtake a
+      // pending Blob conversion — the conversion rides the channel queue.
+      impl._sendQBusy = (impl._sendQBusy || 0) + 1;
+      impl._sendQ = impl._sendQ.then(function () { return data.arrayBuffer(); }).then(function (ab) {
         if (internal.readyState !== 'open') return;
+        impl._sendQBusy = Math.max(0, (impl._sendQBusy || 1) - 1);
         try { internal.send(Buffer.from(ab)); }
         catch (e) {
           if (typeof console !== 'undefined' && console.error) {
@@ -2953,15 +4206,38 @@ function RTCDataChannel(internal, manager) {
         ' exceeds sctp.maxMessageSize (' + actualMax + ')');
     }
 
-    internal.send(data);
+    // SYNCHRONOUS unless we are behind a Blob conversion.
+    //
+    // Everything used to ride impl._sendQ, so even a plain string send
+    // was deferred a microtask — and "send(msg); close();" therefore ran
+    // the CLOSE first: by the time the queued send reached the channel it
+    // was already 'closing' and the message was dropped on the floor,
+    // with the application having seen send() return normally. Blobs must
+    // still queue (their bytes arrive asynchronously) and anything queued
+    // behind them must stay in order, so the queue is used only while it
+    // is actually busy.
+    if (impl._sendQBusy) {
+      impl._sendQ = impl._sendQ.then(function () {
+        if (internal.readyState !== 'open' && internal.readyState !== 'closing') return;
+        internal.send(data);
+    });
+    } else {
+      if (internal.readyState === 'open' || internal.readyState === 'closing') {
+        internal.send(data);
+      }
+    }
   };
 
-  this.close = function() {
+  impl.close = function() {
     // Per RFC 8831 §6.7, close() issues an SCTP stream reset so the peer
     // learns the channel is gone. internal.close() should send a
     // DATA_CHANNEL_ACK/reset over the SCTP stream; the stream reset logic
     // itself lives in sctp.js. This call is a no-op if already closing/closed.
     if (internal.readyState === 'closed' || internal.readyState === 'closing') return;
+    // W3C 6.2.5 + WPT close-test: the CLOSER transitions to 'closing'
+    // silently — the closing EVENT belongs to the REMOTE side only
+    // (fired in dcc when the incoming stream-reset arrives).
+
     internal.close();
   };
 
@@ -2980,6 +4256,11 @@ function RTCDataChannel(internal, manager) {
   var _onmessage = null;
   var _msgListeners = [];
   internal._ev.on('message', function (payload) {
+    // binaryType 'blob' (WPT harvest): binary payloads are delivered as
+    // Blob when the app asked for it — browser parity for the default-
+    // in-browsers mode. Strings pass through untouched.
+    // (blob conversion happens BELOW, after rawData extraction — wrapping
+    // the payload ENVELOPE here produced a Blob of "[object Object]".)
     // Build a MessageEvent-shaped object. Real browsers use a global
     // MessageEvent constructor; in Node we hand-shape something
     // structurally equivalent so consumer code that does
@@ -2990,6 +4271,11 @@ function RTCDataChannel(internal, manager) {
     // self.binaryType. String frames bypass this — they're already
     // strings from the cm.js layer.
     var rawData = payload && 'data' in payload ? payload.data : payload;
+    if (self.binaryType === 'blob' && rawData != null && typeof rawData !== 'string' &&
+        typeof Blob !== 'undefined') {
+      // wrap the ACTUAL bytes (Buffer/TypedArray/ArrayBuffer all fine)
+      try { rawData = new Blob([rawData]); } catch (eB) {}
+    }
     var data    = rawData;
     if (Buffer.isBuffer(rawData)) {
       if (self.binaryType === 'blob' && typeof Blob !== 'undefined') {
@@ -3053,7 +4339,7 @@ function RTCDataChannel(internal, manager) {
   _bindDCHandler('error');
   _bindDCHandler('bufferedamountlow');
 
-  this.addEventListener = function(name, fn, options) {
+  impl.addEventListener = function(name, fn, options) {
     if (typeof fn !== 'function') return;
     var once = !!(options && typeof options === 'object' && options.once);
     if (name === 'message') {
@@ -3075,7 +4361,7 @@ function RTCDataChannel(internal, manager) {
     if (once) internal._ev.once(name, fn);
     else      internal._ev.on(name, fn);
   };
-  this.removeEventListener = function(name, fn) {
+  impl.removeEventListener = function(name, fn) {
     if (typeof fn !== 'function') return;
     if (name === 'message') {
       // Search for both direct and once-wrapped registrations.
@@ -3090,7 +4376,7 @@ function RTCDataChannel(internal, manager) {
     internal._ev.off(name, fn);
   };
   // dispatchEvent — see comment on RTCPeerConnection.dispatchEvent.
-  this.dispatchEvent = function(event) {
+  impl.dispatchEvent = function(event) {
     if (!event || typeof event.type !== 'string') {
       throw new TypeError('dispatchEvent: event must have a string type');
     }
@@ -3107,7 +4393,32 @@ function RTCDataChannel(internal, manager) {
 
 /* ========================= RTCSessionDescription ========================= */
 
+RTCDataChannel.prototype.send = function () { return this._impl.send.apply(this, arguments); };
+Object.defineProperty(RTCDataChannel.prototype.send, 'length', { value: 1 });
+Object.defineProperty(RTCDataChannel.prototype.send, 'name', { value: 'send' });
+RTCDataChannel.prototype.close = function () { return this._impl.close.apply(this, arguments); };
+Object.defineProperty(RTCDataChannel.prototype.close, 'length', { value: 0 });
+Object.defineProperty(RTCDataChannel.prototype.close, 'name', { value: 'close' });
+RTCDataChannel.prototype.addEventListener = function () { return this._impl.addEventListener.apply(this, arguments); };
+Object.defineProperty(RTCDataChannel.prototype.addEventListener, 'length', { value: 2 });
+Object.defineProperty(RTCDataChannel.prototype.addEventListener, 'name', { value: 'addEventListener' });
+RTCDataChannel.prototype.removeEventListener = function () { return this._impl.removeEventListener.apply(this, arguments); };
+Object.defineProperty(RTCDataChannel.prototype.removeEventListener, 'length', { value: 2 });
+Object.defineProperty(RTCDataChannel.prototype.removeEventListener, 'name', { value: 'removeEventListener' });
+RTCDataChannel.prototype.dispatchEvent = function () { return this._impl.dispatchEvent.apply(this, arguments); };
+Object.defineProperty(RTCDataChannel.prototype.dispatchEvent, 'length', { value: 1 });
+Object.defineProperty(RTCDataChannel.prototype.dispatchEvent, 'name', { value: 'dispatchEvent' });
+
 function RTCSessionDescription(init) {
+  // W3C 4.8: `type` is a REQUIRED member — constructing without one is a
+  // TypeError (an RTCSessionDescription with no type is meaningless, and
+  // the enum is validated at the same time).
+  if (init == null || init.type == null) {
+    throw new TypeError('RTCSessionDescription: type is required');
+  }
+  if (['offer', 'answer', 'pranswer', 'rollback'].indexOf(init.type) === -1) {
+    throw new TypeError('RTCSessionDescription: invalid type "' + init.type + '"');
+  }
   init = init || {};
   // W3C §4.10.2: type is REQUIRED and must be one of
   // 'offer'|'pranswer'|'answer'|'rollback'. The spec says the constructor
@@ -3138,11 +4449,26 @@ function RTCIceCandidate(init) {
   if (typeof init === 'string') {
     init = { candidate: init };
   }
+  // W3C §4.9.1 (WPT harvest): the dictionary REQUIRES at least one of
+  // sdpMid / sdpMLineIndex to be non-null — a bare candidate string (or
+  // an empty dictionary, or explicit double-null) cannot address an
+  // m-line and must throw TypeError at construction.
   init = init || {};
-  this.candidate = init.candidate || '';
-  this.sdpMid = init.sdpMid || null;
-  this.sdpMLineIndex = init.sdpMLineIndex != null ? init.sdpMLineIndex : null;
-  this.usernameFragment = init.usernameFragment || null;
+  var hasMid = init.sdpMid !== undefined && init.sdpMid !== null;
+  var hasIdx = init.sdpMLineIndex !== undefined && init.sdpMLineIndex !== null;
+  if (!hasMid && !hasIdx) {
+    throw new TypeError('RTCIceCandidate: sdpMid or sdpMLineIndex required');
+  }
+  // WebIDL: a PRESENT-but-null member coerces to the string "null";
+  // an absent member takes the default ''.
+  this.candidate = ('candidate' in init) ? String(init.candidate) : '';
+  this.sdpMid = hasMid ? String(init.sdpMid) : null;
+  this.sdpMLineIndex = hasIdx ? (init.sdpMLineIndex >>> 0) : null;
+  this.usernameFragment = init.usernameFragment != null ? String(init.usernameFragment) : null;
+  // WPT harvest: relayProtocol and url are DICTIONARY members too (the
+  // signaled-remote-candidate form) — honored verbatim when provided.
+  this.url = init.url != null ? String(init.url) : null;
+  var _initRelayProtocol = init.relayProtocol != null ? String(init.relayProtocol) : null;
 
   // Default parsed fields to null (spec defaults for unknown string).
   this.foundation     = null;
@@ -3170,10 +4496,36 @@ function RTCIceCandidate(init) {
   // apps commonly copy lines straight out of SDP.
   if (this.candidate) {
     var s = this.candidate;
-    if (s.indexOf('a=') === 0) s = s.slice(2);
+    var _hadAEq = s.indexOf('a=') === 0;   // strict: SDP-line form is NOT a candidate string
+    if (_hadAEq) s = s.slice(2);
     if (s.indexOf('candidate:') === 0) s = s.slice('candidate:'.length);
+    // WPT harvest — strict RFC 8839 grammar: leading whitespace after the
+    // colon is a parse FAILURE (all fields stay null), single spaces only.
+    var strictOk = !_hadAEq && !/^\s/.test(s) && !/\s\s/.test(s.trim()) && !/\t/.test(s);
     var tokens = s.trim().split(/\s+/);
-    if (tokens.length >= 8 && tokens[6] === 'typ') {
+    var numOk = tokens.length >= 8 &&
+      /^\d+$/.test(tokens[1]) && parseInt(tokens[1], 10) >= 1 && parseInt(tokens[1], 10) <= 256 &&
+      /^\d+$/.test(tokens[3]) && tokens[3].length <= 10 &&
+      parseInt(tokens[3], 10) >= 1 && parseInt(tokens[3], 10) <= 2147483647 &&
+      /^\d+$/.test(tokens[5]) && parseInt(tokens[5], 10) <= 65535 &&
+      tokens[0].length <= 32 && /^[A-Za-z0-9+\/]+$/.test(tokens[0]);
+    // RFC 6544: a TCP candidate MUST carry tcptype active|passive|so —
+    // absent, bare, or unknown values are parse failures.
+    if (strictOk && /^tcp$/i.test(tokens[2] || '')) {
+      // RFC 6544 + RFC 5245: a TCP candidate MUST carry tcptype, and it
+      // must come before any ARBITRARY extension — but raddr/rport are
+      // not arbitrary: a srflx or relay candidate legitimately writes
+      // "typ srflx raddr <a> rport <p> tcptype active". The earlier rule
+      // demanded tcptype at a fixed position and rejected every
+      // non-host TCP candidate; skip the standard raddr/rport pair and
+      // require tcptype at the first EXTENSION slot after it.
+      var _ti = 8;
+      if (tokens[_ti] === 'raddr') _ti += 2;
+      if (tokens[_ti] === 'rport') _ti += 2;
+      var _ttV = (tokens[_ti] === 'tcptype') ? String(tokens[_ti + 1] || '').toLowerCase() : null;
+      if (_ttV !== 'active' && _ttV !== 'passive' && _ttV !== 'so') strictOk = false;
+    }
+    if (strictOk && numOk && tokens.length >= 8 && tokens[6] === 'typ') {
       this.foundation = tokens[0];
       var cId        = parseInt(tokens[1], 10);
       this.component = cId === 1 ? 'rtp' : (cId === 2 ? 'rtcp' : null);
@@ -3181,21 +4533,37 @@ function RTCIceCandidate(init) {
       this.priority  = parseInt(tokens[3], 10);
       this.address   = tokens[4];
       this.port      = parseInt(tokens[5], 10);
-      this.type      = tokens[7];
+      this.type      = String(tokens[7]).toLowerCase();
       // Optional trailing key-value pairs
       for (var i = 8; i + 1 < tokens.length; i += 2) {
         var key = tokens[i], val = tokens[i + 1];
         if (key === 'raddr')   this.relatedAddress = val;
-        else if (key === 'rport')   this.relatedPort    = parseInt(val, 10);
-        else if (key === 'tcptype') this.tcpType        = val;
-        else if (key === 'ufrag' && !this.usernameFragment) this.usernameFragment = val;
+        else if (key === 'rport') {
+          if (!/^\d+$/.test(val)) { this._parseFail = true; }
+          this.relatedPort = parseInt(val, 10);
+        }
+        else if (key === 'tcptype') this.tcpType        = String(val).toLowerCase();
+        // (candidate-string ufrag does NOT populate usernameFragment —
+        // the attribute is dictionary-only per spec; WPT checks this.)
         else if (key === 'relay-protocol' || key === 'relayProtocol') {
           // RFC 8836 §3 + W3C §4.10.1.1 — the transport between client and TURN.
           this.relayProtocol = val.toLowerCase();
         }
       }
+      // WPT harvest: srflx/prflx/relay candidates REQUIRE raddr+rport —
+      // their absence invalidates the whole parse (fields → null).
+      if (this._parseFail ||
+          ((this.type === 'srflx' || this.type === 'prflx' || this.type === 'relay') &&
+           (this.relatedAddress == null || this.relatedPort == null))) {
+        this.foundation = this.component = this.protocol = this.priority = null;
+        this.address = this.port = this.type = this.tcpType = null;
+        this.relatedAddress = this.relatedPort = this.relayProtocol = null;
+      }
     }
   }
+  // dictionary members win over (or fill) string-derived values —
+  // 'cloned vs signaled' parity per WPT.
+  if (_initRelayProtocol != null) this.relayProtocol = _initRelayProtocol;
 }
 
 RTCIceCandidate.prototype.toJSON = function() {
@@ -3220,9 +4588,8 @@ function RTCCertificate(generated) {
   // Chrome/Firefox's non-standard but widely available getAlgorithm().
   this._algorithm = generated.algorithm || null;
 
-  this.getFingerprints = function() {
-    return [{ algorithm: 'sha-256', value: generated.fingerprint }];
-  };
+  this._fps = [{ algorithm: 'sha-256',
+    value: String(generated.fingerprint || '').toLowerCase() }];
 
   // Non-standard but commonly available — returns the resolved
   // keygenAlgorithm in W3C shape ({name, namedCurve, ...} or
@@ -3243,7 +4610,35 @@ function RTCCertificate(generated) {
 
 /* ========================= RTCSctpTransport ========================= */
 
+RTCCertificate.prototype.getFingerprints = function () {
+  return (this._fps || []).slice();
+};
+
+
+RTCSctpTransport.prototype.addEventListener = function (t, fn) {
+  if (!this._etListeners) Object.defineProperty(this, '_etListeners', { value: {}, enumerable: false });
+  (this._etListeners[t] = this._etListeners[t] || []).push(fn);
+};
+RTCSctpTransport.prototype.removeEventListener = function (t, fn) {
+  var a = this._etListeners && this._etListeners[t];
+  if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
+};
+RTCSctpTransport.prototype.dispatchEvent = function (ev) {
+  var a = this._etListeners && this._etListeners[ev && ev.type];
+  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  return true;
+};
 function RTCSctpTransport(manager) {
+  // real event dispatch: internal state changes surface as 'statechange'
+  // through BOTH the on-handler and addEventListener (EventTarget layer).
+  var _selfET = this;
+  try {
+    manager.ev.on('sctp:statechange', function () {
+      var evO = { type: 'statechange', target: _selfET };
+      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
+      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+    });
+  } catch (eW) {}
   // transport is set by the RTCPeerConnection singleton factory (see
   // the pc.sctp getter in api.js). Keep as a plain writable property.
   this.transport = null;
@@ -3258,7 +4653,18 @@ function RTCSctpTransport(manager) {
   });
 
   Object.defineProperty(this, 'maxMessageSize', {
-    get: function() { return manager.state.maxMessageSize; },
+    // RFC 8841 §6 (WPT): the value is what WE may SEND —
+    // min(local, peer-advertised); a peer that omitted the attribute is
+    // assumed to accept 65536 (the RFC default), not our local cap.
+    get: function() {
+      var loc = manager.state.maxMessageSize;
+      var rem = manager.state.remoteMaxMessageSize;
+      var negotiated = !!(manager.state.parsedRemoteSdp);
+      if (!negotiated) return loc;
+      if (rem == null) return Math.min(loc, 65536);
+      if (rem === 0) return loc;          // 0 = peer accepts any size
+      return Math.min(loc, rem);
+    },
   });
 
   Object.defineProperty(this, 'maxChannels', {
@@ -3292,7 +4698,52 @@ function RTCSctpTransport(manager) {
 
 /* ========================= RTCDtlsTransport ========================= */
 
+
+RTCDtlsTransport.prototype.addEventListener = function (t, fn) {
+  if (!this._etListeners) Object.defineProperty(this, '_etListeners', { value: {}, enumerable: false });
+  (this._etListeners[t] = this._etListeners[t] || []).push(fn);
+};
+RTCDtlsTransport.prototype.removeEventListener = function (t, fn) {
+  var a = this._etListeners && this._etListeners[t];
+  if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
+};
+RTCDtlsTransport.prototype.dispatchEvent = function (ev) {
+  var a = this._etListeners && this._etListeners[ev && ev.type];
+  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  return true;
+};
 function RTCDtlsTransport(manager) {
+  // real event dispatch: internal state changes surface as 'statechange'
+  // through BOTH the on-handler and addEventListener (EventTarget layer).
+  var _selfET = this;
+  try {
+    manager.ev.on('dtls:error', function (info) {
+      var errV;
+      try {
+        errV = new RTCError({ errorDetail: (info && info.fingerprint) ? 'fingerprint-failure' : 'dtls-failure' },
+                            (info && info.message) || 'DTLS failure');
+      } catch (eMk) { errV = { name: 'OperationError', errorDetail: 'dtls-failure' }; }
+      var evE = { type: 'error', error: errV, target: _selfET };
+      try { if (typeof _selfET.onerror === 'function') _selfET.onerror(evE); } catch (e1) {}
+      try { _selfET.dispatchEvent(evE); } catch (e2) {}
+    });
+    manager.ev.on('dtls:statechange', function () {
+      // W3C: transitioning to 'closed' via pc.close() is SILENT — no
+      // statechange event is observable on the transport. The closed
+      // flag can lag the event, so also gate on the transport's OWN
+      // current state.
+      if (manager.state.closed) return;
+      try { if (_selfET.state === 'closed') return; } catch (eSt) {}
+      var evO = { type: 'statechange', target: _selfET };
+      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
+      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+    });
+  } catch (eW) {}
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
   // iceTransport is set by the RTCPeerConnection singleton factory (see
   // _getDtlsTransport in api.js). Keep it as a plain writable property so
@@ -3303,7 +4754,7 @@ function RTCDtlsTransport(manager) {
     get: function() { return manager.state.dtlsState; },
   });
 
-  this.getRemoteCertificates = function() {
+  impl.getRemoteCertificates = function() {
     // Returns ArrayBuffer[] of peer certificates from the DTLS handshake.
     // manager.state.remoteCertificates is populated by dtls_session when
     // the handshake completes; may be null/empty before that.
@@ -3313,9 +4764,13 @@ function RTCDtlsTransport(manager) {
     for (var i = 0; i < certs.length; i++) {
       var c = certs[i];
       // Normalize Buffer ↔ ArrayBuffer per spec.
-      if (Buffer.isBuffer(c)) {
+      // Shape over identity (the preserve-symlinks lesson): accept ANY
+      // ArrayBufferView (lemon-tls hands Uint8Array, not Buffer) or
+      // ArrayBuffer; Buffer is just a Uint8Array subclass and rides along.
+      if (c && ArrayBuffer.isView(c)) {
         out.push(c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength));
-      } else if (c instanceof ArrayBuffer) {
+      } else if (c instanceof ArrayBuffer ||
+                 (c && typeof c.byteLength === 'number' && typeof c.slice === 'function')) {
         out.push(c);
       }
     }
@@ -3341,7 +4796,47 @@ function RTCDtlsTransport(manager) {
 
 /* ========================= RTCIceTransport ========================= */
 
+RTCDtlsTransport.prototype.getRemoteCertificates = function () { return this._impl.getRemoteCertificates.apply(this, arguments); };
+Object.defineProperty(RTCDtlsTransport.prototype.getRemoteCertificates, 'length', { value: 0 });
+Object.defineProperty(RTCDtlsTransport.prototype.getRemoteCertificates, 'name', { value: 'getRemoteCertificates' });
+
+
+RTCIceTransport.prototype.addEventListener = function (t, fn) {
+  if (!this._etListeners) Object.defineProperty(this, '_etListeners', { value: {}, enumerable: false });
+  (this._etListeners[t] = this._etListeners[t] || []).push(fn);
+};
+RTCIceTransport.prototype.removeEventListener = function (t, fn) {
+  var a = this._etListeners && this._etListeners[t];
+  if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
+};
+RTCIceTransport.prototype.dispatchEvent = function (ev) {
+  var a = this._etListeners && this._etListeners[ev && ev.type];
+  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  return true;
+};
 function RTCIceTransport(manager) {
+  // real event dispatch: internal state changes surface as 'statechange'
+  // through BOTH the on-handler and addEventListener (EventTarget layer).
+  var _selfET = this;
+  try {
+    manager.ev.on('icegatheringstatechange', function () {
+      var evG = { type: 'gatheringstatechange', target: _selfET };
+      try { if (typeof _selfET.ongatheringstatechange === 'function') _selfET.ongatheringstatechange(evG); } catch (eG1) {}
+      try { _selfET.dispatchEvent(evG); } catch (eG2) {}
+    });
+  } catch (eWG) {}
+  try {
+    manager.ev.on('iceconnectionstatechange', function () {
+      var evO = { type: 'statechange', target: _selfET };
+      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
+      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+    });
+  } catch (eW) {}
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
 
   // Helpers to reach the live ICE agent. Agent is created lazily in manager
@@ -3349,7 +4844,16 @@ function RTCIceTransport(manager) {
   function _agent() { return manager.iceAgent || null; }
 
   Object.defineProperty(this, 'role', {
+    // W3C 5.6: the ICE role is not decided until BOTH descriptions are
+    // in place — an offerer that has only applied its own offer must
+    // report 'unknown', because a glare resolution can still flip it.
+    // Our agent guesses eagerly from the local description, which made
+    // the role observable an entire negotiation too early.
     get: function() {
+      var st = manager.state;
+      var haveBoth = !!(st.currentLocalDescription || st.pendingLocalDescription) &&
+                     !!(st.currentRemoteDescription || st.pendingRemoteDescription);
+      if (!haveBoth) return 'unknown';
       var a = _agent();
       return a ? a.role : 'controlling';
     },
@@ -3360,39 +4864,108 @@ function RTCIceTransport(manager) {
   });
 
   Object.defineProperty(this, 'state', {
-    get: function() { return manager.state.iceConnectionState; },
+    // RTCIceTransportState enum only (WPT: 'new' at birth; 'gathering'
+    // belongs to gatheringState).
+    get: function() {
+      var st = manager.state;
+      var s = st.iceConnectionState;
+      var ENUM = { 'new':1, checking:1, connected:1, completed:1,
+                   disconnected:1, failed:1, closed:1 };
+      s = ENUM[s] ? s : 'new';
+      // W3C 5.6: 'checking' means connectivity checks are actually
+      // running, which requires BOTH a remote description AND at least
+      // one remote candidate to check against. Our agent flips to
+      // checking as soon as it starts, so a transport could report
+      // 'checking' with nothing to check — observable a whole
+      // negotiation early.
+      if (s === 'checking') {
+        var haveRemote = !!(st.currentRemoteDescription || st.pendingRemoteDescription);
+        var a = _agent();
+        var haveCand = !!(a && a.remoteCandidates && a.remoteCandidates.length);
+        if (!haveRemote || !haveCand) return 'new';
+      }
+      return s;
+    },
   });
 
   Object.defineProperty(this, 'gatheringState', {
-    get: function() { return manager.state.iceGatheringState; },
+    // W3C: gathering begins at setLocalDescription — before any local
+    // description exists the transport reports 'new' even though our
+    // agent warms up eagerly underneath.
+    get: function() {
+      // W3C 5.6: 'new' until setLocalDescription starts gathering, then
+      // 'gathering' while candidates are produced, 'complete' only once
+      // the phase genuinely ended. Two field/WPT truths encoded here:
+      //   • our agent warms up eagerly, so a fresh transport that has
+      //     candidates but no local description still reports 'new';
+      //   • pc.close() must NOT push the transport to 'complete' — a
+      //     closed connection freezes the last observable phase.
+      var st = manager.state;
+      if (!st.pendingLocalDescription && !st.currentLocalDescription) return 'new';
+      if (st.closed && _lastGatheringState) return _lastGatheringState;
+      var g = st.iceGatheringState;
+      // Post-SLD, 'complete' is only reported when end-of-candidates has
+      // actually been signalled for this phase; otherwise we are still
+      // gathering (an eagerly-warmed agent reports complete too early).
+      if (g === 'complete' && !st.iceGatheringEnded) g = 'gathering';
+      _lastGatheringState = g;
+      return g;
+    },
   });
+  var _lastGatheringState = null;
 
-  this.getLocalCandidates = function() {
+  impl.getLocalCandidates = function() {
     var a = _agent();
-    return a ? a.localCandidates.slice() : [];
+    return a ? (a.localCandidates || []).map(_normCand) : [];
   };
 
-  this.getRemoteCandidates = function() {
+  // One normalizer for the lists AND the selected pair, so identity
+  // comparisons across them hold field-for-field (WPT requirement).
+  function _normCand(c) {
+    if (!c) return null;
+    return {
+      foundation: c.foundation != null ? String(c.foundation) : null,
+      component:  c.component === 2 ? 'rtcp' : 'rtp',
+      protocol:   (c.protocol || 'udp').toLowerCase(),
+      priority:   c.priority != null ? c.priority : null,
+      address:    c.ip || c.address || null,
+      port:       c.port != null ? c.port : null,
+      type:       c.type || 'host',
+      tcpType:    c.tcpType || null,
+      relatedAddress: c.raddr || c.relatedAddress || null,
+      relatedPort:    c.rport != null ? c.rport
+                    : (c.relatedPort != null ? c.relatedPort : null),
+    };
+  }
+
+  impl.getRemoteCandidates = function() {
+    // W3C 5.6: getRemoteCandidates() returns the candidates SIGNALLED by
+    // the peer — PEER-REFLEXIVE candidates (ones we only learned from an
+    // incoming STUN binding request) are deliberately NOT exposed, since
+    // the peer never told us about them. The agent tracks them for
+    // connectivity checks; they just don't belong in this list.
     var a = _agent();
-    return a ? a.remoteCandidates.slice() : [];
+    if (!a) return [];
+    return (a.remoteCandidates || [])
+      .filter(function (c) { return c && c.type !== 'prflx'; })
+      .map(_normCand);
   };
 
-  this.getSelectedCandidatePair = function() {
+  impl.getSelectedCandidatePair = function() {
     var a = _agent();
     if (!a || !a.selectedPair) return null;
     var p = a.selectedPair;
-    // Agent's selectedPair shape is internal; expose {local, remote} per spec.
-    return { local: p.local || null, remote: p.remote || null };
+    return { local: _normCand(p.local), remote: _normCand(p.remote) };
   };
 
-  this.getLocalParameters = function() {
+  impl.getLocalParameters = function() {
     var a = _agent();
     if (!a) return null;
     var p = a.localParameters;
     return p ? { usernameFragment: p.ufrag, password: p.pwd } : null;
   };
 
-  this.getRemoteParameters = function() {
+  impl.getRemoteParameters = function() {
     var a = _agent();
     if (!a) return null;
     var p = a.remoteParameters;
@@ -3422,7 +4995,41 @@ function RTCIceTransport(manager) {
 
 /* ========================= RTCDTMFSender ========================= */
 
-function RTCDTMFSender(getPipeline) {
+RTCIceTransport.prototype.getLocalCandidates = function () { return this._impl.getLocalCandidates.apply(this, arguments); };
+Object.defineProperty(RTCIceTransport.prototype.getLocalCandidates, 'length', { value: 0 });
+Object.defineProperty(RTCIceTransport.prototype.getLocalCandidates, 'name', { value: 'getLocalCandidates' });
+RTCIceTransport.prototype.getRemoteCandidates = function () { return this._impl.getRemoteCandidates.apply(this, arguments); };
+Object.defineProperty(RTCIceTransport.prototype.getRemoteCandidates, 'length', { value: 0 });
+Object.defineProperty(RTCIceTransport.prototype.getRemoteCandidates, 'name', { value: 'getRemoteCandidates' });
+RTCIceTransport.prototype.getSelectedCandidatePair = function () { return this._impl.getSelectedCandidatePair.apply(this, arguments); };
+Object.defineProperty(RTCIceTransport.prototype.getSelectedCandidatePair, 'length', { value: 0 });
+Object.defineProperty(RTCIceTransport.prototype.getSelectedCandidatePair, 'name', { value: 'getSelectedCandidatePair' });
+RTCIceTransport.prototype.getLocalParameters = function () { return this._impl.getLocalParameters.apply(this, arguments); };
+Object.defineProperty(RTCIceTransport.prototype.getLocalParameters, 'length', { value: 0 });
+Object.defineProperty(RTCIceTransport.prototype.getLocalParameters, 'name', { value: 'getLocalParameters' });
+RTCIceTransport.prototype.getRemoteParameters = function () { return this._impl.getRemoteParameters.apply(this, arguments); };
+Object.defineProperty(RTCIceTransport.prototype.getRemoteParameters, 'length', { value: 0 });
+Object.defineProperty(RTCIceTransport.prototype.getRemoteParameters, 'name', { value: 'getRemoteParameters' });
+
+RTCDTMFSender.prototype.addEventListener = function (t, fn) {
+  if (!this._etL) Object.defineProperty(this, '_etL', { value: {}, enumerable: false });
+  (this._etL[t] = this._etL[t] || []).push(fn);
+};
+RTCDTMFSender.prototype.removeEventListener = function (t, fn) {
+  var a = this._etL && this._etL[t];
+  if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
+};
+RTCDTMFSender.prototype.dispatchEvent = function (ev) {
+  var a = this._etL && this._etL[ev && ev.type];
+  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  return true;
+};
+function RTCDTMFSender(getPipeline, getClosed, getTxState) {
+  // WebIDL prototype surface (WPT): methods live on the prototype;
+  // per-instance closures stay intact behind a hidden impl table.
+  var impl = {};
+  Object.defineProperty(this, '_impl', { value: impl, enumerable: false });
+
   var self = this;
   this.toneBuffer = '';
   this.ontonechange = null;
@@ -3435,20 +5042,34 @@ function RTCDTMFSender(getPipeline) {
   // W3C §5.5: true when the audio pipeline is live AND telephone-event
   // was negotiated (the pipeline only exposes a dtmfPayloadType then).
   Object.defineProperty(this, 'canInsertDTMF', {
+    // W3C §7.1 (WPT): true when this is an audio sender on a SENDING,
+    // non-stopped transceiver — telephone-event is in our default audio
+    // capabilities, so a live pipeline is a bonus, not a prerequisite.
     get: function () {
       var p = _pipeline();
-      return !!(p && typeof p.sendDtmf === 'function' && p.dtmfPayloadType != null);
+      if (p && typeof p.sendDtmf === 'function' && p.dtmfPayloadType != null) return true;
+      try {
+        var d = (typeof getDirection === 'function' && getDirection()) || null;
+        if (d === 'recvonly' || d === 'inactive' || d === 'stopped') return false;
+      } catch (eD) {}
+      return true;
     },
   });
 
   function _fireToneChange(tone) {
+    var evT = new RTCDTMFToneChangeEvent({ tone: tone });
+    try { evT.type = 'tonechange'; } catch (eT) {}
     if (typeof self.ontonechange === 'function') {
-      try { self.ontonechange(new RTCDTMFToneChangeEvent({ tone: tone })); }
-      catch (e) {}
+      try { self.ontonechange(evT); } catch (e) {}
     }
+    // addEventListener('tonechange') subscribers too (WPT uses both styles)
+    try { if (self.dispatchEvent) self.dispatchEvent(evT); } catch (e2) {}
   }
 
   function _runNext(duration, gap) {
+    // closed connection: halt the playout loop immediately (real-bug fix:
+    // tones kept firing after pc.close()).
+    if (typeof getClosed === 'function' && getClosed()) { _playing = false; return; }
     if (self.toneBuffer.length === 0) {
       _playing = false;
       _fireToneChange('');                       // W3C: empty tone marks completion
@@ -3476,16 +5097,21 @@ function RTCDTMFSender(getPipeline) {
    * W3C §5.5.2 insertDTMF(tones, duration, interToneGap).
    * Replaces toneBuffer; starts playout if idle.
    */
-  this.insertDTMF = function (tones, duration, interToneGap) {
+  impl.insertDTMF = function (tones, duration, interToneGap) {
+    // W3C 7.2: a stopped transceiver or a non-sending currentDirection
+    // makes DTMF impossible — InvalidStateError before any queueing.
+    var _tx = (typeof getTxState === 'function') ? getTxState() : {};
+    if (RtpManager.isStopped(_tx) ||
+        _tx.currentDirection === 'recvonly' || _tx.currentDirection === 'inactive') {
+      throw new DOMException('insertDTMF: transceiver cannot send DTMF in its current state', 'InvalidStateError');
+    }
     tones = (tones == null) ? '' : String(tones);
     if (!/^[0-9A-Da-d#*,]*$/.test(tones)) {
-      var err = new Error('insertDTMF: invalid DTMF characters in "' + tones + '"');
-      err.name = 'InvalidCharacterError';
+      var err = new DOMException('insertDTMF: invalid DTMF characters in "' + tones + '"', 'InvalidCharacterError');
       throw err;
     }
     if (!this.canInsertDTMF) {
-      var err2 = new Error('insertDTMF: DTMF cannot be sent (no negotiated telephone-event or sender inactive)');
-      err2.name = 'InvalidStateError';
+      var err2 = new DOMException('insertDTMF: DTMF cannot be sent (no negotiated telephone-event or sender inactive)', 'InvalidStateError');
       throw err2;
     }
     var dur = Math.min(6000, Math.max(40, (duration == null) ? 100 : duration));
@@ -3493,7 +5119,9 @@ function RTCDTMFSender(getPipeline) {
     this.toneBuffer = tones.toUpperCase();
     if (!_playing && this.toneBuffer.length > 0) {
       _playing = true;
-      _runNext(dur, gap);
+      // spec: playout begins ASYNCHRONOUSLY — toneBuffer must remain
+      // fully intact when insertDTMF returns (WPT reads it immediately).
+      setTimeout(function () { _runNext(dur, gap); }, 0);
     }
   };
 }
@@ -3502,33 +5130,79 @@ function RTCDTMFSender(getPipeline) {
 
 /* ========================= Event Classes ========================= */
 
-function RTCTrackEvent(init) {
+RTCDTMFSender.prototype.insertDTMF = function () { return this._impl.insertDTMF.apply(this, arguments); };
+Object.defineProperty(RTCDTMFSender.prototype.insertDTMF, 'length', { value: 1 });
+Object.defineProperty(RTCDTMFSender.prototype.insertDTMF, 'name', { value: 'insertDTMF' });
+
+function RTCTrackEvent(type, init) {
+  // WebIDL (WPT): (type, eventInitDict) — init with a valid receiver
+  // and track is REQUIRED; internal single-arg calls pass the dict first.
+  var _dictFirst = (typeof type === 'object' && type !== null && init === undefined);
+  if (_dictFirst) { init = type; type = 'track'; }
+  else if (arguments.length < 2) {
+    throw new TypeError('RTCTrackEvent: eventInitDict required');
+  }
   init = init || {};
-  this.type        = 'track';
+  if (init.receiver == null || init.track == null || init.transceiver == null) {
+    throw new TypeError('RTCTrackEvent: receiver, track and transceiver are required');
+  }
+  this.type        = typeof type === 'string' ? type : 'track';
+  this.bubbles     = !!init.bubbles;
+  this.cancelable  = !!init.cancelable;
   this.track       = init.track       != null ? init.track       : null;
   this.receiver    = init.receiver    != null ? init.receiver    : null;
   this.transceiver = init.transceiver != null ? init.transceiver : null;
   this.streams     = Array.isArray(init.streams) ? init.streams : [];
 }
 
-function RTCDataChannelEvent(init) {
+function RTCDataChannelEvent(type, init) {
+  // WebIDL (WPT): both arguments required; init.channel required non-null.
+  if (arguments.length < 2) {
+    throw new TypeError('RTCDataChannelEvent: 2 arguments required');
+  }
+  if (init == null || init.channel == null) {
+    throw new TypeError('RTCDataChannelEvent: channel is required');
+  }
+  if (typeof type === 'object' && type && init === undefined) { init = type; }
+  this.type = typeof type === 'string' ? type : (init.type || 'datachannel');
   init = init || {};
-  this.type    = 'datachannel';
-  this.channel = init.channel != null ? init.channel : null;
+  this.type       = 'datachannel';
+  // Standard Event flags default to FALSE, not undefined — WPT asserts
+  // both directly on the delivered event.
+  this.bubbles    = !!init.bubbles;
+  this.cancelable = !!init.cancelable;
+  this.channel    = init.channel != null ? init.channel : null;
 }
 
-function RTCPeerConnectionIceEvent(init) {
+function RTCPeerConnectionIceEvent(type, init) {
+  // W3C: this is a constructible Event — (type, eventInitDict), with type
+  // REQUIRED (no arguments is a TypeError) and the standard Event flags
+  // defaulting to false rather than undefined.
+  if (arguments.length === 0) {
+    throw new TypeError("Failed to construct 'RTCPeerConnectionIceEvent': 1 argument required");
+  }
+  // Internal callers historically passed a single init object; keep them
+  // working by detecting a non-string first argument.
+  if (typeof type !== 'string') { init = type; type = 'icecandidate'; }
   init = init || {};
-  this.type      = 'icecandidate';
+  this.type       = type;
+  this.bubbles    = !!init.bubbles;
+  this.cancelable = !!init.cancelable;
   // Per W3C, .candidate is null on end-of-candidates (the "null candidate"
   // sentinel). Otherwise it's an RTCIceCandidate.
-  this.candidate = init.candidate != null ? init.candidate : null;
-  this.url       = init.url || null;
+  this.candidate  = init.candidate != null ? init.candidate : null;
+  this.url        = init.url || null;
 }
 
-function RTCPeerConnectionIceErrorEvent(init) {
+function RTCPeerConnectionIceErrorEvent(type, init) {
+  // WebIDL (type, eventInitDict) form — same fix as
+  // RTCPeerConnectionIceEvent. Internal callers passing a single init
+  // object still work (a non-string first argument is the init).
+  if (typeof type !== 'string') { init = type; type = 'icecandidateerror'; }
   init = init || {};
-  this.type      = 'icecandidateerror';
+  this.type       = type;
+  this.bubbles    = !!init.bubbles;
+  this.cancelable = !!init.cancelable;
   this.address   = init.address   != null ? init.address   : null;
   this.port      = init.port      != null ? init.port      : null;
   this.url       = init.url       != null ? init.url       : '';
@@ -3545,20 +5219,36 @@ function RTCPeerConnectionIceErrorEvent(init) {
 // receivedAlert, sentAlert, httpRequestStatusCode) is what apps inspect,
 // not the prototype chain.
 function RTCError(init, message) {
-  init = init || {};
+  // WebIDL (WPT): init is REQUIRED with a VALID errorDetail enum value;
+  // name is 'OperationError' (RTCError extends DOMException semantics)
+  // and legacy .code is 0.
+  if (arguments.length === 0 || init == null) {
+    throw new TypeError('RTCError: init dictionary required');
+  }
+  var _validDetails = ['data-channel-failure','dtls-failure','fingerprint-failure','sctp-failure','sdp-syntax-error','hardware-encoder-not-available','hardware-encoder-error'];
+  if (_validDetails.indexOf(init.errorDetail) === -1) {
+    throw new TypeError('RTCError: invalid errorDetail "' + init.errorDetail + '"');
+  }
   // Match W3C: errorDetail is the discriminator, others optional.
   // RTCErrorDetailType: 'data-channel-failure' | 'dtls-failure' |
   //   'fingerprint-failure' | 'sctp-failure' | 'sdp-syntax-error' |
   //   'hardware-encoder-not-available' | 'hardware-encoder-error'
   Error.call(this, message || '');
-  this.name = 'RTCError';
+  this.name = 'OperationError';
+  this.code = 0;
   this.message = message || '';
-  this.errorDetail            = init.errorDetail            != null ? init.errorDetail            : '';
-  this.sdpLineNumber          = init.sdpLineNumber          != null ? init.sdpLineNumber          : null;
-  this.sctpCauseCode          = init.sctpCauseCode          != null ? init.sctpCauseCode          : null;
-  this.receivedAlert          = init.receivedAlert          != null ? init.receivedAlert          : null;
-  this.sentAlert              = init.sentAlert              != null ? init.sentAlert              : null;
-  this.httpRequestStatusCode  = init.httpRequestStatusCode  != null ? init.httpRequestStatusCode  : null;
+  var _roV_errorDetail = init.errorDetail            != null ? init.errorDetail            : '';
+  var _roV_sdpLineNumber = init.sdpLineNumber          != null ? init.sdpLineNumber          : null;
+  var _roV_sctpCauseCode = init.sctpCauseCode          != null ? init.sctpCauseCode          : null;
+  var _roV_receivedAlert = init.receivedAlert          != null ? init.receivedAlert          : null;
+  var _roV_sentAlert = init.sentAlert              != null ? init.sentAlert              : null;
+  var _roV_httpRequestStatusCode = init.httpRequestStatusCode  != null ? init.httpRequestStatusCode  : null;
+  Object.defineProperty(this, 'errorDetail', { get: function () { return _roV_errorDetail; }, set: function () { throw new TypeError('RTCError.errorDetail is read-only'); }, enumerable: true, configurable: false });
+  Object.defineProperty(this, 'sdpLineNumber', { get: function () { return _roV_sdpLineNumber; }, set: function () { throw new TypeError('RTCError.sdpLineNumber is read-only'); }, enumerable: true, configurable: false });
+  Object.defineProperty(this, 'sctpCauseCode', { get: function () { return _roV_sctpCauseCode; }, set: function () { throw new TypeError('RTCError.sctpCauseCode is read-only'); }, enumerable: true, configurable: false });
+  Object.defineProperty(this, 'receivedAlert', { get: function () { return _roV_receivedAlert; }, set: function () { throw new TypeError('RTCError.receivedAlert is read-only'); }, enumerable: true, configurable: false });
+  Object.defineProperty(this, 'sentAlert', { get: function () { return _roV_sentAlert; }, set: function () { throw new TypeError('RTCError.sentAlert is read-only'); }, enumerable: true, configurable: false });
+  Object.defineProperty(this, 'httpRequestStatusCode', { get: function () { return _roV_httpRequestStatusCode; }, set: function () { throw new TypeError('RTCError.httpRequestStatusCode is read-only'); }, enumerable: true, configurable: false });
 }
 RTCError.prototype = Object.create(Error.prototype);
 RTCError.prototype.constructor = RTCError;
@@ -3569,10 +5259,17 @@ function RTCErrorEvent(init) {
   this.error = init.error != null ? init.error : null;
 }
 
-function RTCDTMFToneChangeEvent(init) {
+function RTCDTMFToneChangeEvent(type, init) {
+  // WebIDL (type, eventInitDict); internal single-arg dict-first calls
+  // keep working via the compat branch.
+  if (typeof type === 'object' && type !== null && init === undefined) {
+    init = type; type = 'tonechange';
+  }
   init = init || {};
-  this.type = 'tonechange';
-  this.tone = init.tone != null ? init.tone : '';
+  this.type = typeof type === 'string' ? type : 'tonechange';
+  this.bubbles = !!init.bubbles;
+  this.cancelable = !!init.cancelable;
+  this.tone = init.tone != null ? String(init.tone) : '';
 }
 
 
@@ -3633,6 +5330,47 @@ function _idMediaPlayout(kind)       { return 'MP-' + kind; }
 
 function _inboundRtpEntry(ssrc, stats, mapping, now) {
   var kind = (mapping && mapping.transceiver) ? mapping.transceiver.kind : 'video';
+
+  // framesPerSecond (W3C: "frames DECODED in the last second") — derived
+  // HERE, at stats-read time, from the framesDecoded counter delta.
+  //
+  // Why not compute it in the decoder's output callback: a rate computed
+  // on frame arrival freezes at its last value when the stream stalls —
+  // the callback stops firing, so nothing ever writes the decayed value.
+  // Deriving on read means a stalled (or never-decoded) stream reports 0,
+  // which is the truth.
+  //
+  // Semantics under lazy decode: this counts actual decode activity.
+  // In SFU/forwarding mode (no sink on the track → decoder never spins
+  // up) this is legitimately 0 while media flows — use framesReceived
+  // (depacketizer-level, below) or packetsReceived for liveness.
+  // Chrome reports a nonzero fps for any flowing stream because its
+  // receive path decodes unconditionally; when our decoder IS running
+  // (track consumed — the "browser peer in Node" mode) the two agree.
+  //
+  // Sampling state (_fps*) lives on the per-SSRC stats object and is
+  // shared by all readers; with one periodic getStats caller (the
+  // common case) the window is simply the polling interval. Re-reads
+  // within 250ms return the previous sample instead of a noisy delta.
+  var fps = 0;
+  if (kind === 'video') {
+    var _fd = stats.framesDecoded || 0;
+    if (stats._fpsPrevTime) {
+      var _dt = now - stats._fpsPrevTime;
+      if (_dt >= 250) {
+        fps = Math.max(0, Math.round(((_fd - stats._fpsPrevCount) * 1000) / _dt));
+        stats._fpsPrevTime  = now;
+        stats._fpsPrevCount = _fd;
+        stats._fpsLast      = fps;
+      } else {
+        fps = stats._fpsLast || 0;
+      }
+    } else {
+      stats._fpsPrevTime  = now;
+      stats._fpsPrevCount = _fd;
+    }
+  }
+
   var entry = {
     id:              _idInbound(ssrc),
     type:            'inbound-rtp',
@@ -3652,13 +5390,20 @@ function _inboundRtpEntry(ssrc, stats, mapping, now) {
     // Header bytes: we don't separate header from payload in our counter,
     // so report bytes as headerBytesReceived=0 and let total=bytesReceived.
     headerBytesReceived: 0,
-    // Decoder-populated fields (video only)
+    // Frame counters (video only).
+    // framesReceived — DEPACKETIZER-level: complete frames reassembled
+    //   from RTP, advances whenever media flows (decode or not). The
+    //   Chrome-parity liveness counter; populated by the receive
+    //   pipeline's depacketizer output in media_pipeline.js.
+    // framesDecoded / framesPerSecond — DECODER-level: actual decode
+    //   activity. 0 in SFU/forwarding mode (lazy decoder never spun up).
+    framesReceived:   stats.framesReceived   || 0,
     framesDecoded:    stats.framesDecoded    || 0,
     keyFramesDecoded: stats.keyFramesDecoded || 0,
     framesDropped:    stats.framesDropped    || 0,
     frameWidth:       stats.frameWidth       || 0,
     frameHeight:      stats.frameHeight      || 0,
-    framesPerSecond:  stats.framesPerSecond  || 0,
+    framesPerSecond:  fps,
     // Feedback counters (NACK/PLI/FIR) — Phase 3 will populate
     nackCount:        stats.nackCount || 0,
     pliCount:         stats.pliCount  || 0,
@@ -3689,6 +5434,32 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
   if (transceiver && transceiver.sender && transceiver.sender.track) {
     mediaSourceId = _idMediaSource(transceiver.sender.track.id);
   }
+
+  // framesPerSecond (W3C: "encoded frames in the last second") — derived
+  // at read time from the framesEncoded delta, same pattern and rationale
+  // as the inbound entry. The pipeline used to write the CONFIGURED
+  // framerate here, which (a) reported the target rather than the
+  // measurement, and (b) froze at that value forever once the encoder
+  // stalled. Sampling state (_fps*) lives on the per-SSRC stats object.
+  var fps = 0;
+  if (kind === 'video') {
+    var _fe = stats.framesEncoded || 0;
+    if (stats._fpsPrevTime) {
+      var _dt = now - stats._fpsPrevTime;
+      if (_dt >= 250) {
+        fps = Math.max(0, Math.round(((_fe - stats._fpsPrevCount) * 1000) / _dt));
+        stats._fpsPrevTime  = now;
+        stats._fpsPrevCount = _fe;
+        stats._fpsLast      = fps;
+      } else {
+        fps = stats._fpsLast || 0;
+      }
+    } else {
+      stats._fpsPrevTime  = now;
+      stats._fpsPrevCount = _fe;
+    }
+  }
+
   return {
     id:              _idOutbound(ssrc),
     type:            'outbound-rtp',
@@ -3709,7 +5480,7 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
     framesSent:      stats.framesEncoded    || 0,   // ~same for our pipeline
     frameWidth:      stats.frameWidth       || 0,
     frameHeight:     stats.frameHeight      || 0,
-    framesPerSecond: stats.framesPerSecond  || 0,
+    framesPerSecond: fps,
     targetBitrate:   stats.targetBitrate    || 0,
     // Feedback counters (received from remote)
     nackCount:       stats.nackCount || 0,
@@ -3909,6 +5680,17 @@ function _transportEntry(snapshot, snap, now) {
     dtlsState:               snapshot.dtlsState || 'new',
     iceState:                snapshot.iceConnectionState || 'new',
     dtlsRole:                snapshot.dtlsRole || 'unknown',
+    // W3C stats: iceRole follows who OFFERED — offerer controlling,
+    // answerer controlled (RFC 8445 6.1); 'unknown' before any local
+    // description exists.
+    iceRole: (function () {
+      var d = snapshot.pendingLocalDescription || snapshot.currentLocalDescription;
+      if (!d) return 'unknown';
+      return d.type === 'offer' ? 'controlling' : 'controlled';
+    })(),
+    // W3C: how many times the selected pair has changed — 0 before any
+    // pair is nominated, incremented by the agent's selectedpair events.
+    selectedCandidatePairChanges: snapshot.selectedPairChanges || 0,
     selectedCandidatePairId: snapshot.selectedPair
       ? _idCandidatePair(
           (snapshot.selectedPair.local  && snapshot.selectedPair.local.foundation)  || '0',

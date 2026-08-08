@@ -1127,6 +1127,8 @@ function SctpAssociation(config) {
     // SCTP-9: cum-ack progressed → loss event recovered. Allow another
     // fast-retransmit halving on the next loss.
     if (dropCount > 0) fastRetransmitCutThisRound = false;
+    // A stream may have just gone quiet — release any reset waiting on it.
+    _releaseReadyStreamResets();
     // SCTP-9: grow cwnd according to slow-start / CA rules.
     // RFC 4960 §7.2.1 gates growth on "cwnd was fully utilised". The
     // strict reading "outstandingBytes >= cwnd" is overly conservative
@@ -1846,6 +1848,25 @@ function SctpAssociation(config) {
     // Apply the reset to our recv state for each requested stream.
     for (var s = 0; s < streams.length; s++) {
       var sid = streams[s];
+      // DELIVER BEFORE DISCARDING (RFC 6525 3.1 + RFC 8831 6.7): an
+      // incoming stream reset closes the stream for FUTURE data — it does
+      // not invalidate messages that already arrived and are sitting
+      // complete in the reassembly buffers. Dropping them here is what
+      // made "send(msg); close();" lose msg on the RECEIVING side: the
+      // reset chunk cleaned up the very message it was meant to follow.
+      // Only INCOMPLETE fragments are discarded; a complete message is
+      // handed up first.
+      var _pend = pendingMsgs[sid];
+      if (_pend && _pend.size) {
+        // deliver in SSN order, exactly as the normal drain does
+        var _ssns = [];
+        _pend.forEach(function (_m, _ssn) { _ssns.push(_ssn); });
+        _ssns.sort(function (a, b) { return a - b; });
+        for (var _pi = 0; _pi < _ssns.length; _pi++) {
+          var _msg = _pend.get(_ssns[_pi]);
+          try { processMessage(sid, _msg.ppid, _msg.payload); } catch (eD) {}
+        }
+      }
       delete recvSSN[sid];
       if (pendingMsgs[sid]) delete pendingMsgs[sid];
       if (fragStore[sid])   delete fragStore[sid];
@@ -1947,6 +1968,46 @@ function SctpAssociation(config) {
   // If peer doesn't support RECONFIG, the callback fires immediately
   // with err='peer-no-reconfig' so cm.js can fall back to local-only
   // close (W3C-compatible degradation).
+  /**
+   * Stream resets that are WAITING for their data to be acknowledged.
+   *   key: reqSeq   value: { streamIds, body, timer }
+   * See _streamHasOutstanding for why they wait.
+   */
+  var pendingStreamResets = new Map();
+
+  /**
+   * Does this stream still have data we have not seen acknowledged?
+   *
+   * A stream reset tells the peer "everything up to senderLastTsn is
+   * final, now close the stream". If chunks for that stream are still
+   * sitting in sendQueue — unsent because rwnd is closed, or sent but
+   * unacked — the peer receives the reset while those chunks are still
+   * in flight and discards them (RFC 6525 3.1). That is exactly how the
+   * common "send(msg); close();" idiom lost its last message.
+   */
+  function _streamHasOutstanding(sid) {
+    for (var i = 0; i < sendQueue.length; i++) {
+      if (sendQueue[i].streamId === sid) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Release any reset whose streams have gone quiet. Called from
+   * handleSack (every acknowledgement is a chance for a stream to
+   * drain) and from the safety timer below.
+   */
+  function _releaseReadyStreamResets() {
+    if (pendingStreamResets.size === 0) return;
+    pendingStreamResets.forEach(function (entry, reqSeq) {
+      var stillBusy = entry.streamIds.some(_streamHasOutstanding);
+      if (stillBusy) return;
+      if (entry.timer) clearTimeout(entry.timer);
+      pendingStreamResets.delete(reqSeq);
+      entry.send();
+    });
+  }
+
   function resetStreams(streamIds, callback) {
     if (state !== STATE_ESTABLISHED) {
       if (typeof callback === 'function') {
@@ -1977,6 +2038,22 @@ function SctpAssociation(config) {
     var bodyLen      = paramLen;
     if (bodyLen % 4 !== 0) bodyLen += 4 - (bodyLen % 4);   // pad
 
+    // BUILD LATE, SEND LATE — and WAIT FOR THE STREAM TO DRAIN.
+    //
+    // Two orderings must hold before a RECONFIG may leave:
+    //   • it must not overtake data still queued behind the coalescing
+    //     transmit microtask (RFC 4960 6.10 bundling);
+    //   • senderLastTsn must cover that data, which means reading
+    //     localTsn only after the data has been assigned its TSNs
+    //     (RFC 6525 4.1).
+    // Building the whole parameter inside the deferred sender gives both.
+    // On top of that, if the stream still has UNACKNOWLEDGED chunks the
+    // reset waits for them: the peer would otherwise apply the reset
+    // while those chunks are in flight and drop them — the "send(msg);
+    // close();" data loss. handleSack releases the reset as soon as the
+    // stream goes quiet, and a safety timer releases it regardless so a
+    // stalled queue can never keep a channel open forever.
+    var _sendReset = function () {
     var body = Buffer.alloc(bodyLen);
     body.writeUInt16BE(PARAM_OUTGOING_SSN_RESET, 0);
     body.writeUInt16BE(paramLen, 2);
@@ -1990,7 +2067,40 @@ function SctpAssociation(config) {
       body.writeUInt16BE(streamIds[i] & 0xFFFF, 16 + i * 2);
     }
 
+    // ORDER WITH PENDING DATA (RFC 8831 6.7 / W3C 6.2.5): user data goes
+    // out through sendQueue on a coalescing MICROTASK, while this
+    // RECONFIG was written synchronously — so a stream reset OVERTOOK
+    // data the application had just sent and the peer closed the stream
+    // before the message arrived. "send(msg); close();" silently lost
+    // msg. queueMicrotask preserves FIFO order and send() already
+    // scheduled its transmit pass, so deferring the RECONFIG the same
+    // way puts it strictly AFTER the data it must not overtake.
     sendChunk(CHUNK_RECONFIG, 0, body, remoteVerificationTag);
+    };
+
+    // STATUS (round 116): the wait itself works — traced busy=true, the
+    // reset held, released on the SACK. But with an IMMEDIATE close the
+    // peer's SCTP never emits the message at all, so the loss is EARLIER
+    // than this layer: between dcc.send()'s enqueue and the transmit
+    // pass, for that one timing. The two orderings fixed in round 115
+    // and this drain-wait are all RFC-correct and stay; the remaining
+    // piece is why that first chunk never leaves. Next probe: trace
+    // transmitPending's selection for a stream whose channel entered
+    // 'closing' in the same turn.
+    var _busy = streamIds.some(_streamHasOutstanding);
+    if (_busy) {
+      var _entry = { streamIds: streamIds.slice(), send: _sendReset, timer: null };
+      _entry.timer = setTimeout(function () {
+        if (pendingStreamResets.has(reqSeq)) {
+          pendingStreamResets.delete(reqSeq);
+          _sendReset();   // safety net: never leave a channel unclosed
+        }
+      }, Math.max(200, (typeof rto === 'number' ? rto : 200) * 2));
+      if (_entry.timer && _entry.timer.unref) _entry.timer.unref();
+      pendingStreamResets.set(reqSeq, _entry);
+    } else {
+      queueMicrotask(_sendReset);
+    }
     return reqSeq;
   }
 

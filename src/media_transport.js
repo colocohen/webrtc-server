@@ -307,6 +307,7 @@ class MediaTransport extends EventEmitter {
     var o = state.outboundStats[mediaSsrc];
     var currentSeq = (o && o.lastSentSeq != null) ? o.lastSentSeq : null;
 
+    if (!this._nackDiagLast) this._nackDiagLast = {};
     var sent = 0, missing = 0, throttled = 0;
     for (var i = 0; i < lostSeqs.length; i++) {
       var lostSeq = lostSeqs[i];
@@ -358,6 +359,15 @@ class MediaTransport extends EventEmitter {
         o.retransmittedBytesSent   = (o.retransmittedBytesSent   || 0) + rtxPacket.length;
         o.nackCount                = (o.nackCount || 0) + 1;
       }
+    }
+
+    // [mt-diag] NACK service proof-of-life (rate-limited): the one line
+    // that distinguishes "RTX healing losses" from "NACKs into the void".
+    var _now = Date.now();
+    if ((sent || missing) && (!this._nackDiagLast[mediaSsrc] || _now - this._nackDiagLast[mediaSsrc] > 2000)) {
+      this._nackDiagLast[mediaSsrc] = _now;
+      this._diag('[mt-diag] NACK served ssrc=' + mediaSsrc + ' sent=' + sent +
+                 ' evicted=' + missing + ' throttled=' + throttled);
     }
 
     // Diag pattern: every NACK for the first 20, then every 50th. Shows
@@ -456,6 +466,30 @@ class MediaTransport extends EventEmitter {
     }
     if (info.payloadType != null) {
       o.payloadType = info.payloadType;
+    }
+    // MID for the outgoing header extension. The stamper's constructor-
+    // level mid served the single-transceiver era; every registered
+    // outbound stream now carries its OWN mid so BUNDLE sessions and
+    // SFU-injected streams stamp correctly (found live: injected packets
+    // wore the producer session's mid → Chrome bundle-demux dropped all).
+    if (info.mid != null && state.headerStamper &&
+        typeof state.headerStamper.setMidForSsrc === 'function') {
+      state.headerStamper.setMidForSsrc(ssrc, info.mid);
+    }
+    // RTX for this stream (VERIFY#4 closure): without this registration,
+    // a viewer's NACK on an injected stream found no rtxStreams entry and
+    // was silently unserved — every lost packet cost a full PLI/keyframe
+    // round instead of a ~2ms retransmit. The sender buffer already holds
+    // injected packets (sendRtp path); this wires the lookup. The RTX
+    // ssrc shares the m-line's mid — stamp it too, or Chrome's bundle
+    // demux drops the retransmits the same way it dropped the media.
+    if (info.rtxSsrc != null && info.rtxPayloadType != null &&
+        typeof this.setRtxMapping === 'function') {
+      this.setRtxMapping(ssrc, info.rtxSsrc, info.rtxPayloadType);
+      if (info.mid != null && state.headerStamper &&
+          typeof state.headerStamper.setMidForSsrc === 'function') {
+        state.headerStamper.setMidForSsrc(info.rtxSsrc, info.mid);
+      }
     }
   }
 

@@ -62,7 +62,11 @@ function buildMediaForTransceiver(state, t) {
   if (t.kind === 'audio') {
     codecs = SDP.DEFAULT_AUDIO_CODECS.map(function(c, idx) {
       return {
-        payloadType: 111 + idx,
+        // STATIC payload types win (RFC 3551: PCMU=0, PCMA=8, G722=9).
+        // They are not ours to allocate — a peer that sees PCMA on a
+        // dynamic PT may still decode it, but any endpoint following the
+        // static table (SIP gateways, PSTN bridges) will not.
+        payloadType: (c.pt != null) ? c.pt : (111 + idx),
         name:        c.name,
         clockRate:   c.clockRate,
         channels:    c.channels,
@@ -158,7 +162,34 @@ function buildMediaForTransceiver(state, t) {
     type:      t.kind,
     mid:       t.mid,
     direction: resolvedDir,
-    codecs:    codecs,
+    // setCodecPreferences (W3C 5.4): the application ordering wins in the
+    // m-section. Nothing consumed _codecPreferences here before — the API
+    // accepted the call and silently ignored it. NOTE the deeper gap this
+    // exposed: getCapabilities() advertises codecs (PCMA, PCMU, G722...)
+    // that are NOT in SDP.DEFAULT_AUDIO_CODECS, so preferring one of them
+    // still cannot change the wire until the two tables are reconciled.
+    // The ranking below is correct and takes effect for any codec we do
+    // offer; aligning the tables is its own piece of work.
+    codecs:    (function () {
+      var prefs = t._codecPreferences;
+      if (!prefs || !prefs.length) return codecs;
+      var ranked = [], seen = {};
+      for (var pi = 0; pi < prefs.length; pi++) {
+        var want = String(prefs[pi] && prefs[pi].mimeType || '').toLowerCase();
+        for (var ci = 0; ci < codecs.length; ci++) {
+          // internal entries carry a bare `name` ("opus"); capabilities
+          // use the IDL mimeType ("audio/opus") — compare on the name.
+          var haveName = String(codecs[ci] && codecs[ci].name || '').toLowerCase();
+          var wantName = want.indexOf('/') >= 0 ? want.split('/')[1] : want;
+          if (haveName && haveName === wantName && !seen[ci]) {
+            ranked.push(codecs[ci]); seen[ci] = true;
+          }
+        }
+      }
+      // codecs the app did not mention keep their relative order at the end
+      for (var ri = 0; ri < codecs.length; ri++) if (!seen[ri]) ranked.push(codecs[ri]);
+      return ranked.length ? ranked : codecs;
+    })(),
   };
 
   if (hasLocalSsrc) {
@@ -166,7 +197,18 @@ function buildMediaForTransceiver(state, t) {
       id:    t.sender.ssrc,
       rtxId: t.sender.rtxSsrc,
       cname: state.localCname,
-      msid:  'stream0 ' + t.kind + t.mid,
+      msid:  (((t.streamIds && t.streamIds[0]) || '-')) + ' ' +
+             ((t.track && t.track.id) || (t.kind + t.mid)),
+      // MULTI-STREAM (W3C: addTrack(track, s1, s2)): a sender may belong
+      // to SEVERAL MediaStreams, and each one needs its own msid token —
+      // we only ever emitted the first, so the receiving side could never
+      // reconstruct more than one stream. Carried as a list; the SDP
+      // writer emits one a=msid line per entry.
+      msids: (t.streamIds && t.streamIds.length > 1)
+        ? t.streamIds.map(function (sid) {
+            return sid + ' ' + ((t.track && t.track.id) || (t.kind + t.mid));
+          })
+        : null,
       layers: (t.sender.layers || []).map(function (L) {
         return { rid: L.rid, ssrc: L.ssrc, rtxSsrc: L.rtxSsrc };
       }),
@@ -212,6 +254,33 @@ function buildOffer(state, options) {
   // assignExtensionIds() so new sections pick non-colliding IDs.
   var bundleExtmap = {};
 
+  // SESSION-STICKY EXTMAP (M2 finding): claims made by the REMOTE side
+  // must be honored too. In a session where BOTH endpoints add m-lines
+  // (a browser adds its camera, the SFU adds consumer streams), the peer
+  // has already bound extension IDs to URIs on ITS m-lines — Chrome, for
+  // example, binds id 3 to video-orientation while our default table
+  // binds id 3 to transport-cc. Allocating from our table alone produced
+  // one BUNDLE where id 3 meant two different things; Chrome hard-fails
+  // ("RTP extension ID reassignment not supported") and the session is
+  // poisoned. Seed the remote's id→uri claims FIRST; the local-pin loop
+  // below may overwrite (re-emitted local lines must stay self-
+  // consistent), and assignExtensionIds() then steers every NEW section
+  // around the union of both worlds.
+  var _remoteParsedForExt = state.parsedRemoteSdp;
+  if (_remoteParsedForExt && Array.isArray(_remoteParsedForExt.media)) {
+    for (var _rmi = 0; _rmi < _remoteParsedForExt.media.length; _rmi++) {
+      var _rm = _remoteParsedForExt.media[_rmi];
+      if (_rm && _rm.extensions) {
+        for (var _rei = 0; _rei < _rm.extensions.length; _rei++) {
+          var _re = _rm.extensions[_rei];
+          if (_re && _re.id != null && bundleExtmap[_re.id] == null) {
+            bundleExtmap[_re.id] = _re.uri;
+          }
+        }
+      }
+    }
+  }
+
   // Renegotiation: preserve existing m-sections.
   // We pin from state.parsedCurrentLocalSdp (the parsed view of the most
   // recently *completed* round). Using state.parsedLocalSdp here would be
@@ -243,7 +312,7 @@ function buildOffer(state, options) {
       }
 
       var tr = RtpManager.findByMid(state, em.mid);
-      var trStopped = !tr || tr.currentDirection === 'stopped' ||
+      var trStopped = !tr || RtpManager.isStopped(tr) ||
                       tr.direction === 'stopped';
 
       if (tr && !trStopped) {
@@ -269,7 +338,7 @@ function buildOffer(state, options) {
       var recycle = null;
       for (var ti2 = 0; ti2 < state.transceivers.length; ti2++) {
         var cand = state.transceivers[ti2];
-        if (cand.currentDirection === 'stopped' || cand.direction === 'stopped') continue;
+        if (RtpManager.isStopped(cand)) continue;
         if (existingMids[cand.mid]) continue;     // already placed
         if (cand.kind !== em.type) continue;
         recycle = cand;
@@ -328,8 +397,35 @@ function buildOffer(state, options) {
   // vs audio+video), so any static default table will collide somewhere.
   for (var i = 0; i < state.transceivers.length; i++) {
     var t = state.transceivers[i];
-    if (t.currentDirection === 'stopped' || t.direction === 'stopped') continue;
+    if (RtpManager.isStopped(t)) {
+      // JSEP 5.2.2: a STOPPED transceiver that was already associated
+      // with an m-section must still be OFFERED — as a REJECTED section
+      // (port 0). Dropping the section outright renumbers every m-line
+      // after it, so the peer's mids no longer line up with ours. The
+      // section is emitted here and the transceiver is retired once the
+      // negotiation completes (see cm's post-stable sweep).
+      if (t._associated && t.mid != null && !existingMids[t.mid]) {
+        existingMids[t.mid] = true;
+        mediaSections.push({
+          type: t.kind, mid: String(t.mid), port: 0,
+          direction: 'inactive', rejected: true,
+          codecs: [], extensions: [],
+        });
+      }
+      continue;
+    }
+    // BIRTH-MID COLLISION (the last link of the bidi saga): an
+    // UNASSOCIATED transceiver whose internal birth mid happens to equal
+    // an m-line already placed for someone else was silently skipped —
+    // the sender never got an m-line and stayed silent forever. Give it
+    // a FRESH mid outside the used space and emit its section.
+    if (existingMids[t.mid] && !RtpManager.isLegitimateOwner(t)) {
+      var _fresh = 0;
+      while (existingMids[String(_fresh)]) _fresh++;
+      RtpManager.rebindMid(state, t, _fresh);
+    }
     if (!existingMids[t.mid]) {
+      existingMids[t.mid] = true;
       var newSpec = buildMediaForTransceiver(state, t);
       var defaults = (t.kind === 'audio')
         ? SDP.DEFAULT_AUDIO_EXTENSIONS
@@ -412,10 +508,16 @@ function buildAnswer(state, options) {
   for (var i = 0; i < state.parsedRemoteSdp.media.length; i++) {
     var m = state.parsedRemoteSdp.media[i];
     if (m.type !== 'audio' && m.type !== 'video') continue;
-    if (state.localSsrcs[m.mid]) {
+    // THE FOURTH SELECTOR (the bidi grab): this builder used the RAW
+    // findByMid — a birth-mid collision handed the server's SEND
+    // transceiver (and its localSsrcs slot!) to the browser's own
+    // m-line, committing recvonly onto it and killing server-to-browser
+    // video. Only legitimate owners may steer an answer m-line.
+    var tr = RtpManager.findByMid(state, m.mid);
+    if (tr && !RtpManager.isLegitimateOwner(tr)) tr = null;
+    if (state.localSsrcs[m.mid] && tr) {
       ssrcs[m.mid] = state.localSsrcs[m.mid];
     }
-    var tr = RtpManager.findByMid(state, m.mid);
     if (tr && tr.direction) {
       directions[m.mid] = tr.direction;
     }

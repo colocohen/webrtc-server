@@ -108,14 +108,41 @@ function createTransceiver(state, kind, init) {
   // where the peer's parser may reject it. Validate format unconditionally;
   // require non-empty + uniqueness only when simulcast (rid is required for
   // simulcast per RFC 8852 §3.1, but optional for single encoding).
+  // AUDIO SHORT-CIRCUIT (W3C 5.2): an audio sender takes ONE encoding and
+  // only `active` survives — video-only members are DROPPED SILENTLY, so
+  // none of the video validation below may run for audio (an invalid
+  // scaleResolutionDownBy on audio is removed, never an error).
+  if (kind === 'audio' && reqEncodings && reqEncodings.length) {
+    var _a0 = reqEncodings[0] || {};
+    // AUDIO keeps `active` AND `maxBitrate` — only rid,
+    // scaleResolutionDownBy and maxFramerate are video-only members.
+    reqEncodings = [typeof _a0.maxBitrate === 'number'
+      ? { active: _a0.active !== false, maxBitrate: _a0.maxBitrate }
+      : { active: _a0.active !== false }];
+  }
+
+  // Truncate to the implementation ceiling FIRST: a caller passing a
+  // ridiculous list gets a truncated one, never an error — and the
+  // simulcast rules below then apply to the surviving layers only.
+  if (reqEncodings && reqEncodings.length > MAX_SIMULCAST_ENCODINGS) {
+    reqEncodings = reqEncodings.slice(0, MAX_SIMULCAST_ENCODINGS);
+  }
   if (reqEncodings) {
     var seenRids = {};
     for (var ei = 0; ei < reqEncodings.length; ei++) {
       var enc = reqEncodings[ei] || {};
+      // RFC 8852 requires a rid per simulcast layer ON THE WIRE, but the
+      // W3C API does NOT require the app to supply one — a multi-encoding
+      // addTransceiver with no rids is legal (the ladder test does
+      // exactly this) and the rids are synthesised below.
       if (isSimulcast && !enc.rid) {
-        throw new TypeError('sendEncodings: rid required on every encoding when simulcast');
+        enc = Object.assign({}, enc, { rid: 'r' + ei });
+        reqEncodings[ei] = enc;
       }
-      if (enc.rid != null && !/^[A-Za-z0-9_-]{1,32}$/.test(enc.rid)) {
+      // RFC 8852 rid-syntax: alphanumerics ONLY (no '-' or '_' — those
+      // are rid *separators* in SDP). Audio drops rid entirely later, so
+      // validation applies where rid is meaningful.
+      if (enc.rid != null && !/^[A-Za-z0-9]{1,32}$/.test(enc.rid)) {
         throw new TypeError('sendEncodings: invalid rid "' + enc.rid + '"');
       }
       if (isSimulcast) {
@@ -129,20 +156,83 @@ function createTransceiver(state, kind, init) {
 
   var layers = [];
   var encodings = [];
+  // WPT: absurd sendEncodings lists are TRUNCATED (UA cap), not rejected.
+  if (reqEncodings && reqEncodings.length > 16) reqEncodings = reqEncodings.slice(0, 16);
+  if (reqEncodings) {
+    for (var _ri16 = 0; _ri16 < reqEncodings.length; _ri16++) {
+      var _rid = reqEncodings[_ri16] && reqEncodings[_ri16].rid;
+      if (_rid != null && String(_rid).length > 16) {
+        throw new TypeError('sendEncodings: rid must be at most 16 characters');
+      }
+    }
+  }
+  if (reqEncodings && reqEncodings.length) {
+    // W3C 5.2 addTransceiver, in order:
+    //  1. AUDIO takes ONE encoding, and only `active` survives on it —
+    //     video-shaped members (rid, scaleResolutionDownBy, maxBitrate…)
+    //     are dropped rather than rejected.
+    //  2. The list is TRUNCATED to the implementation maximum before any
+    //     per-encoding work (a "ridiculous" list must not throw).
+    //  3. VIDEO: when SOME encodings carry scaleResolutionDownBy, the
+    //     others default to 1 — and a SINGLE encoding never keeps it.
+    if (kind === 'audio') {
+      var _a1 = reqEncodings[0] || {};
+      // keeps active AND maxBitrate (see the collapse above)
+      reqEncodings = [typeof _a1.maxBitrate === 'number'
+        ? { active: _a1.active !== false, maxBitrate: _a1.maxBitrate }
+        : { active: _a1.active !== false }];
+    } else {
+      if (reqEncodings.length > MAX_SIMULCAST_ENCODINGS) {
+        reqEncodings = reqEncodings.slice(0, MAX_SIMULCAST_ENCODINGS);
+      }
+      var _anyScale = reqEncodings.some(function (e) { return e && e.scaleResolutionDownBy != null; });
+      if (_anyScale) {
+        // some set it => the rest default to 1
+        reqEncodings = reqEncodings.map(function (e) {
+          e = e || {};
+          return e.scaleResolutionDownBy == null
+            ? Object.assign({}, e, { scaleResolutionDownBy: 1 }) : e;
+        });
+      } else if (reqEncodings.length > 1) {
+        // NONE set it => the spec's descending ladder: the FIRST layer is
+        // full resolution and each subsequent one halves (1, 2, 4 …).
+        // W3C: the auto-filled ladder DESCENDS — [2, 1] for two layers,
+        // [4, 2, 1] for three: the LAST encoding is full resolution and
+        // earlier ones are progressively scaled down. (We had it the
+        // other way round, which inverted every simulcast ladder an app
+        // did not configure explicitly.)
+        var _n = reqEncodings.length;
+        reqEncodings = reqEncodings.map(function (e, i) {
+          return Object.assign({}, e || {}, { scaleResolutionDownBy: Math.pow(2, _n - 1 - i) });
+        });
+      }
+    }
+  }
   if (reqEncodings && reqEncodings.length) {
     for (var li = 0; li < reqEncodings.length; li++) {
       var e = reqEncodings[li] || {};
       var ls = SDP.generateSsrc();
       var lrtx = SDP.generateSsrc();
       layers.push({ rid: e.rid || null, ssrc: ls, rtxSsrc: lrtx });
+      // A SINGLE encoding carries neither rid nor scaleResolutionDownBy
+      // (both are simulcast-only concepts) — getParameters must not
+      // report them. Audio never carries them at all.
+      var _single = reqEncodings.length === 1;
+      var _vid = kind === 'video';
       encodings.push({
-        rid:                   e.rid || null,
+        rid:                   (_single || !_vid) ? undefined : (e.rid || null),
         active:                e.active !== false,
-        maxBitrate:            typeof e.maxBitrate === 'number' ? e.maxBitrate : 0,
-        maxFramerate:          typeof e.maxFramerate === 'number' ? e.maxFramerate : 0,
-        scaleResolutionDownBy: typeof e.scaleResolutionDownBy === 'number'
-                                 ? e.scaleResolutionDownBy : 1,
+        // maxBitrate applies to BOTH kinds (only rid/scale/framerate are video-only)
+        maxBitrate:            (typeof e.maxBitrate === 'number') ? e.maxBitrate : undefined,
+        maxFramerate:          (_vid && typeof e.maxFramerate === 'number') ? e.maxFramerate : undefined,
+        // video reports it always (defaulting to 1); audio never does
+        scaleResolutionDownBy: _vid
+          ? (typeof e.scaleResolutionDownBy === 'number' ? e.scaleResolutionDownBy : 1)
+          : undefined,
         scalabilityMode:       e.scalabilityMode || null,
+        // WPT harvest: the per-encoding codec-selection member (W3C §5.2)
+        // rides through to getParameters verbatim.
+        codec:                 e.codec ? Object.assign({}, e.codec) : null,
       });
     }
   } else {
@@ -157,11 +247,36 @@ function createTransceiver(state, kind, init) {
     encodings.push({
       rid:                   null,
       active:                true,
-      maxBitrate:            0,
-      maxFramerate:          0,
-      scaleResolutionDownBy: 1,
+      // A DEFAULT encoding is exactly { active: true } — these members
+      // are UNSET, not zero. Storing 0/1 here leaked into getParameters
+      // the moment the projection stopped filtering falsy values.
+      maxBitrate:            undefined,
+      maxFramerate:          undefined,
+      // VIDEO always carries scaleResolutionDownBy (default 1); AUDIO
+      // never does — it is a video-only member.
+      scaleResolutionDownBy: (kind === 'video') ? 1 : undefined,
       scalabilityMode:       null,
     });
+  }
+
+  // Stream association (subset of W3C init.streams / QUICK-1+2):
+  // which MediaStream(s) this sender's track belongs to, surfaced to the
+  // peer via a=msid. Previously EVERY transceiver hardcoded 'stream0' —
+  // so a session forwarding several participants told the remote that
+  // ALL tracks share one stream, and the browser grouped everyone into a
+  // single MediaStream (one <video> ever renders). Accepts W3C
+  // MediaStream objects (init.streams) or plain ids (init.streamIds —
+  // the Node-stack convenience, no stream object needed server-side).
+  var streamIds = null;
+  if (Array.isArray(init.streamIds) && init.streamIds.length) {
+    streamIds = init.streamIds.map(String);
+  } else if (Array.isArray(init.streams) && init.streams.length) {
+    streamIds = [];
+    for (var sti = 0; sti < init.streams.length; sti++) {
+      var st = init.streams[sti];
+      if (st && st.id) streamIds.push(String(st.id));
+    }
+    if (!streamIds.length) streamIds = null;
   }
 
   var transceiver = {
@@ -177,6 +292,7 @@ function createTransceiver(state, kind, init) {
     direction: init.direction || 'sendrecv',
     currentDirection: null,
     kind: kind,
+    streamIds: streamIds,
   };
 
   state.transceivers.push(transceiver);
@@ -184,7 +300,19 @@ function createTransceiver(state, kind, init) {
     id:     layers[0].ssrc,
     rtxId:  layers[0].rtxSsrc,
     fecId:  layers[0].fecSsrc || null,
-    msid:   'stream0 ' + kind + mid,
+    // WPT harvest: msid must carry the REAL stream id + track id — the
+    // receiver reconstructs shared MediaStreams by these tokens, and
+    // tests compare event.streams[0].id to the sender's stream.id.
+    msid:   ((streamIds && streamIds[0]) || '-') + ' ' + ((init && init.track && init.track.id) || (kind + mid)),
+    // MULTI-STREAM: a sender can belong to several MediaStreams
+    // (addTrack(track, s1, s2)); each needs its own msid token or the
+    // receiver can only ever rebuild one stream. Null for the common
+    // single-stream case so nothing changes there.
+    msids:  (streamIds && streamIds.length > 1)
+      ? streamIds.map(function (sid) {
+          return sid + ' ' + ((init && init.track && init.track.id) || (kind + mid));
+        })
+      : null,
     layers: layers.slice(),
   };
   // Data-plane lookup: media SSRC → its FEC SSRC (media_transport.sendRtp
@@ -207,6 +335,62 @@ function createTransceiver(state, kind, init) {
  * @param {string|number} mid
  * @returns {Object|null}
  */
+/**
+ * Rebind a transceiver to a new mid, moving its send-side state with it.
+ * The ssrc allocation lives in state.localSsrcs keyed BY MID, so a mid
+ * change without this re-key silently orphans the sender (no a=ssrc in
+ * the offer, no RTP on the wire — the field bug of rounds 68-69). Four
+ * call sites need this exact pair, so it lives here once.
+ */
+function rebindMid(state, t, newMid) {
+  var oldMid = String(t.mid);
+  var next = String(newMid);
+  t.mid = next;
+  if (oldMid !== next && state.localSsrcs && state.localSsrcs[oldMid]) {
+    state.localSsrcs[next] = state.localSsrcs[oldMid];
+    delete state.localSsrcs[oldMid];
+  }
+  return t;
+}
+
+
+/**
+ * Is this transceiver stopped? The stopped state lives in its OWN flag,
+ * not in currentDirection: W3C 5.4 says stop() sets direction to
+ * 'stopped' while currentDirection stays null until a negotiation
+ * actually retires the m-section. Encoding it in currentDirection made
+ * the two observable values disagree with the spec and forced every
+ * guard in the codebase to test two fields. One predicate, one truth.
+ */
+function isStopped(t) {
+  if (!t) return false;
+  return !!(t._stopped || t.direction === 'stopped' ||
+            t.currentDirection === 'stopped');
+}
+
+
+/**
+ * JSEP legitimate-owner test — the single source of truth for "may this
+ * transceiver own/steer an m-line?". Association is earned three ways:
+ * created by a remote description, adopted during offer processing, or
+ * bound by the local-offer binding step. A RAW MID MATCH IS NEVER ENOUGH
+ * (birth mids live in an internal namespace and collide with the peer's).
+ * Every selector in the codebase routes through this — cm's association
+ * walk, the answer builder, and the directions committer.
+ */
+function isLegitimateOwner(t) {
+  if (!t) return false;
+  if (process.env.WSRV_LEGACY_ASSOC === '1') return true;   // pre-JSEP escape hatch
+  return !!(t._associated || t._srdCreated || t._adopted);
+}
+
+
+// W3C: implementations cap the simulcast layer count; extra encodings
+// are TRUNCATED (not an error). Three layers matches the common browser
+// ceiling and our SFU's rid handling.
+var MAX_SIMULCAST_ENCODINGS = 3;
+
+
 function findByMid(state, mid) {
   for (var i = 0; i < state.transceivers.length; i++) {
     if (state.transceivers[i].mid === String(mid)) return state.transceivers[i];
@@ -348,7 +532,16 @@ function applyDirectionsFromAnswer(state, parsed, isLocalAnswer) {
     var m = parsed.media[i];
     if (!m || m.type === 'application') continue;
     var t = findByMid(state, m.mid);
+    // THE FIFTH SELECTOR (same disease, last carrier): committing a
+    // negotiated direction onto a transceiver whose only claim is a raw
+    // birth-mid collision is the grab itself — legitimate owners only.
+    if (t && !isLegitimateOwner(t)) t = null;
     if (!t) continue;
+    // A STOPPED transceiver is final: applying a negotiated direction
+    // over it resurrected it (direction came back as recvonly), which
+    // also defeated the retirement sweep — a stopped transceiver could
+    // never be retired and the list grew forever.
+    if (isStopped(t)) continue;
 
     if (m.port === 0) {
       t.currentDirection = 'stopped';
@@ -361,6 +554,17 @@ function applyDirectionsFromAnswer(state, parsed, isLocalAnswer) {
     }
     t.currentDirection = dir;
   }
+  // FIELD DIAG: one line naming exactly what the answer committed —
+  // if the sender is silent, this says whether the direction landed.
+  try {
+    if (typeof console !== 'undefined' &&
+        (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true')) {
+      console.log('[rtp-diag] post-answer table: ' + JSON.stringify(state.transceivers.map(function (x) {
+        return (x.mid == null ? '?' : x.mid) + ':' + (x._associated ? 'A' : 'u') +
+               (x.sender && x.sender.track ? 'T' : '-') + '/' + (x.currentDirection || '-');
+      })));
+    }
+  } catch (eD) {}
 }
 
 
@@ -409,7 +613,7 @@ function checkIfNegotiationIsNeeded(state) {
 
   for (var i = 0; i < state.transceivers.length; i++) {
     var t = state.transceivers[i];
-    if (t.currentDirection === 'stopped') continue;
+    if (isStopped(t)) continue;
     if (t.mid == null) return true;
     if (t.direction !== t.currentDirection) return true;
   }
@@ -434,6 +638,9 @@ export {
 
   // Direction commit
   applyDirectionsFromAnswer,
+  isLegitimateOwner,
+  isStopped,
+  rebindMid,
 
   // Negotiation-needed
   hasApplicationMediaInLocalDescription,
