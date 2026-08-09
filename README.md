@@ -11,7 +11,6 @@
   <a href="https://www.npmjs.com/package/webrtc-server">
     <img src="https://img.shields.io/npm/v/webrtc-server?color=blue" alt="npm">
   </a>
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="status">
   <img src="https://img.shields.io/github/license/colocohen/webrtc-server?color=brightgreen" alt="license">
 </p>
 
