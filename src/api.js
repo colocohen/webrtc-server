@@ -274,21 +274,91 @@ function RTCPeerConnection(config) {
     get: function() { return manager.state.mode; },
   });
 
+  // ── Undelivered-candidate filter (W3C §4.4.1.4) ──
+  //
+  // A candidate belongs in localDescription only once it has been SURFACED
+  // through onicecandidate. Ours are folded into the SDP as soon as they are
+  // gathered, so a read immediately after setLocalDescription showed a
+  // candidate that the application had not been told about yet.
+  //
+  // This is a READ-SIDE view, deliberately. Round 154 tried the write-side
+  // version — holding candidates out of the description until delivery — and
+  // it worked for this test but cost RTCIceTransport 12 subtests to 6 and
+  // iceGatheringState 5 to 4, because internal consumers read the stored
+  // description as the authoritative candidate list. Filtering at the getter
+  // leaves the stored description whole, so those consumers are untouched and
+  // only the public view is corrected.
+  //
+  // It is also self-limiting: the filter only hides candidates in the window
+  // between gathered and delivered. Anything that signals an SDP without
+  // trickle waits for iceGatheringState 'complete' first, by which point every
+  // candidate has been delivered and the filter is a no-op. The WHIP/WHEP
+  // interop property that sank round 154 is preserved.
+  var _deliveredCandidates = Object.create(null);
+  var _deliveredCount = 0;
+
+  function _markCandidateDelivered(payload) {
+    if (!payload || !payload.candidate) return;
+    // Key on the candidate line itself — the same text that appears in the
+    // SDP, minus the "a=candidate:" prefix and any trailing whitespace.
+    var line = String(payload.candidate).replace(/^a=/, '').trim();
+    if (!_deliveredCandidates[line]) {
+      _deliveredCandidates[line] = true;
+      _deliveredCount++;          // invalidates the memo below
+    }
+  }
+
+  // Memoised per (source description object, delivered-ledger version).
+  //
+  // The filtered view MUST be reference-stable: WPT asserts
+  // `pc.pendingLocalDescription === pc.localDescription`, and applications
+  // compare descriptions by identity too. Building a fresh
+  // RTCSessionDescription on every read broke six subtests across
+  // setLocalDescription-offer and -answer before this cache was added.
+  var _filterMemoSrc = null, _filterMemoVer = -1, _filterMemoOut = null;
+
+  function _filterUndelivered(desc) {
+    if (!desc || !desc.sdp) return desc;
+    if (desc.sdp.indexOf('a=candidate:') < 0) return desc;
+    if (_filterMemoSrc === desc && _filterMemoVer === _deliveredCount) {
+      return _filterMemoOut;
+    }
+    var kept = [];
+    var dropped = 0;
+    var lines = desc.sdp.split(/\r\n|\n/);
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (ln.indexOf('a=candidate:') === 0) {
+        var key = ln.slice(2).trim();          // strip "a=" → "candidate:..."
+        if (!_deliveredCandidates[key]) { dropped++; continue; }
+      }
+      kept.push(ln);
+    }
+    var out = dropped
+      ? new RTCSessionDescription({ type: desc.type, sdp: kept.join('\r\n') })
+      : desc;
+    _filterMemoSrc = desc; _filterMemoVer = _deliveredCount; _filterMemoOut = out;
+    return out;
+  }
+
   // SDP descriptions — pending || current (browser-compatible)
   Object.defineProperty(this, 'localDescription', {
-    get: function() { return manager.state.pendingLocalDescription || manager.state.currentLocalDescription; },
+    get: function() {
+      return _filterUndelivered(manager.state.pendingLocalDescription ||
+                                manager.state.currentLocalDescription);
+    },
   });
   Object.defineProperty(this, 'remoteDescription', {
     get: function() { return manager.state.pendingRemoteDescription || manager.state.currentRemoteDescription; },
   });
   Object.defineProperty(this, 'currentLocalDescription', {
-    get: function() { return manager.state.currentLocalDescription; },
+    get: function() { return _filterUndelivered(manager.state.currentLocalDescription); },
   });
   Object.defineProperty(this, 'currentRemoteDescription', {
     get: function() { return manager.state.currentRemoteDescription; },
   });
   Object.defineProperty(this, 'pendingLocalDescription', {
-    get: function() { return manager.state.pendingLocalDescription; },
+    get: function() { return _filterUndelivered(manager.state.pendingLocalDescription); },
   });
   Object.defineProperty(this, 'pendingRemoteDescription', {
     get: function() { return manager.state.pendingRemoteDescription; },
@@ -415,6 +485,10 @@ function RTCPeerConnection(config) {
     setImmediate(function () { _fireIceCandidate(payload); });
   });
   function _fireIceCandidate(payload) {
+    // Stamp the ledger BEFORE the application callback runs, so a handler that
+    // reads pc.localDescription synchronously already sees this candidate.
+    // That ordering is what the spec describes and what WPT checks.
+    _markCandidateDelivered(payload);
     if (!self._handlers.onicecandidate) return;
     // payload is either { candidate: null } (end-of-candidates) or
     // { candidate: '<string>', sdpMid, sdpMLineIndex }. Browser wraps this
@@ -512,11 +586,26 @@ function RTCPeerConnection(config) {
 
   // ── Transceiver wrapper cache ──
 
-  var _tcMap = {};
+  // Keyed by the internal transceiver OBJECT, not by mid.
+  //
+  // mid is not a usable identity. It is null before association, and the
+  // JSEP §5.10 adoption path in connection_manager.js reassigns it outright
+  // (`_rt.mid = m.mid`). Two transceivers can legitimately hold the same mid
+  // for a moment: when addTrack races an in-flight setRemoteDescription of a
+  // sendonly offer, the addTrack transceiver carries a provisional mid while
+  // the sRD-created one is the associated owner of that same mid.
+  //
+  // Keyed by mid, _tcCache then handed BOTH of them the same wrapper, so
+  // getTransceivers() reported two entries that were really one object —
+  // both claiming the same mid, both reporting a track when only one had
+  // one. Object identity is stable for the transceiver's whole lifetime and
+  // has none of these problems.
+  var _tcMap = new Map();
   function _tcCache(internal) {
-    if (_tcMap[internal.mid]) return _tcMap[internal.mid];
+    var existing = _tcMap.get(internal);
+    if (existing) return existing;
     var w = new RTCRtpTransceiver(internal, manager);
-    _tcMap[internal.mid] = w;
+    _tcMap.set(internal, w);
     return w;
   }
 
@@ -869,10 +958,20 @@ function RTCPeerConnection(config) {
         var d = it.currentDirection || it.direction || '';
         var recv = d === 'sendrecv' || d === 'recvonly';
         if ((d === 'sendrecv' || d === 'sendonly') && it.sender) it.sender._everSentDir = true;
-        if (recv && tr.muted === true && it._associated) {
-          tr.muted = false;
-          try { tr.dispatchEvent && tr.dispatchEvent({ type: 'unmute' }); } catch (u1) {}
-        } else if (!recv && tr.muted === false) {
+        // NEGOTIATION ALONE DOES NOT UNMUTE. W3C 5.3: a remote track is muted
+        // while no media is being received, and it is born muted. Being able
+        // to receive is not the same as receiving — the SDP says the peer
+        // MAY send, not that anything has arrived.
+        //
+        // Unmuting here made every receiver track report muted === false the
+        // instant setRemoteDescription resolved, before a single packet
+        // existed. WPT checks the initial state directly ('track is muted
+        // after SRD') and also inside ontrack.
+        //
+        // The unmute now happens where media actually arrives — see the
+        // first-packet path in connection_manager. Muting on a direction that
+        // can no longer receive stays here, because that IS a negotiated fact.
+        if (!recv && tr.muted === false) {
           tr.muted = true;
           try { tr.dispatchEvent && tr.dispatchEvent({ type: 'mute' }); } catch (u2) {}
         }
@@ -1100,17 +1199,34 @@ function RTCPeerConnection(config) {
       internal.streamIds = streams.map(function (s) { return s.id; });
     }
 
-    // Build / fetch the public sender wrapper. Cache by transceiver so
+    // Fetch (or build) the public transceiver wrapper. Cache by transceiver so
     // multiple getSenders() calls return the same object identity.
+    //
+    // ONE TRANSCEIVER, ONE SENDER, FOR ITS WHOLE LIFETIME (W3C §5.4). The
+    // wrapper's constructor builds the sender; addTrack retargets it. It must
+    // NOT build a second one.
+    //
+    // It used to. `_tcCache` constructs RTCRtpTransceiver, whose constructor
+    // constructs an RTCRtpSender, whose constructor calls startPipeline() —
+    // and `internal.sender.track` is already set by both branches above, so
+    // that first pipeline came up live. The line here then built a SECOND
+    // sender over the same transceiver, starting a second pipeline on the
+    // same SSRC. The orphaned first sender kept transmitting: two sequence
+    // counters, one SSRC, interleaved on the wire. SRTP could not decrypt
+    // roughly half of it. See FINDINGS.md.
+    //
+    // The old `if (reused && ...) _stop()` guard cleaned up only the reuse
+    // path, which is why the new-transceiver path leaked a live sender.
     var tcWrapper = _tcCache(internal);
-    // If we reused a transceiver, the cached wrapper already has a sender.
-    // Tear its listeners down cleanly (pli / encodings-updated) before
-    // replacing — otherwise we leak listeners and the stale sender keeps
-    // reacting to events.
-    if (reused && tcWrapper._sender && typeof tcWrapper._sender._stop === 'function') {
-      try { tcWrapper._sender._stop(); } catch (e) {}
+    if (typeof tcWrapper._sender._attachTrack === 'function') {
+      tcWrapper._sender._attachTrack(track);
+    } else {
+      // Defensive: a wrapper built before this hook existed.
+      if (typeof tcWrapper._sender._stop === 'function') {
+        try { tcWrapper._sender._stop(); } catch (e) {}
+      }
+      tcWrapper._sender = new RTCRtpSender(internal, track, manager);
     }
-    tcWrapper._sender = new RTCRtpSender(internal, track, manager);
     // Stash streams for setStreams() / getStreams() — until QUICK-1+2 lands
     // these don't propagate to SDP, but they survive on the sender.
     if (streams.length) tcWrapper._sender._streams = streams.slice();
@@ -1571,6 +1687,27 @@ function RTCPeerConnection(config) {
               break;
             }
           }
+          // remoteSsrcMap is learned from arriving packets, so it is empty
+          // until the first one lands. Falling through with filter === null
+          // returned an EMPTY report for a receiver that plainly exists — the
+          // caller asked about a specific track and was told nothing at all.
+          // An application reads getStats(track) as soon as the track unmutes,
+          // which is inside that window.
+          //
+          // Mark the receiver instead: _buildStatsReport then emits its
+          // zeros-valued inbound-rtp, the same way receiver.getStats() does
+          // (fix 12). Once packets arrive the SSRC branch above takes over.
+          // Always carry the mid alongside. remoteSsrcMap is learned from
+          // arriving packets, but the per-SSRC COUNTERS are populated
+          // separately — so an SSRC can be known while no inbound-rtp entry
+          // exists for it yet. Filtering on that SSRC alone then returned a
+          // report with no inbound-rtp at all, for a receiver the caller had
+          // just asked about by name.
+          //
+          // The mid lets the builder fall back to a zeros entry when the SSRC
+          // produced none, the same way receiver.getStats() does (fix 12).
+          if (!filter) filter = {};
+          filter.receiverMid = tr[i].mid;
           break;
         }
       }
@@ -1612,16 +1749,36 @@ function RTCPeerConnection(config) {
     if (manager.state.closed) return;
     // Stop every active send + receive pipeline (frees encoders, decoders,
     // depacketizers, jitter buffers, and the event subscriptions they hold).
-    for (var mid in _tcMap) {
-      if (!Object.prototype.hasOwnProperty.call(_tcMap, mid)) continue;
-      var wrapper = _tcMap[mid];
+    _tcMap.forEach(function (wrapper, internal) {
       if (wrapper && wrapper._sender && typeof wrapper._sender._stop === 'function') {
         try { wrapper._sender._stop(); } catch (e) {}
       }
       if (wrapper && wrapper._receiver && typeof wrapper._receiver._stop === 'function') {
         try { wrapper._receiver._stop(); } catch (e) {}
       }
-    }
+      // W3C 4.4.1.7 step 4: closing the connection STOPS every transceiver.
+      // Tearing down the pipelines is not the same thing — the application
+      // still holds these objects, and they went on reporting their old
+      // direction ('sendonly') on a connection that no longer exists.
+      //
+      // Same shape as transceiver.stop() (fix 25): direction and
+      // currentDirection both read 'stopped', and the receiver track ends.
+      // Unlike stop(), the ending is immediate — there is no negotiation
+      // left to observe an intermediate state, and close() is where an
+      // application expects everything to be finished.
+      try {
+        if (internal && typeof internal === 'object') {
+          internal.direction        = 'stopped';
+          internal.currentDirection = 'stopped';
+          internal._stopped         = true;
+        }
+        var _cRt = wrapper && wrapper._receiver && wrapper._receiver.track;
+        if (_cRt && _cRt.readyState !== 'ended') {
+          if (typeof _cRt.stop === 'function') _cRt.stop();   // fires 'ended'
+          else _cRt.readyState = 'ended';
+        }
+      } catch (eCl) { /* close() must never throw */ }
+    });
     // DataChannels are closed by manager.close() — each dc transitions to
     // readyState 'closed' and fires its 'close' event. See cm.js close().
     manager.close();
@@ -2488,6 +2645,10 @@ function RTCRtpSender(internal, track, manager) {
         '" but track kind is "' + newTrack.kind + '"'
       ));
     }
+    // Same reason as the direction setter: a remotely created transceiver has
+    // no SSRC until it becomes a sender, and an application may attach the
+    // track before (or instead of) setting direction. Idempotent.
+    RtpManager.ensureSendSsrc(manager.state, internal);
     stopPipeline();
     // self.track is a getter backed by internal.sender.track, so a
     // single assignment updates both views.
@@ -2562,6 +2723,32 @@ function RTCRtpSender(internal, track, manager) {
       manager.ev.off('pli', _pliHandler);
       manager.ev.off('transceiver:encodings-updated', _encodingsUpdatedHandler);
     }
+  };
+
+  // Internal hook: point this sender at a different track, restarting the
+  // send pipeline. Used by addTrack().
+  //
+  // W3C §5.4: a transceiver's sender is fixed for the transceiver's lifetime.
+  // addTrack therefore either reuses an existing transceiver — and must
+  // retarget ITS sender — or creates a new transceiver, which brings its own
+  // sender with it. It must never construct a second sender for a transceiver
+  // that already has one.
+  //
+  // It did, and both senders started a pipeline on the SAME SSRC with
+  // independent sequence counters. The two streams interleaved on the wire,
+  // SRTP's per-SSRC rollover estimate went wrong, and the receiver failed to
+  // decrypt about half of all packets on every connection — rising to ~98%
+  // whenever the two counters happened to start more than 32768 apart. See
+  // FINDINGS.md.
+  //
+  // Same stop/start pair replaceTrack uses, for the same reason: the pipeline
+  // captures the track at construction, so it has to be rebuilt to follow a
+  // new one.
+  this._attachTrack = function (newTrack) {
+    if (internal.sender.track === newTrack && pipeline) return;
+    stopPipeline();
+    internal.sender.track = newTrack;
+    if (newTrack) startPipeline();
   };
 
   impl.getParameters = function() {
@@ -3790,16 +3977,32 @@ impl.getStats = function() {
     // microtask (WPT checks exactly that on senders and receivers, the
     // same rule pc.getStats already follows). Assemble on the next task.
     var _gsSelf = this, _gsArgs = arguments;
+    // Sample "is the transceiver stopped" AT CALL TIME, not when the report is
+    // assembled. Assembly is deferred by a task, and an application may stop
+    // the transceiver in between:
+    //
+    //   const p = receiver.getStats();   // still live here
+    //   transceiver.stop();
+    //   await p;                         // must reflect the live moment
+    //
+    // Reading the flag during assembly made both reports look stopped, so the
+    // first one lost its inbound-rtp. WPT checks exactly this pair.
+    var _stoppedAtCall = internalTransceiver && RtpManager.isStopped(internalTransceiver);
     return new Promise(function (res, rej) {
       setTimeout(function () {
-        try { res(_getStatsNow0.apply(_gsSelf, _gsArgs)); } catch (e) { rej(e); }
+        try { res(_getStatsNow0.call(_gsSelf, _stoppedAtCall)); } catch (e) { rej(e); }
       }, 0);
     });
   };
-  function _getStatsNow0() {
+  function _getStatsNow0(_stoppedAtCall) {
     // WPT: a live receiver ALWAYS reports an inbound-rtp entry (zeros
     // pre-media); a stopped transceiver reports none.
-    var _stopped = internalTransceiver && RtpManager.isStopped(internalTransceiver);
+    // A closed PeerConnection has no live streams either, so it reports no
+    // inbound-rtp — same rule as a stopped transceiver.
+    var _closed = !!(manager && manager.state && manager.state.closed);
+    var _stopped = _closed || ((_stoppedAtCall != null)
+      ? _stoppedAtCall
+      : (internalTransceiver && RtpManager.isStopped(internalTransceiver)));
     var _base = new Map();
     if (!_stopped) {
       var _sid = 'RTCInboundRTPStream_' + (internalTransceiver && internalTransceiver.mid || '0');
@@ -3813,8 +4016,27 @@ impl.getStats = function() {
     // from the transceiver's remote SSRC mapping. If the receiver hasn't been
     // wired to an SSRC yet (track:new hasn't fired), returns an empty report.
     var ssrc = findRemoteSsrc();
+    // Stopped or closed: never surface an inbound-rtp, whatever the full
+    // report would otherwise contain.
+    if (_stopped) return Promise.resolve(_base);
     if (ssrc == null) return Promise.resolve(_base);   // zeros-report pre-media
-    return Promise.resolve(_buildStatsReport(manager, { ssrc: ssrc }));
+
+    // The full report REPLACED the zeros entry, and it only contains an
+    // inbound-rtp once packets have actually arrived. Between "the receiver is
+    // wired to an SSRC" and "the first packet lands" the report therefore had
+    // no inbound-rtp at all — a live receiver reporting nothing about its own
+    // stream. WPT reads receiver.getStats() as soon as the track unmutes,
+    // which is inside exactly that window.
+    //
+    // Merge instead: take the full report, and keep the zeros entry only if it
+    // brought no inbound-rtp of its own.
+    var _full = _buildStatsReport(manager, { ssrc: ssrc });
+    var _hasInbound = false;
+    _full.forEach(function (r) { if (r && r.type === 'inbound-rtp') _hasInbound = true; });
+    if (!_hasInbound) {
+      _base.forEach(function (v, k) { _full.set(k, v); });
+    }
+    return Promise.resolve(_full);
   };
 
   // ─── API-9 extension: per-layer track + encoded-stream access ──────────
@@ -3969,6 +4191,14 @@ function RTCRtpTransceiver(internal, manager) {
       }
       if (dir === internal.direction) return;   // no-op, spec: don't fire
       internal.direction = dir;
+      // A transceiver created by setRemoteDescription is born with no SSRC —
+      // it was receive-only at birth. Turning it into a sender is ordinary
+      // answerer behaviour (remote offers recvonly, we answer by sending), so
+      // allocate one now. Without this the SDP said a=sendonly while carrying
+      // no a=ssrc, and nothing was ever transmitted. Idempotent.
+      if (dir === 'sendrecv' || dir === 'sendonly') {
+        RtpManager.ensureSendSsrc(manager.state, internal);
+      }
       // WPT harvest — muted transitions: the receiver's track mutes when
       // the transceiver stops receiving and unmutes when receiving is
       // (re-)enabled, EVEN before media flows.
@@ -3979,11 +4209,9 @@ function RTCRtpTransceiver(internal, manager) {
           if (willRecv && rTrack.muted) {
             rTrack.muted = false;
             try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'unmute' }); } catch (e1) {}
-            try { typeof rTrack.onunmute === 'function' && rTrack.onunmute({ type: 'unmute' }); } catch (e2) {}
           } else if (!willRecv && !rTrack.muted) {
             rTrack.muted = true;
             try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'mute' }); } catch (e3) {}
-            try { typeof rTrack.onmute === 'function' && rTrack.onmute({ type: 'mute' }); } catch (e4) {}
           }
         }
       } catch (eMut) {}
@@ -4033,6 +4261,46 @@ function RTCRtpTransceiver(internal, manager) {
     // direction: 'stopped'} right after stop()). Internal guards test
     // direction too, so the stopped state is still enforced everywhere.
     internal.direction = 'stopped';
+
+    // W3C 5.4.3.6 step 5: stopping a transceiver ENDS both of its tracks.
+    // The receiver's track will never carry media again, and the sender's is
+    // released back to the application — so both move to readyState 'ended'
+    // and fire 'ended'. Leaving them 'live' meant an application watching for
+    // that event on a stopped transceiver waited forever, and any code
+    // branching on readyState saw a track that looked usable.
+    //
+    // Only the RECEIVER's track is ended by us. The sender's track belongs to
+    // the application — it may have handed the same MediaStreamTrack to
+    // another connection — so we detach it rather than ending it.
+    // ASYNCHRONOUSLY. W3C 5.4.3.6 queues a task to end the track, and the
+    // difference is observable — the track must still read 'live' on the line
+    // right after stop() returns, and only then flip:
+    //
+    //   transceiver.stop();
+    //   assert_equals(track.readyState, 'live');    // still live here
+    //   await trackEnded;
+    //   assert_equals(track.readyState, 'ended');
+    //
+    // Ending it inline made the first assertion fail.
+    try {
+      var _rt = self._receiver && self._receiver.track;
+      if (_rt && _rt.readyState !== 'ended') {
+        setTimeout(function () {
+          try {
+            if (_rt.readyState === 'ended') return;
+            if (typeof _rt.stop === 'function') {
+              // stop() sets readyState AND fires 'ended' — dispatching again
+              // would deliver the event twice (same trap as fix 23).
+              _rt.stop();
+            } else {
+              _rt.readyState = 'ended';
+              try { _rt.dispatchEvent && _rt.dispatchEvent({ type: 'ended' }); } catch (eE1) {}
+            }
+          } catch (eE2) { /* never throw from a queued task */ }
+        }, 0);
+      }
+    } catch (eEnd) { /* stop() must never throw */ }
+
     manager.updateNegotiationNeededFlag();
   };
 
@@ -5538,10 +5806,35 @@ function _inboundRtpEntry(ssrc, stats, mapping, now) {
     fecPacketsReceived:           0,
     fecBytesReceived:             0,
     packetsRepaired:              stats.packetsRepaired || 0,
+    // packetsDiscarded — packets received but dropped before decode (jitter
+    // buffer overflow, arrived too late). Required by the spec for every
+    // inbound stream; we count none today, but the member must exist.
+    packetsDiscarded:             stats.packetsDiscarded || 0,
   };
+  // Audio-only members. Required on audio inbound streams and absent on video,
+  // so they are attached conditionally rather than set to zero everywhere.
+  //   totalAudioEnergy     — cumulative energy of received samples (0..1 scale)
+  //   totalSamplesDuration — seconds of audio received
+  // Both accumulate from the audio-level extension where present; zero until
+  // then, which is a valid reading, not a missing one.
+  if (kind === 'audio') {
+    entry.totalAudioEnergy     = stats.totalAudioEnergy     || 0;
+    entry.totalSamplesDuration = stats.totalSamplesDuration || 0;
+    entry.totalSamplesReceived = stats.totalSamplesReceived || 0;
+    entry.audioLevel           = stats.audioLevel           || 0;
+    entry.concealedSamples     = stats.concealedSamples     || 0;
+    entry.silentConcealedSamples = stats.silentConcealedSamples || 0;
+    entry.concealmentEvents    = stats.concealmentEvents    || 0;
+    entry.insertedSamplesForDeceleration = stats.insertedSamplesForDeceleration || 0;
+    entry.removedSamplesForAcceleration  = stats.removedSamplesForAcceleration  || 0;
+  }
   if (mapping && mapping.transceiver && mapping.transceiver.receiver
       && mapping.transceiver.receiver.track) {
-    entry.trackIdentifier = mapping.transceiver.receiver.track.id || undefined;
+    // Assign only when there is a value — an explicit undefined would make
+    // `'trackIdentifier' in entry` true while reading it gives undefined. See
+    // fix 11.
+    var _tid = mapping.transceiver.receiver.track.id;
+    if (_tid) entry.trackIdentifier = _tid;
   }
   return entry;
 }
@@ -5578,16 +5871,21 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
     }
   }
 
-  return {
+  // mid and mediaSourceId are attached below only when we actually have them.
+  // A WebIDL dictionary omits absent members rather than setting them to
+  // undefined, and the difference is observable: `'mid' in stat` is true for a
+  // key explicitly set to undefined, so a consumer that checks presence then
+  // reads the value gets undefined from a field it was told exists. WPT
+  // asserts that pair inside its umbrella "Validating stats" test, which 19
+  // other subtests key off — one stray undefined failed all of them.
+  var _out = {
     id:              _idOutbound(ssrc),
     type:            'outbound-rtp',
     timestamp:       now,
     kind:            kind,
     ssrc:            ssrc,
-    mid:             transceiver ? transceiver.mid : undefined,
     transportId:     TRANSPORT_ID,
     codecId:         _idCodec(stats.payloadType || 0, 'out'),
-    mediaSourceId:   mediaSourceId,
     // Core counters — REQUIRED by spec
     packetsSent:     stats.packets || 0,
     bytesSent:       stats.bytes   || 0,
@@ -5614,6 +5912,30 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
     qualityLimitationResolutionChanges: 0,
     active:          true,
   };
+  if (transceiver && transceiver.mid != null) _out.mid = transceiver.mid;
+  if (mediaSourceId != null) _out.mediaSourceId = mediaSourceId;
+  // encodingIndex — this stream's position in sender.getParameters().encodings.
+  // 0 for a singlecast sender; for simulcast it identifies which layer the
+  // entry describes, which is the only way a consumer can line an outbound-rtp
+  // up with the encoding it configured.
+  //
+  // VIDEO ONLY. encodings are a simulcast concept and audio has none, so an
+  // audio outbound-rtp must not carry the member at all — WPT asserts it is
+  // undefined there. A first version set it unconditionally and reported 0 on
+  // audio streams.
+  try {
+    var _lys = (kind === 'video') && transceiver && transceiver.sender &&
+               transceiver.sender.layers;
+    if (_lys && _lys.length) {
+      for (var _ei = 0; _ei < _lys.length; _ei++) {
+        if (_lys[_ei] && _lys[_ei].ssrc === ssrc) { _out.encodingIndex = _ei; break; }
+      }
+    } else if (kind === 'video' && transceiver && transceiver.sender &&
+               transceiver.sender.ssrc === ssrc) {
+      _out.encodingIndex = 0;
+    }
+  } catch (eE) { /* stats must never throw */ }
+  return _out;
 }
 
 function _remoteInboundRtpEntry(ssrc, rs, outboundId, kind, now) {
@@ -5626,7 +5948,14 @@ function _remoteInboundRtpEntry(ssrc, rs, outboundId, kind, now) {
     transportId:   TRANSPORT_ID,
     localId:       outboundId,                                // links back to our outbound-rtp
     // Values REPORTED BY remote about packets we sent them:
-    packetsReceived: undefined,                                // not in RR
+    // WebIDL dictionaries OMIT absent members; they never carry an explicit
+    // `undefined`. The distinction is observable: `'x' in stat` is true for a
+    // key set to undefined, so a consumer that checks presence and then reads
+    // the value gets undefined from a field it was told exists. WPT asserts
+    // exactly that pair, and one such field failed the umbrella "Validating
+    // stats" test, which in turn is what 19 dependent subtests key off — so a
+    // single stray undefined cost the whole file.
+    // packetsReceived is not carried in a Receiver Report, so it is omitted.
     packetsLost:   rs.totalLost || 0,
     jitter:        (rs.jitter       || 0) / 90000,
     fractionLost:  (rs.fractionLost || 0) / 256,              // 0..1
@@ -5671,6 +6000,36 @@ function _remoteOutboundRtpEntry(ssrc, ro, inboundId, kind, now) {
 
 /* ── Codec helper ──────────────────────────────────────────────────── */
 
+// Find the fmtp line negotiated for a payload type, across every transceiver's
+// negotiated codec set. Returns null when the codec carries no fmtp.
+var _fmtpStatsManager = null;
+function _negotiatedFmtpLine(pt) {
+  var mgr = _fmtpStatsManager;
+  if (!mgr || !mgr.state || !mgr.state.transceivers) return null;
+  var tcs = mgr.state.transceivers;
+  for (var i = 0; i < tcs.length; i++) {
+    var lists = [
+      tcs[i]._negotiatedCodecs,
+      tcs[i].sender && tcs[i].sender._negotiatedCodecs,
+    ];
+    for (var l = 0; l < lists.length; l++) {
+      var list = lists[l];
+      if (!list) continue;
+      for (var c = 0; c < list.length; c++) {
+        if (list[c] && list[c].payloadType === pt) {
+          if (list[c].sdpFmtpLine) return list[c].sdpFmtpLine;
+          if (list[c].fmtp && SDP.buildFmtpConfig) {
+            var line = SDP.buildFmtpConfig(list[c].fmtp);
+            if (line) return line;
+          }
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function _codecEntry(pt, kind, direction, now) {
   // Map PT → mimeType + clockRate based on common WebRTC assignments.
   // This is a best-effort — real codec params come from SDP fmtp lines.
@@ -5696,6 +6055,15 @@ function _codecEntry(pt, kind, direction, now) {
     clockRate:   info.clockRate,
   };
   if (info.channels) entry.channels = info.channels;
+  // sdpFmtpLine — the fmtp parameters actually negotiated for this PT. The
+  // table above is a static PT→name map and carries none, so opus reported no
+  // sdpFmtpLine even when the SDP said "minptime=10;useinbandfec=1". Read it
+  // back from the negotiated codec list instead, which is the authoritative
+  // source. Omitted (not undefined) when the codec has no fmtp — see fix 11.
+  try {
+    var _fmtpLine = _negotiatedFmtpLine(pt);
+    if (_fmtpLine) entry.sdpFmtpLine = _fmtpLine;
+  } catch (eF) { /* stats must never throw */ }
   return entry;
 }
 
@@ -5954,7 +6322,9 @@ function _candidatePairEntry(snapshot, snap, now) {
     availableOutgoingBitrate: snap.estimatedBandwidthBps || undefined,
     // We don't currently estimate incoming bitrate — would require us to
     // be the one sending transport-cc back to the remote.
-    availableIncomingBitrate: undefined,
+    // availableIncomingBitrate omitted — see the note on packetsReceived in
+    // _remoteInboundEntry: an absent dictionary member is left out, not set
+    // to undefined.
   };
 }
 
@@ -6109,7 +6479,13 @@ function _certificateEntry(fp, isLocal, now, pem) {
  *   { ssrcs: [...] }   → multi-SSRC filter (simulcast sender — include all layers)
  *   null / omitted     → include everything
  */
+var _pendingReceiverMid = null;
 function _buildStatsReport(manager, filter) {
+  // _codecEntry needs the negotiated codec sets to fill sdpFmtpLine, and it is
+  // called from several places that do not carry the manager. Park it here for
+  // the duration of the build.
+  _fmtpStatsManager = manager;
+  _pendingReceiverMid = null;
   var report   = new Map();
   var now      = Date.now();
   var snap     = manager.getCurrentStats();
@@ -6126,6 +6502,13 @@ function _buildStatsReport(manager, filter) {
     } else if (filter.ssrc != null) {
       filterSet = {};
       filterSet[filter.ssrc] = true;
+    }
+    if (filter.receiverMid != null) {
+      // Receiver selector: remember the mid so a zeros inbound-rtp can be
+      // emitted if the SSRC-driven pass produces none. See the note at the
+      // selector resolution site.
+      if (!filterSet) filterSet = {};
+      _pendingReceiverMid = filter.receiverMid;
     }
   }
   // All filtering now goes through filterSet — see above.
@@ -6209,6 +6592,76 @@ function _buildStatsReport(manager, filter) {
     report.set(playoutAudio.id, playoutAudio);
   }
 
+  // Receiver selector with no SSRC yet: emit its zeros inbound-rtp so the
+  // caller gets an answer about the track it asked about. See the selector
+  // resolution site in impl.getStats.
+  if (_pendingReceiverMid != null) {
+    var _haveInbound = false;
+    report.forEach(function (r) { if (r && r.type === 'inbound-rtp') _haveInbound = true; });
+    if (_haveInbound) _pendingReceiverMid = null;
+  }
+  if (_pendingReceiverMid != null) {
+    var _rmid = _pendingReceiverMid;
+    var _rtcs = (snapshot && snapshot.transceivers) || [];
+    for (var _rj = 0; _rj < _rtcs.length; _rj++) {
+      if (String(_rtcs[_rj].mid) !== String(_rmid)) continue;
+      var _rid2 = 'RTCInboundRTPStream_' + _rmid;
+      report.set(_rid2, {
+        id: _rid2, type: 'inbound-rtp', timestamp: now,
+        kind: _rtcs[_rj].kind || 'audio',
+        ssrc: 0, packetsReceived: 0, bytesReceived: 0, packetsLost: 0, jitter: 0,
+        transportId: TRANSPORT_ID,
+      });
+      break;
+    }
+  }
+
+  // Every sender that has been given an SSRC reports an outbound-rtp entry,
+  // even before it has sent a packet — a transceiver created with a null track
+  // still has a stream, it is simply idle. snap.outbound is populated by the
+  // send path, so without this a sender that has never transmitted produced no
+  // entry at all and pc.getStats()/sender.getStats() looked empty.
+  //
+  // Mirrors what the receive side already does (see _getStatsNow0 in
+  // RTCRtpReceiver): a live stream always reports, with zeros.
+  //
+  // Simulcast layers each carry their own SSRC and each get their own entry.
+  try {
+    var _tcs = (snapshot && snapshot.transceivers) || [];
+    for (var _ti = 0; _ti < _tcs.length; _ti++) {
+      var _sndr = _tcs[_ti].sender;
+      if (!_sndr) continue;
+      if (RtpManager.isStopped(_tcs[_ti])) continue;
+      // Only a NEGOTIATED sending direction has a stream. Before the answer
+      // lands, currentDirection is null — the transceiver exists but nothing
+      // is being sent, and the spec says there is no outbound-rtp yet:
+      //
+      //   addTransceiver('video')      → no outbound-rtp
+      //   setLocalDescription()        → still none (have-local-offer)
+      //   answer applied, sendrecv     → now it exists
+      //
+      // Seeding on existence alone made the entry appear one negotiation step
+      // too early.
+      var _cd = _tcs[_ti].currentDirection;
+      if (_cd !== 'sendrecv' && _cd !== 'sendonly') continue;
+      var _lys = (_sndr.layers && _sndr.layers.length)
+        ? _sndr.layers
+        : (_sndr.ssrc != null ? [{ ssrc: _sndr.ssrc }] : []);
+      for (var _li = 0; _li < _lys.length; _li++) {
+        var _ls = _lys[_li] && _lys[_li].ssrc;
+        if (_ls == null) continue;
+        if (!snap.outbound[_ls]) {
+          snap.outbound[_ls] = {
+            packets: 0, bytes: 0,
+            payloadType: (_sndr._negotiatedCodecs && _sndr._negotiatedCodecs[0] &&
+                          _sndr._negotiatedCodecs[0].payloadType) || 0,
+            firstPacketAt: 0, lastPacketAt: 0,
+          };
+        }
+      }
+    }
+  } catch (eOut) { /* stats must never throw */ }
+
   // outbound-rtp + remote-inbound-rtp entries
   var outboundSsrcs = Object.keys(snap.outbound);
   for (var j = 0; j < outboundSsrcs.length; j++) {
@@ -6223,7 +6676,12 @@ function _buildStatsReport(manager, filter) {
     var tcLayer = null;
     for (var t = 0; t < snapshot.transceivers.length; t++) {
       var sndr = snapshot.transceivers[t].sender;
-      if (sndr.ssrc === outSsrc) { tc = snapshot.transceivers[t]; break; }
+      // Search layers FIRST. sender.ssrc mirrors layers[0].ssrc, so matching
+      // on it before scanning layers found the transceiver but left tcLayer
+      // null for the first simulcast layer — and outbound-rtp.rid is set from
+      // tcLayer. The lowest layer therefore reported no rid while its
+      // siblings did, which makes a simulcast sender's stats unreadable
+      // exactly where a consumer needs to tell the layers apart.
       if (sndr.layers && sndr.layers.length) {
         for (var ly = 0; ly < sndr.layers.length; ly++) {
           if (sndr.layers[ly].ssrc === outSsrc) {
@@ -6234,6 +6692,7 @@ function _buildStatsReport(manager, filter) {
         }
         if (tc) break;
       }
+      if (sndr.ssrc === outSsrc) { tc = snapshot.transceivers[t]; break; }
     }
     var oStats = snap.outbound[outSsrc];
     var oEntry = _outboundRtpEntry(outSsrc, oStats, tc, now);

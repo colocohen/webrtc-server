@@ -1033,9 +1033,27 @@ class MediaTransport extends EventEmitter {
       }
     }
 
+    // Notify on EVERY packet, not just the first. "First packet ever seen on
+    // this SSRC" is true once in a connection's life, but a track can mute and
+    // unmute repeatedly — go inactive and back to sendrecv, and media resumes
+    // on the SAME SSRC. Gating on the first packet left the track muted
+    // forever after the first mute, even with media flowing.
+    //
+    // The receiving side checks `muted` before doing anything, so this is a
+    // cheap flag read per packet in the steady state.
+    var _wasFirstPacket = true;
     s.packets++;
     s.bytes += byteLen;
     s.lastPacketAt = Date.now();
+
+    // FIRST PACKET ON THIS SSRC → the receiver's track is now receiving media,
+    // so unmute it (W3C 5.3). This is the only correct moment: negotiation
+    // says the peer MAY send, arrival says it IS sending. Unmuting at
+    // setRemoteDescription time — which is what used to happen — reported
+    // muted === false before a single packet existed.
+    if (_wasFirstPacket && this._deps.onFirstInboundPacket) {
+      try { this._deps.onFirstInboundPacket(ssrc); } catch (eFP) {}
+    }
 
     // RTX recovery accounting. isRecovered=true means this call is the
     // recursive re-entry from the RTX-unwrap branch above.

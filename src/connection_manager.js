@@ -127,6 +127,8 @@ var DEPACKETIZERS = {
 
 /* ========================= ConnectionManager ========================= */
 
+var MEDIA_STALL_MUTE_MS = parseInt(process.env.WEBRTC_MEDIA_STALL_MS || '3000', 10);
+
 function ConnectionManager(config) {
   try {
     if (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true') {
@@ -651,6 +653,42 @@ function ConnectionManager(config) {
   // BWE feedback dispatch. Most data-plane state still lives in shared state;
   // a future milestone moves it into the class.
   var mediaTransport = new MediaTransport({
+    // Media arriving on an SSRC unmutes the matching receiver track (W3C 5.3).
+    //
+    // TWO SOURCES OF TRUTH, AND THEIR ORDER MATTERS. `muted` is written both
+    // by negotiation (the direction the answer agreed on) and by the data
+    // plane (media is or is not arriving). They are not peers:
+    //
+    //   negotiated direction — a FACT. The peer has agreed not to send.
+    //   arriving media       — an OBSERVATION. Packets already in flight,
+    //                          or a sender that has not stopped yet.
+    //
+    // The fact wins. Without that ordering the two raced: setting direction
+    // to 'inactive' fired 'mute', a packet still on the wire arrived a
+    // moment later and fired 'unmute', and the track ended up unmuted on a
+    // transceiver that had been negotiated to receive nothing.
+    //
+    // So this only ever unmutes a transceiver whose negotiated direction
+    // still permits receiving. Direction changes drive muting on their own
+    // (see the signalingstatechange handler in api.js); this path exists to
+    // report that media has actually started, which negotiation cannot know.
+    onFirstInboundPacket: function (ssrc) {
+      var mapping = state.remoteSsrcMap && state.remoteSsrcMap[ssrc];
+      if (!mapping || mapping.isRtx) return;
+      for (var i = 0; i < state.transceivers.length; i++) {
+        var tc = state.transceivers[i];
+        if (String(tc.mid) !== String(mapping.mid)) continue;
+        // Negotiated to receive? currentDirection is the committed answer;
+        // before the first answer lands it is null and direction stands in.
+        var _dir = tc.currentDirection || tc.direction || 'sendrecv';
+        if (_dir !== 'sendrecv' && _dir !== 'recvonly') return;
+        var tr = tc.receiver && tc.receiver.track;
+        if (!tr || tr.muted !== true) return;
+        tr.muted = false;
+        try { tr.dispatchEvent && tr.dispatchEvent({ type: 'unmute' }); } catch (e1) {}
+        return;
+      }
+    },
     getClosed:    function () { return state.closed; },
     sharedState:  state,
     getIceAgent:  function () { return iceAgent; },
@@ -958,12 +996,56 @@ function ConnectionManager(config) {
           e.error.code >= 300 && e.error.code <= 699) {
         _code = e.error.code;   // genuine STUN/TURN error response
       }
+      // W3C 4.8.2 scopes this event to failures gathering FROM A STUN OR TURN
+      // SERVER, and makes `url` a required field naming that server. Our ICE
+      // agent also reports purely local gather failures — mDNS resolution,
+      // and NAT port-mapping ("no gateway answered PCP, NAT-PMP or UPnP-IGD").
+      // Those have no server to name, so surfacing them here produced an
+      // event with an empty url that does not describe anything the spec
+      // defines, and it arrived FIRST — an application inspecting the first
+      // error it receives saw a blank one instead of the server that failed.
+      //
+      // Local failures are still visible through iceGatheringState and the
+      // absence of the corresponding candidate type; they are simply not this
+      // event.
+      if (!e.server) return;
+
       ev.emit('icecandidateerror', {
-        url:       e.server || null,
+        // W3C 4.8.2: url is a DOMString, NOT nullable — an application is
+        // entitled to call event.url.includes(...) unconditionally, and WPT
+        // does exactly that. Emitting null threw inside the app's handler on
+        // every gather error, and since a failing server retries, the throw
+        // repeated indefinitely: one run produced 1299 exceptions and starved
+        // the encoder into 259 ffmpeg restarts before the file timed out.
+        // Fall back to the empty string the event class already defaults to.
+        url:       e.server || '',
         errorText: (e.error && (e.error.message || String(e.error))) || 'gather failed',
         errorCode: _code,
-        address:   e.address || null,
-        port:      null,
+        // W3C 4.8.2 ties address and port together: port 0 means "no host
+        // candidate address is available", and address MUST be null then.
+        // We always sent port: null, and null == 0 is false in JavaScript,
+        // so an application following the spec took the "address is present"
+        // branch and dereferenced null. WPT does exactly that, and because a
+        // failing ICE server keeps retrying, the throw repeated until the
+        // file timed out — 1299 exceptions in one run, which also starved
+        // the audio encoder into 259 ffmpeg restarts.
+        //
+        // Report the pair consistently: an address with its port when we
+        // have one, and 0/null when we do not.
+        // The agent reports the LOCAL address it gathered from as `base` on
+        // server-error paths (srflx/relay) and as `address` on local ones
+        // (mDNS). Either is the "local address used" the event describes.
+        // W3C 4.8.2 makes address and port a PAIR: port 0 means no local
+        // address is available, and address MUST be null in that case. So we
+        // report both or neither — reporting an address with port 0 is a
+        // contradiction a spec-following application will assert on, and WPT
+        // does exactly that.
+        //
+        // The agent gives the local address as `base` on server-error paths
+        // (srflx/relay) and as `address` on local ones (mDNS). Only the
+        // server paths carry a port, so only they report a pair.
+        address:   e.port != null ? (e.base || e.address || null) : null,
+        port:      e.port != null ? e.port : 0,
       });
     });
 
@@ -1358,7 +1440,18 @@ function ConnectionManager(config) {
             var ut = state.transceivers[ui];
             if (ut._associated) continue;
             if (ut.kind !== bm.type) continue;
-            if (RtpManager.isStopped(ut)) continue;
+            // FULLY stopped only. A transceiver that is merely STOPPING still
+            // has a live m-section in this very offer — stop() marks
+            // [[Stopping]], and [[Stopped]] only arrives once a negotiation
+            // retires the section (W3C 5.4). Skipping those here left them
+            // permanently unassociated, so isLegitimateOwner stayed false and
+            // every later step that gates on it silently passed them over:
+            // the negotiated direction was never recorded and currentDirection
+            // stayed null on a transceiver that was still carrying media.
+            //
+            // The window is real and ordinary — `stop()` called after
+            // createOffer but before setLocalDescription lands exactly here.
+            if (RtpManager.isFullyStopped(ut)) continue;
             // RE-KEY the send-side state (the mid-3 no-RTP bug): ssrc
             // allocation lives in state.localSsrcs keyed by the BIRTH
             // mid — rebinding the transceiver's mid without re-keying
@@ -1976,6 +2069,49 @@ function ConnectionManager(config) {
     }, 5000);
     if (state._dtlsReconcileTimer.unref) state._dtlsReconcileTimer.unref();
 
+    // MEDIA STOPPING RE-MUTES THE TRACK (W3C 5.3). Fix 23 gave the data plane
+    // authority to report that media has STARTED; this is the other half —
+    // reporting that it has STOPPED.
+    //
+    // The negotiated direction cannot cover it. A peer that calls
+    // transceiver.stop() or pc.close() stops sending immediately and may never
+    // renegotiate, so as far as our SDP is concerned nothing changed. Without
+    // this the receiver's track reported muted === false forever on a
+    // connection that had gone silent minutes earlier, and no 'mute' event
+    // ever fired.
+    //
+    // Ordering is the same as fix 23: negotiation outranks observation, so a
+    // transceiver negotiated NOT to receive is already muted by that path and
+    // is left alone here.
+    state._mediaStallTimer = setInterval(function () {
+      if (state.closed) return;
+      var now = Date.now();
+      for (var i = 0; i < state.transceivers.length; i++) {
+        var tc = state.transceivers[i];
+        var tr = tc.receiver && tc.receiver.track;
+        if (!tr || tr.muted === true) continue;
+        var _dir = tc.currentDirection || tc.direction || '';
+        if (_dir !== 'sendrecv' && _dir !== 'recvonly') continue;   // negotiation owns it
+        // When did this transceiver last see a packet? Scan its remote SSRCs.
+        var last = 0;
+        for (var k in state.remoteSsrcMap) {
+          if (!Object.prototype.hasOwnProperty.call(state.remoteSsrcMap, k)) continue;
+          var mp = state.remoteSsrcMap[k];
+          if (!mp || mp.isRtx || String(mp.mid) !== String(tc.mid)) continue;
+          var st = state.rtpStats && state.rtpStats[k];
+          if (st && st.lastPacketAt > last) last = st.lastPacketAt;
+        }
+        // Never received anything: the track is still in its born-muted state
+        // or was unmuted by something else — either way there is no flow to
+        // have stopped, so leave it.
+        if (!last) continue;
+        if (now - last < MEDIA_STALL_MUTE_MS) continue;
+        tr.muted = true;
+        try { tr.dispatchEvent && tr.dispatchEvent({ type: 'mute' }); } catch (eMs) {}
+      }
+    }, 1000);
+    if (state._mediaStallTimer.unref) state._mediaStallTimer.unref();
+
     state._dtlsWatchdog = setTimeout(function () {
       state._dtlsWatchdog = null;
       if (state.closed || state.dtlsState !== 'connecting') return;
@@ -2276,6 +2412,42 @@ function ConnectionManager(config) {
       if (m.type !== 'audio' && m.type !== 'video') continue;
 
       var existing = findTransceiverByMid(m.mid);
+
+      // A REMOTE OFFER THAT REJECTS AN EXISTING SECTION STOPS IT NOW.
+      //
+      // W3C 5.4: a transceiver the peer has stopped goes DIRECTLY to
+      // [[Stopped]] — there is no [[Stopping]] step on this side, because
+      // nothing is left to negotiate; the peer has already decided. So its
+      // direction and currentDirection must read 'stopped' as soon as the
+      // offer is applied, before we answer:
+      //
+      //   await pc2.setRemoteDescription(offerWithRejectedSection);
+      //   assert_equals(tc.direction, 'stopped');          // here already
+      //   assert_equals(tc.currentDirection, 'stopped');
+      //
+      // We left it reporting its previous direction ('recvonly') until the
+      // local answer was applied, so an application inspecting the
+      // transceiver between the two steps saw a live one that was in fact
+      // finished. The retirement sweep already removed it correctly at the
+      // answer; only the state during negotiation was wrong.
+      //
+      // The track ends with it, on a task, for the same reason as fix 25.
+      if (_rejectedSection && existing) {
+        existing.direction        = 'stopped';
+        existing.currentDirection = 'stopped';
+        existing._stopped         = true;
+        var _rjTrack = existing.receiver && existing.receiver.track;
+        if (_rjTrack && _rjTrack.readyState !== 'ended') {
+          setTimeout(function () {
+            try {
+              if (_rjTrack.readyState === 'ended') return;
+              if (typeof _rjTrack.stop === 'function') _rjTrack.stop();
+              else _rjTrack.readyState = 'ended';
+            } catch (eRj) {}
+          }, 0);
+        }
+        continue;
+      }
       if (!existing) {
         // JSEP offer-processing reuse (the true adoption site — the
         // legacy loop below sits in a branch this path never reaches):
@@ -2366,7 +2538,10 @@ function ConnectionManager(config) {
             }
             if (_upAll.indexOf(_us) === -1) _upAll.push(_us);
           }
-          try { existing.receiver.track.muted = false; } catch (eM) {}
+          // Do NOT unmute here. Announcing a track in SDP is not receiving
+          // media on it — W3C 5.3 keeps a remote track muted until media
+          // actually arrives. The unmute lives on the first-packet path
+          // (see _unmuteReceiverForSsrc).
           ev.emit('track:new', {
             mid: m.mid, kind: m.type,
             transceiver: existing,               // the handler REQUIRES this
@@ -2482,7 +2657,43 @@ function ConnectionManager(config) {
         }
       }
 
-      if (existing && existing.receiver.track) continue;
+      // A transceiver that already has a receiver track needs no NEW track —
+      // but it still needs to know whether the peer is still sending.
+      //
+      // This guard used to skip the whole remainder of the loop, so a
+      // renegotiation that turned the section recvonly (the peer called
+      // sender.removeTrack) was never processed on the receiving side at all.
+      // W3C 5.1 requires the track to leave every stream it was announced in,
+      // each firing 'removetrack', and to be muted, firing 'mute' — all while
+      // the description is being applied, so the application observes them
+      // BEFORE setRemoteDescription resolves.
+      //
+      // Handle that here, then skip as before.
+      if (existing && existing.receiver.track) {
+        var _stillSends = (m.direction === 'sendrecv' || m.direction === 'sendonly');
+        if (!_stillSends && m.port !== 0) {
+          var _rmTrack = existing.receiver.track;
+          var _rms = state._remoteStreams || {};
+          for (var _rmk in _rms) {
+            if (!Object.prototype.hasOwnProperty.call(_rms, _rmk)) continue;
+            var _rmStream = _rms[_rmk];
+            if (!_rmStream || typeof _rmStream.removeTrack !== 'function') continue;
+            var _rmHas = _rmStream.getTracks && _rmStream.getTracks().some(function (x) {
+              return x === _rmTrack || (x && x.id === _rmTrack.id);
+            });
+            if (!_rmHas) continue;
+            // removeTrack fires 'removetrack' itself — fix 23 on not
+            // dispatching a second time.
+            try { _rmStream.removeTrack(_rmTrack); } catch (eRm) {}
+          }
+          if (_rmTrack.muted !== true) {
+            _rmTrack.muted = true;
+            try { _rmTrack.dispatchEvent && _rmTrack.dispatchEvent({ type: 'mute' }); } catch (eMu) {}
+          }
+          existing._trackSurfaced = false;
+        }
+        continue;
+      }
 
       // Only wire up a receiver / fire ontrack when the peer actually intends
       // to send media on this m-section. That requires BOTH:
@@ -2640,6 +2851,88 @@ function ConnectionManager(config) {
             remoteExtensions: m.extensions,
             remoteSimulcast:  _remoteSimulcast,
           });
+
+          // ANNOUNCE THE TRACK. This branch handles m-sections with no
+          // a=ssrc lines, and it built the receiver track without ever
+          // emitting track:new — so ontrack never fired and an application
+          // had no way to learn the track existed.
+          //
+          // a=ssrc is not required. Chrome omits it for simulcast (layer
+          // SSRCs are learned from the rid header extension on the first
+          // packet), and any offer that describes a receiving m-section
+          // without naming SSRCs lands here. The track is real either way;
+          // only the SSRC mapping has to wait for media.
+          //
+          // Streams come from the m-section's msid. 'a=msid:-' means "no
+          // stream", which is why an absent or '-' id yields none.
+          if (peerSends && _birthTrack) {
+            try {
+              var _nsTc = state.transceivers[state.transceivers.length - 1];
+              var _nsStreams = [];
+              // W3C 5.1 / JSEP resolve the stream ids in a fixed order:
+              //
+              //   1. media-level a=msid          — authoritative when present
+              //   2. source-level a=ssrc:N msid  — the legacy form, used only
+              //                                    when there is no media-level one
+              //   3. neither                     — the track still belongs to a
+              //                                    stream; the receiver invents one
+              //
+              // Only rule 1 was implemented. An offer carrying just
+              // `a=ssrc:3 msid:1 2` produced no streams, and one with no msid
+              // at all produced none either — in both cases ontrack fired with
+              // an empty streams array where the spec requires exactly one.
+              var _nsIds = (m.msids && m.msids.length)
+                ? m.msids
+                : (m.msid ? [m.msid] : []);
+              if (!_nsIds.length && m.ssrcs && m.ssrcs.length) {
+                for (var _nsS = 0; _nsS < m.ssrcs.length; _nsS++) {
+                  var _nsMs = m.ssrcs[_nsS] && m.ssrcs[_nsS].msid;
+                  if (_nsMs && _nsIds.indexOf(_nsMs) === -1) _nsIds.push(_nsMs);
+                }
+              }
+              // No msid anywhere: the track is still in a stream. Synthesise a
+              // stable id so repeated applies of the same description reuse
+              // the same MediaStream object rather than making a new one.
+              if (!_nsIds.length) {
+                _nsIds = ['msid-less-' + m.mid + ' ' + m.type];
+              }
+              for (var _nsI = 0; _nsI < _nsIds.length; _nsI++) {
+                var _nsSid = String(_nsIds[_nsI]).split(' ')[0];
+                if (!_nsSid || _nsSid === '-') continue;
+                // _remoteStreams is lazily created by the ssrc path; this
+                // branch can run first, so make sure it exists.
+                state._remoteStreams = state._remoteStreams || {};
+                var _nsSt = state._remoteStreams[_nsSid];
+                if (!_nsSt) {
+                  _nsSt = new MediaStream();
+                  try {
+                    Object.defineProperty(_nsSt, 'id', { value: _nsSid, configurable: true });
+                  } catch (eNs1) {}
+                  state._remoteStreams[_nsSid] = _nsSt;
+                }
+                if (_nsSt.getTracks().indexOf(_birthTrack) === -1) _nsSt.addTrack(_birthTrack);
+                if (_nsStreams.indexOf(_nsSt) === -1) _nsStreams.push(_nsSt);
+              }
+              // Through the SAME hold-aware queue the ssrc path uses. Track
+              // events must follow signalingstatechange (W3C 4.4.1.6), so
+              // while that event is held they buffer and flush right after
+              // it. Emitting directly delivered this one BEFORE the state
+              // event, and an application whose ontrack is installed during
+              // setRemoteDescription never saw it.
+              var _nsPayload = {
+                mid: m.mid, kind: m.type,
+                transceiver: _nsTc,
+                track: _birthTrack,
+                stream: _nsStreams[0] || null,
+                streamsAnnounced: _nsStreams.length ? _nsStreams : null,
+              };
+              if (state._holdSignalingEvent) {
+                (state._pendingTrackEvents = state._pendingTrackEvents || []).push(_nsPayload);
+              } else {
+                ev.emit('track:new', _nsPayload);
+              }
+            } catch (eNs) { /* announcing must never break the apply */ }
+          }
         } else {
           // Refresh on renegotiation — peer may have dropped/reordered codecs.
           if (existing.sender) existing.sender._negotiatedCodecs = _senderCodecs;
@@ -2820,12 +3113,24 @@ function ConnectionManager(config) {
           // WPT/browser parity: remote tracks are labeled 'remote <kind>'
           label: 'remote ' + m.type,
         });
-      // media has (or is about to) arrive on this track
-      try { track.muted = false; } catch (eUm) {}
+      // Born muted; unmuted on the first arriving packet (see
+      // _unmuteReceiverForSsrc). 'about to arrive' is not 'arrived'.
+      try { track.muted = true; } catch (eUm) {}
       // WPT harvest: tracks sharing a remote msid must surface in the
       // SAME MediaStream object (ontrack ordering tests compare object
       // identity), and the stream's id must equal the remote msid token.
-      var msidSid = m.msid ? String(m.msid).split(' ')[0] : null;
+      // Resolve the stream id in the order W3C 5.1 / JSEP define: media-level
+      // a=msid first, then source-level a=ssrc:N msid. Reading only the
+      // media-level form meant an offer carrying just `a=ssrc:3 msid:1 2`
+      // fell through to the synthesised-stream branch below and announced a
+      // random id instead of the one the sender named.
+      var _msidRaw = m.msid;
+      if (!_msidRaw && m.ssrcs && m.ssrcs.length) {
+        for (var _mrS = 0; _mrS < m.ssrcs.length; _mrS++) {
+          if (m.ssrcs[_mrS] && m.ssrcs[_mrS].msid) { _msidRaw = m.ssrcs[_mrS].msid; break; }
+        }
+      }
+      var msidSid = _msidRaw ? String(_msidRaw).split(' ')[0] : null;
       if (!state._remoteStreams) state._remoteStreams = {};
       var stream;
       if (msidSid && msidSid !== '-' && state._remoteStreams[msidSid]) {
@@ -2888,7 +3193,19 @@ function ConnectionManager(config) {
       // so an app that received a track shared across two streams saw
       // one and silently lost the grouping the sender intended.
       var _allStreams = [];
+      // Same resolution order as the ssrc-less path: media-level a=msid wins,
+      // then source-level a=ssrc:N msid, then a synthesised id. See the note
+      // there. This path only read the media-level form, so an offer carrying
+      // just `a=ssrc:3 msid:1 2` announced no streams.
       var _msidList = (m.msids && m.msids.length) ? m.msids : (m.msid ? [m.msid] : []);
+      if (!_msidList.length && m.ssrcs && m.ssrcs.length) {
+        _msidList = [];
+        for (var _msS = 0; _msS < m.ssrcs.length; _msS++) {
+          var _msV = m.ssrcs[_msS] && m.ssrcs[_msS].msid;
+          if (_msV && _msidList.indexOf(_msV) === -1) _msidList.push(_msV);
+        }
+      }
+      if (!_msidList.length) _msidList = ['msid-less-' + m.mid + ' ' + m.type];
       for (var _ms = 0; _ms < _msidList.length; _ms++) {
         var _sid2 = String(_msidList[_ms]).split(' ')[0];
         if (!_sid2 || _sid2 === '-') continue;
@@ -2900,7 +3217,10 @@ function ConnectionManager(config) {
         }
         if (_allStreams.indexOf(_st2) === -1) _allStreams.push(_st2);
       }
-      var _noMsid = !(msidSid && msidSid !== '-');
+      // Follows the RESOLVED list: a source-level or synthesised id is a
+      // stream just as much as a media-level one. Keyed off msidSid alone,
+      // this reported "no msid" for both and suppressed the announcement.
+      var _noMsid = (_allStreams.length === 0);
       // No track event for a rejected section — there is no media there.
       if (_rejectedSection) continue;
       // TRACK EVENTS FOLLOW THE STATE EVENT (W3C 4.4.1.6): the order is
@@ -2930,6 +3250,13 @@ function ConnectionManager(config) {
   }
 
   /* ====================== Transport ====================== */
+
+  // How long a negotiated-receiving track may go without a packet before it is
+  // reported muted. Long enough not to trip on ordinary jitter or a brief
+  // network stall; short enough that an application learns promptly. Override
+  // for tests with WEBRTC_MEDIA_STALL_MS.
+
+
 
 
   /* ====================== Transceivers ====================== */
@@ -3178,10 +3505,52 @@ function ConnectionManager(config) {
       sdpOA.setLocalDescription(desc, next);
     }, cb);
   };
+  // Candidates that arrived before any remote description existed. W3C 4.4.2
+  // says such a candidate is BUFFERED and applied once a description lands —
+  // not rejected. Rejecting was a field-fatal bug: signalling races are the
+  // norm, an application that forwards each candidate the moment it is
+  // generated routinely delivers the first one ahead of the SDP, and the
+  // rejection meant those candidates were simply lost. With no candidates the
+  // connection never left 'new'.
+  //
+  // It also surfaced as an unhandled rejection, because the idiomatic
+  // forwarding line has nothing to catch:
+  //
+  //   pc1.addEventListener('icecandidate', ({candidate}) =>
+  //     pc2.addIceCandidate(candidate));
+  //
+  // which is exactly what WPT's own exchangeIceCandidates helper does.
+  var _pendingRemoteCandidates = [];
+
+  function _flushPendingCandidates() {
+    if (!_pendingRemoteCandidates.length) return;
+    var queued = _pendingRemoteCandidates;
+    _pendingRemoteCandidates = [];
+    for (var i = 0; i < queued.length; i++) {
+      // Fire and forget: the original caller's promise already resolved when
+      // the candidate was accepted into the queue. A candidate that turns out
+      // to be malformed is dropped here rather than resurfacing as an
+      // unhandled rejection long after the call site is gone.
+      (function (entry) {
+        try {
+          sdpOA.addIceCandidate(entry, function (err) {
+            if (err) _diag('[cm-diag] queued candidate rejected on flush: ' +
+                           (err && err.message));
+          });
+        } catch (e) { /* never let a stale candidate break negotiation */ }
+      })(queued[i]);
+    }
+  }
+
   this.setRemoteDescription = function (desc, cb) {
     trackNegotiationRole(desc, false);
     sdpOA.chainOperation(function (next) {
-      sdpOA.setRemoteDescription(desc, next);
+      sdpOA.setRemoteDescription(desc, function (err) {
+        // Apply anything that was waiting on exactly this. Only on success —
+        // a failed description leaves us with nothing to address them to.
+        if (!err) _flushPendingCandidates();
+        next(err);
+      });
     }, cb);
   };
   this.addIceCandidate = function (candidate, cb) {
@@ -3189,14 +3558,63 @@ function ConnectionManager(config) {
       // W3C 4.4.2 step 3, evaluated WHEN THE OPERATION RUNS: a candidate
       // (including the bare end-of-candidates form) needs a remote
       // description to address. Run time is the only correct moment —
-      // with an idle chain after a rollback there is none and this
-      // rejects, while during glare the candidate queues behind the
-      // in-flight setRemoteDescription and finds one by the time it
-      // runs. Checking at call time gives one answer where two are
-      // needed.
+      // with an idle chain after a rollback there is none, while during
+      // glare the candidate queues behind the in-flight
+      // setRemoteDescription and finds one by the time it runs. Checking
+      // at call time gives one answer where two are needed.
+      //
+      // With still no description at run time the spec splits two ways, and
+      // WPT asserts BOTH:
+      //
+      //   a real candidate  → reject with InvalidStateError
+      //       ('Add ICE candidate before setting remote description should
+      //        reject with InvalidStateError')
+      //   end-of-candidates → buffer and resolve
+      //
+      // The end-of-candidates form is the one that matters in practice. The
+      // idiomatic forwarding line has nothing to catch:
+      //
+      //   pc1.addEventListener('icecandidate', ({candidate}) =>
+      //     pc2.addIceCandidate(candidate));
+      //
+      // and it delivers null the moment gathering completes — routinely
+      // before the answer has been applied. Rejecting there produced an
+      // unhandled rejection that killed negotiation outright: the connection
+      // stayed at 'new' forever and no data channel ever opened. WPT's own
+      // exchangeIceCandidates helper is written exactly that way.
       if (!state.currentRemoteDescription && !state.pendingRemoteDescription) {
-        return next(new DOMException(
-          'addIceCandidate: no remote description', 'InvalidStateError'));
+        // Two cases, and WPT asserts both:
+        //
+        //   No negotiation has started at all — a fresh RTCPeerConnection,
+        //   addIceCandidate called out of the blue. There is no session for
+        //   the candidate to belong to and never will be until the caller
+        //   does something. Reject, per W3C 4.4.2.
+        //     ('Add ICE candidate before setting remote description should
+        //      reject with InvalidStateError')
+        //
+        //   Negotiation IS under way — we have a local description, so an
+        //   answer is expected and this candidate belongs to that session.
+        //   Buffer it and apply it when the description lands.
+        //
+        // The second case is the common one in real code and the reason this
+        // matters. The idiomatic forwarding line has nothing to catch:
+        //
+        //   pc1.addEventListener('icecandidate', ({candidate}) =>
+        //     pc2.addIceCandidate(candidate));
+        //
+        // and candidates are generated as soon as gathering starts, routinely
+        // beating the answer. Rejecting there produced an unhandled rejection
+        // that killed negotiation outright — the connection stayed at 'new'
+        // forever and no data channel ever opened. WPT's own
+        // exchangeIceCandidates helper is written exactly that way.
+        var _negotiating = !!(state.currentLocalDescription ||
+                              state.pendingLocalDescription);
+        if (!_negotiating) {
+          return next(new DOMException(
+            'addIceCandidate: no remote description', 'InvalidStateError'));
+        }
+        _pendingRemoteCandidates.push(candidate);
+        return next();
       }
       sdpOA.addIceCandidate(candidate, next);
     }, cb);

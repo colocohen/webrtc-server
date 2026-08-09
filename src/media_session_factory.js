@@ -353,8 +353,34 @@ function buildOffer(state, options) {
       }
 
       if (recycle) {
-        existingMids[recycle.mid] = true;
+        // THE SLOT KEEPS ITS MID. An m-section's mid belongs to the SECTION,
+        // not to whatever transceiver currently occupies it (RFC 5888): the
+        // peer has already seen this section at this mid, and every m-line
+        // after it is positioned by it.
+        //
+        // buildMediaForTransceiver emits the TRANSCEIVER's mid, so recycling
+        // a transceiver into a stopped transceiver's slot moved its mid with
+        // it — and the slot it came from was emitted again later with the
+        // same value:
+        //
+        //   a=mid:1   ← the recycled transceiver, in slot 0
+        //   a=mid:1   ← its own slot, emitted again
+        //   a=mid:0
+        //
+        // Two sections claiming one mid is malformed, and it took the msid
+        // with it (both sections then read the same localSsrcs entry), so the
+        // peer rejected the whole description and negotiation failed.
+        //
+        // Re-key the transceiver onto the slot it is moving into, which keeps
+        // its SSRC bookkeeping aligned too — the same re-key the adoption
+        // path does.
+        var _slotMid = em.mid;
+        if (String(recycle.mid) !== String(_slotMid)) {
+          RtpManager.rebindMid(state, recycle, _slotMid);
+        }
+        existingMids[_slotMid] = true;
         var rspec = buildMediaForTransceiver(state, recycle);
+        rspec.mid = String(_slotMid);
         // Pin extmap/codecs to the slot's previous values so the peer
         // side has no extension-ID/codec-PT churn across the recycle —
         // Chrome rejects extmap reassignment.

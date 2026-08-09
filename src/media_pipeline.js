@@ -32,6 +32,31 @@ import {
   JitterBuffer, parse as parseRtp,
 } from 'rtp-packet';
 
+/**
+ * Read the next sequence number a packetizer will emit, or null.
+ *
+ * rtp-packet keeps this in `_seq` on every packetizer (Opus, VP8, H264, RED —
+ * all checked). There is no public accessor. This used to be read as
+ * `packetizer.sequenceNumber`, which is undefined everywhere, so sequence
+ * continuity across a pipeline restart silently never happened: the code that
+ * saved and restored it was correct and simply never ran.
+ *
+ * The consequence was not cosmetic. A restarted pipeline began at a fresh
+ * random sequence number; roughly half the time that number sat below where
+ * the previous pipeline left off, and the receiver's SRTP read the whole
+ * stream as replayed packets and discarded it silently. replaceTrack() lost
+ * audio outright about half the time. See FINDINGS.md.
+ *
+ * `sequenceNumber` is kept as a fallback so a future rtp-packet that exposes a
+ * public accessor keeps working without a change here.
+ */
+function _packetizerSeq(packetizer) {
+  if (!packetizer) return null;
+  if (packetizer._seq != null) return packetizer._seq;
+  if (packetizer.sequenceNumber != null) return packetizer.sequenceNumber;
+  return null;
+}
+
 // Debug logging gate (mirrors api.js / connection_manager.js). '[onRtp …]'
 // and '[mp-diag]' lines are per-packet / per-layer diagnostics that flood
 // stdout at video frame rates. Off by default — set WEBRTC_DEBUG=1.
@@ -382,11 +407,36 @@ function createVideoSendPipeline(opts) {
                     (opts.maxFramerate > 0 ? opts.maxFramerate : DEFAULT_FRAMERATE);
   var scaleDown   = opts.scaleResolutionDownBy > 0 ? opts.scaleResolutionDownBy : 1;
 
-  // Pull resolution from the track's settings if available, else defaults,
-  // then apply scaleResolutionDownBy.
+  // Encoder dimensions are the OUTPUT dimensions: native resolution divided by
+  // scaleResolutionDownBy. Per WebCodecs, VideoEncoderConfig.width/height
+  // describe the encoded frame, and encode() accepts source frames of any size
+  // — the encoder scales. We rely on that contract and do no scaling here.
+  //
+  // KNOWN BROKEN AGAINST CURRENT media-processing — see
+  // MEDIA-PROCESSING-TODO.md. It treats configure()'s width/height as INPUT
+  // dimensions and rejects any frame whose byte length disagrees, so every
+  // simulcast layer with scaleResolutionDownBy > 1 errors on every frame:
+  //
+  //   encoder error: frame size 460800 does not match 160x120 I420 (expected 28800)
+  //
+  // Simulcast therefore negotiates N layers and transmits only the
+  // scaleResolutionDownBy:1 one. THIS IS THE SYMPTOM TO EXPECT until the
+  // encoder is fixed; do not chase it here.
+  //
+  // A workaround was written and verified here (configure at source size, pass
+  // an ffmpeg '-vf scale' filter through codecOptions) and produced three
+  // correct layers. It was reverted deliberately: it leaks ffmpeg through an
+  // API whose entire purpose is to be backend-agnostic, so it would break the
+  // day media-processing runs on anything else, and it left decoderConfig
+  // metadata reporting the source size instead of the encoded size. The fix
+  // belongs in the encoder, where it also fixes every other consumer.
+  //
+  // Rounded to a multiple of 2 — H.264 and VP8 both require even dimensions.
   var settings = (typeof track.getSettings === 'function') ? track.getSettings() : {};
-  var width    = Math.round((opts.width  || settings.width  || 640) / scaleDown);
-  var height   = Math.round((opts.height || settings.height || 480) / scaleDown);
+  var nativeW  = opts.width  || settings.width  || 640;
+  var nativeH  = opts.height || settings.height || 480;
+  var width    = Math.max(2, Math.round(nativeW / scaleDown) & ~1);
+  var height   = Math.max(2, Math.round(nativeH / scaleDown) & ~1);
 
   var packetizer = new codecInfo.Packetizer({
     ssrc:        ssrc,
@@ -596,15 +646,21 @@ function createVideoSendPipeline(opts) {
     abort: function () { /* same */ },
   });
 
-  encoder.configure({
-    codec:                codecInfo.decoderCodec,
-    width:                width,
-    height:               height,
-    bitrate:              bitrate,
-    framerate:            framerate,
-    latencyMode:          'realtime',
-    hardwareAcceleration: 'prefer-software',
-  });
+  // Built in one place so the initial configure and the setParameters
+  // reconfigure below cannot drift apart.
+  function _encoderConfig() {
+    return {
+      codec:                codecInfo.decoderCodec,
+      width:                width,
+      height:               height,
+      bitrate:              bitrate,
+      framerate:            framerate,
+      latencyMode:          'realtime',
+      hardwareAcceleration: 'prefer-software',
+    };
+  }
+
+  encoder.configure(_encoderConfig());
 
 
   /* ── Frame subscription ─────────────────────────────────────────────── */
@@ -627,6 +683,40 @@ function createVideoSendPipeline(opts) {
       try { if (frame && typeof frame.close === 'function') frame.close(); } catch (e) {}
       return;
     }
+    // FOLLOW THE SOURCE'S ACTUAL SIZE.
+    //
+    // nativeW/nativeH come from track.getSettings() read at construction, but
+    // a track's dimensions are only known once it has produced a frame — a
+    // programmatic VideoSource reports none until then, so we fall back to
+    // 640x480 and every stat downstream inherits that guess. Media still
+    // flows (the encoder scales), but outbound-rtp.frameWidth/frameHeight
+    // reported 640x480 for a 320x240 source.
+    //
+    // The audio path already adapts to its track ("audio track is 1-channel
+    // (SDP notation says 2) — reconfiguring encoder to follow the track");
+    // this is the video equivalent. It also covers a source that legitimately
+    // changes resolution mid-stream.
+    if (frame && frame.codedWidth && frame.codedHeight &&
+        (frame.codedWidth !== nativeW || frame.codedHeight !== nativeH)) {
+      nativeW = frame.codedWidth;
+      nativeH = frame.codedHeight;
+      var _newW = Math.max(2, Math.round(nativeW / scaleDown) & ~1);
+      var _newH = Math.max(2, Math.round(nativeH / scaleDown) & ~1);
+      if (_newW !== width || _newH !== height) {
+        width  = _newW;
+        height = _newH;
+        try {
+          encoder.configure(_encoderConfig());
+          pendingKeyFrame = true;   // new dimensions → decoder must re-latch
+        } catch (e) {
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('[media_pipeline] encoder reconfigure for source size failed:',
+                          e && e.message || e);
+          }
+        }
+      }
+    }
+
     var forceKey = pendingKeyFrame || (frameCount % KEYFRAME_INTERVAL_FRAMES === 0);
     if (pendingKeyFrame) pendingKeyFrame = false;
     frameCount++;
@@ -730,10 +820,11 @@ function createVideoSendPipeline(opts) {
         params.scaleResolutionDownBy > 0 &&
         params.scaleResolutionDownBy !== scaleDown) {
       scaleDown = params.scaleResolutionDownBy;
-      var nativeW = (settings && settings.width)  || 640;
-      var nativeH = (settings && settings.height) || 480;
-      width  = Math.round(nativeW / scaleDown);
-      height = Math.round(nativeH / scaleDown);
+      // Rescale from the same native dimensions the initial configure used.
+      // Re-reading settings here would diverge whenever opts.width/height
+      // were supplied explicitly.
+      width  = Math.max(2, Math.round(nativeW / scaleDown) & ~1);
+      height = Math.max(2, Math.round(nativeH / scaleDown) & ~1);
       changed = true;
       needsKeyframe = true;   // new dimensions → decoder must re-latch
     }
@@ -745,15 +836,7 @@ function createVideoSendPipeline(opts) {
 
     if (changed) {
       try {
-        encoder.configure({
-          codec:                codecInfo.decoderCodec,
-          width:                width,
-          height:               height,
-          bitrate:              bitrate,
-          framerate:            framerate,
-          latencyMode:          'realtime',
-          hardwareAcceleration: 'prefer-software',
-        });
+        encoder.configure(_encoderConfig());
         // Only force a keyframe for resolution changes. Bitrate/framerate
         // adjustments alone don't require one.
         if (needsKeyframe) pendingKeyFrame = true;
@@ -795,14 +878,22 @@ function createVideoSendPipeline(opts) {
     // the NEXT seq to emit; subtract 1 (mod 65536) to get the last sent.
     // Returns null if nothing has been packetized yet on this pipeline.
     getLastSequenceNumber: function () {
-      if (!packetizer || packetizer.sequenceNumber == null) return null;
-      // Initial value (before any packetize call) === initialSequenceNumber
-      // if provided, else a random initial. Either way "next" minus one is
-      // the last actually emitted, modulo 16-bit wrap. We only return a
-      // meaningful value if we know packets were actually sent; the
-      // _packetsSent counter handles that gate.
+      // rtp-packet's packetizers hold the next sequence number in `_seq`;
+      // there is no public `sequenceNumber`. Reading the latter returned
+      // undefined on EVERY packetizer (Opus, VP8, H264, RED), so this
+      // method always returned null and sequence continuity across a
+      // pipeline restart never once took effect. The restart then began at
+      // a fresh random sequence number; when that landed below where the
+      // previous pipeline stopped, the receiver's SRTP treated every packet
+      // as a replay and dropped the stream silently. See FINDINGS.md.
+      var next = _packetizerSeq(packetizer);
+      if (next == null) return null;
+      // `next` is the sequence number to be emitted next, so the last one
+      // actually sent is one below it, modulo the 16-bit wrap. Only
+      // meaningful once something has been sent — before that, `next` is
+      // still the initial value and is not a "last emitted" at all.
       if (!_packetsSent) return null;
-      return (packetizer.sequenceNumber - 1) & 0xFFFF;
+      return (next - 1) & 0xFFFF;
     },
   };
 }
@@ -1407,9 +1498,12 @@ function createAudioSendPipeline(opts) {
     },
     // See video send pipeline's getLastSequenceNumber.
     getLastSequenceNumber: function () {
-      if (!packetizer || packetizer.sequenceNumber == null) return null;
+      // See the video send pipeline's getLastSequenceNumber — same fix,
+      // same reason: the counter lives in the packetizer's `_seq`.
+      var next = _packetizerSeq(packetizer);
+      if (next == null) return null;
       if (!_packetsSent) return null;
-      return (packetizer.sequenceNumber - 1) & 0xFFFF;
+      return (next - 1) & 0xFFFF;
     },
   };
 }

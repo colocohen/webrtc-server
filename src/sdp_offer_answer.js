@@ -339,6 +339,17 @@ class SdpOfferAnswer extends EventEmitter {
     }
 
     // 5. flag already true → dedupe.
+    //
+    // The flag is only meaningful between "we decided negotiation is needed"
+    // and "the event fired". Leaving it set past the firing turned it into a
+    // permanent latch: the first negotiationneeded of a connection's life
+    // fired, and every subsequent one was swallowed as a duplicate. An
+    // application that stops a transceiver after the first negotiation — and
+    // waits for the event that is supposed to prompt the retiring round —
+    // waited forever.
+    //
+    // Clearing it at emit time restores the dedupe to what it is for: one
+    // event per burst of state changes, not one per connection.
     if (this._negotiationNeeded) return;
 
     // 6. Set flag and queue task to fire event.
@@ -348,6 +359,7 @@ class SdpOfferAnswer extends EventEmitter {
       if (self._deps.getClosed()) return;
       // Could have been cleared between scheduling and execution.
       if (!self._negotiationNeeded) return;
+      self._negotiationNeeded = false;
       self.emit('negotiationneeded');
     });
   }
@@ -674,6 +686,16 @@ class SdpOfferAnswer extends EventEmitter {
       // keeps its attributes but describes no track, so counting it
       // produced false duplicates — the bundle-tag-rejected case hit
       // exactly that and a legitimate description was refused.
+      // What is actually forbidden is the SAME msid appearing on TWO DIFFERENT
+      // m-sections — one track cannot belong to two media sections. Repeating
+      // the identical line WITHIN one section is redundant, not malformed:
+      //
+      //   a=msid:1 2
+      //   a=msid:1 2      ← the same track, said twice
+      //
+      // and the spec's outcome is one stream, not a rejection. The check used
+      // a single map across the whole SDP, so it refused that description.
+      // Dedupe within a section first, then look for cross-section reuse.
       var _seen = {};
       var _sections = _sdpText.split(/(?=[\r\n]m=)/);
       for (var _si = 0; _si < _sections.length; _si++) {
@@ -681,8 +703,11 @@ class SdpOfferAnswer extends EventEmitter {
         if (!/[\r\n]?m=/.test(_sec)) continue;
         if (/[\r\n]?m=\S+ 0 /.test(_sec)) continue;      // rejected section
         var _lines = _sec.match(/(^|[\r\n])a=msid:[^\r\n]+/g) || [];
+        var _inSection = {};
         for (var _di = 0; _di < _lines.length; _di++) {
           var _key = _lines[_di].replace(/[\r\n]/g, '').trim();
+          if (_inSection[_key]) continue;                 // repeat in the same section
+          _inSection[_key] = true;
           if (_seen[_key]) {
             // OperationError, not InvalidAccessError: the description is
             // malformed, which is a processing failure rather than a
@@ -964,6 +989,12 @@ class SdpOfferAnswer extends EventEmitter {
       parsedCurrentLocalSdp:     SDP.cloneParsedSdp(state.parsedCurrentLocalSdp),
       parsedCurrentRemoteSdp:    SDP.cloneParsedSdp(state.parsedCurrentRemoteSdp),
       transceivers:              state.transceivers ? state.transceivers.slice() : [],
+      // Which of them were ALREADY associated when this snapshot was taken.
+      // Rollback undoes the association the rolled-back description conferred,
+      // but must leave alone any that an earlier description had established.
+      associatedAtSnapshot:      state.transceivers
+        ? state.transceivers.filter(function (t) { return t && t._associated; })
+        : [],
 transceiverMids:           state.transceivers.map(function (t) { return t.mid; }),
             transceiverAssoc:          state.transceivers
         ? state.transceivers.map(function (t) { return !!t._associated; }) : [],
@@ -1439,6 +1470,44 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       // (addTrack/addTransceiver during glare — perfect negotiation!)
       // MUST survive. The blanket snapshot-only restore silently
       // swallowed the app's video sender mid-glare (field bug).
+      // A transceiver that PRE-DATES the rolled-back description keeps its
+      // place in the list — but it may have gained a mid FROM that
+      // description, and that mid has to go with it.
+      //
+      //   pc2.addTrack(track);                       // transceiver exists, mid null
+      //   await pc2.setRemoteDescription(offer);     // adopted, mid "0"
+      //   await pc2.setRemoteDescription(rollback);  // mid must be null again
+      //
+      // The snapshot restores the ARRAY, not the objects in it, so this one
+      // came back still reporting mid "0" — associated with a description
+      // that no longer exists. Only transceivers created during the apply
+      // were being dis-associated.
+      // Association is what the description conferred, so association is what
+      // rollback takes back. A transceiver is born with an internal mid, but
+      // it is only ASSOCIATED with an m-section once a description says so —
+      // and the public mid getter reports null until then. Restoring the array
+      // without clearing that flag left the transceiver reporting the mid of a
+      // description that no longer exists.
+      //
+      // Only transceivers that were unassociated when the snapshot was taken
+      // are reset; one already associated by an EARLIER description keeps that
+      // association, which this rollback has nothing to do with.
+      for (var _si = 0; _si < snap.transceivers.length; _si++) {
+        var _st = snap.transceivers[_si];
+        // Any of the three flags means "a description associated this one".
+        // Checking only _associated missed transceivers whose association had
+        // already been half-cleared elsewhere in the restore, leaving
+        // _adopted set — and isLegitimateOwner accepts ANY of the three, so
+        // the mid stayed publicly visible.
+        if (!_st) continue;
+        if (!_st._associated && !_st._adopted && !_st._srdCreated) continue;
+        if (snap.associatedAtSnapshot &&
+            snap.associatedAtSnapshot.indexOf(_st) !== -1) continue;
+        _st._associated = false;
+        _st._adopted = false;
+        _st._srdCreated = false;
+      }
+
       var createdDuring = state.transceivers.filter(function (t) {
         if (snap.transceivers.indexOf(t) !== -1) return false;
         // An SRD-created transceiver that the APP has since attached a
@@ -1447,7 +1516,58 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
         // (dis-associated, mid null) rather than delete the app's work.
         // Survival is decided by the ADOPTION ACT (addTrack), not by a
         // track being attached at this instant — see _appAdopted.
-        if (t._srdCreated && !t._appAdopted) return false;
+        if (t._srdCreated && !t._appAdopted) {
+          // REMOVED FROM THE LIST IS NOT THE SAME AS FORGOTTEN. The
+          // application still holds this transceiver — it read it out of
+          // getTransceivers() before the rollback — so its observable state
+          // has to say what happened to it.
+          //
+          // W3C 4.4.1.6: a transceiver removed by rollback is STOPPED, with
+          // no mid. We only dropped it from the array, so the object the
+          // application was holding went on reporting 'recvonly' and its old
+          // mid forever, and its track stayed live.
+          t.direction        = 'stopped';
+          t.currentDirection = 'stopped';
+          t._stopped         = true;
+          t.mid              = null;
+          t._srdCreated      = false;
+          t._associated      = false;
+          var _rbTrack = t.receiver && t.receiver.track;
+
+          // The track also leaves every MediaStream it was announced in, and
+          // each of those fires 'removetrack'. W3C 4.4.1.6 lists this
+          // alongside stopping the transceiver: rollback undoes the track
+          // event, and an application that grouped tracks by stream needs to
+          // hear that the grouping is gone. We only stopped the transceiver,
+          // so the stream went on reporting tracks that no longer existed.
+          if (_rbTrack) {
+            var _rs = state._remoteStreams;
+            for (var _rk in _rs) {
+              if (!Object.prototype.hasOwnProperty.call(_rs, _rk)) continue;
+              var _rstream = _rs[_rk];
+              if (!_rstream || typeof _rstream.removeTrack !== 'function') continue;
+              var _has = _rstream.getTracks && _rstream.getTracks().some(function (x) {
+                return x === _rbTrack || (x && x.id === _rbTrack.id);
+              });
+              if (!_has) continue;
+              // removeTrack fires 'removetrack' itself — see fix 23 on not
+              // dispatching a second time.
+              try { _rstream.removeTrack(_rbTrack); } catch (eRm) {}
+            }
+          }
+
+          if (_rbTrack && _rbTrack.readyState !== 'ended') {
+            // On a task, for the same reason as transceiver.stop() (fix 25).
+            setTimeout(function () {
+              try {
+                if (_rbTrack.readyState === 'ended') return;
+                if (typeof _rbTrack.stop === 'function') _rbTrack.stop();
+                else _rbTrack.readyState = 'ended';
+              } catch (eRb) {}
+            }, 0);
+          }
+          return false;
+        }
         // A survivor is FULLY dis-associated: the description that gave
         // it a mid is gone, so mid must read null again (the public
         // getter keys on the birth flags, and leaving _srdCreated set

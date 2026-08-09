@@ -761,12 +761,24 @@ class DataChannelController extends EventEmitter {
       if (info.ppid === PPID_DCEP) return;
       // TIMING GUARD: chunkSent can fire synchronously inside send() on
       // an open SCTP window — draining in the same tick would erase the
-      // spec-mandated synchronous bufferedAmount increase before the
-      // caller can observe it. One macrotask of deferral keeps the
-      // increase observable and still drains within milliseconds.
+      // spec-mandated synchronous bufferedAmount increase before the caller
+      // can observe it. So the drain is deferred.
+      //
+      // It must be deferred by a MICROTASK, not a macrotask. The observable
+      // requirement is only that the increase survives the send() call
+      // itself; a microtask satisfies that. But an application — and WPT —
+      // reads the sender's bufferedAmount as soon as the RECEIVER's message
+      // event fires, and message delivery is itself a macrotask. Deferring
+      // with setImmediate put the drain AFTER that read, so bufferedAmount
+      // still showed the full message length long after it had been sent:
+      //
+      //   after send:     bufferedAmount=10   (correct)
+      //   after delivery: bufferedAmount=10   (should be 0)
+      //
+      // queueMicrotask drains before delivery and keeps the synchronous
+      // increase intact.
       if (!arguments[1]) {
-        // allocation-free deferral: same info object, flag via argument
-        setImmediate(_drain, info, true);
+        queueMicrotask(function () { _drain(info, true); });
         return;
       }
       var dc = self._dataChannelMap[info.streamId];

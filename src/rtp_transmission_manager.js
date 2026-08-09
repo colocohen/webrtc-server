@@ -46,6 +46,68 @@ import * as SDP from './sdp.js';
  * @param {Object} state
  * @returns {number}  the next free mid (caller stringifies if needed)
  */
+/**
+ * Give a send-capable SSRC to a transceiver that does not have one.
+ *
+ * createTransceiver() allocates SSRCs, but it only ever runs for LOCALLY
+ * created transceivers. One created by setRemoteDescription — the remote
+ * offered a section and we adopted it — is born with ssrc: null, because at
+ * that moment it is receive-only and has nothing to send.
+ *
+ * An application is entitled to turn such a transceiver into a sender:
+ *
+ *     const [tc] = pc.getTransceivers();   // created by setRemoteDescription
+ *     tc.direction = 'sendonly';
+ *     tc.sender.replaceTrack(track);
+ *
+ * That is the ordinary answerer flow — the remote offers recvonly, we answer
+ * by sending — and it is exactly what WPT's addTransceiver-renegotiation
+ * tests do. Without this, the SSRC stayed null forever: no a=ssrc line in the
+ * answer, nothing for the packetiser to stamp, and zero packets sent while
+ * the SDP still said a=sendonly.
+ *
+ * Idempotent and safe to call on every direction change; returns true only
+ * when it actually allocated.
+ */
+function ensureSendSsrc(state, transceiver) {
+  if (!transceiver || !transceiver.sender) return false;
+  if (transceiver.sender.ssrc != null) return false;
+
+  var ssrc    = SDP.generateSsrc();
+  var rtxSsrc = SDP.generateSsrc();
+
+  transceiver.sender.ssrc    = ssrc;
+  transceiver.sender.rtxSsrc = rtxSsrc;
+  if (transceiver.sender.layers && transceiver.sender.layers.length) {
+    transceiver.sender.layers[0].ssrc    = ssrc;
+    transceiver.sender.layers[0].rtxSsrc = rtxSsrc;
+  } else {
+    transceiver.sender.layers = [{ rid: null, ssrc: ssrc, rtxSsrc: rtxSsrc, fecSsrc: null }];
+  }
+
+  // Mirror the routing slot createTransceiver would have written, so the SDP
+  // builder emits a=ssrc for this section. Keyed by mid, which a remotely
+  // created transceiver always has.
+  if (transceiver.mid != null) {
+    var trackId = (transceiver.sender.track && transceiver.sender.track.id) ||
+                  (transceiver.kind + transceiver.mid);
+    var streamIds = transceiver.streamIds;
+    state.localSsrcs = state.localSsrcs || {};
+    state.localSsrcs[transceiver.mid] = {
+      id:     ssrc,
+      rtxId:  rtxSsrc,
+      fecId:  null,
+      msid:   ((streamIds && streamIds[0]) || '-') + ' ' + trackId,
+      msids:  (streamIds && streamIds.length > 1)
+                ? streamIds.map(function (id) { return id + ' ' + trackId; })
+                : null,
+      layers: transceiver.sender.layers,
+    };
+  }
+  return true;
+}
+
+
 function getNextMid(state) {
   var usedMids = {};
   for (var i = 0; i < state.transceivers.length; i++) {
@@ -368,6 +430,29 @@ function isStopped(t) {
             t.currentDirection === 'stopped');
 }
 
+/**
+ * Is this transceiver FULLY stopped, as opposed to merely stopping?
+ *
+ * W3C 5.4 has two states and they behave differently:
+ *
+ *   [[Stopping]] — stop() has been called. direction reads 'stopped', but the
+ *                  m-section is still live and MEDIA STILL FLOWS until a
+ *                  negotiation retires it.
+ *   [[Stopped]]  — that negotiation has happened. Nothing flows.
+ *
+ * isStopped() above deliberately answers "stopping or stopped" — it guards
+ * things that must not touch a transceiver on its way out. But a few places
+ * need the stricter question, because a stopping transceiver is still
+ * negotiating: applyDirectionsFromAnswer must record the direction the answer
+ * agreed on, or currentDirection stays null on a transceiver that is actively
+ * carrying media. WPT reads {currentDirection: 'sendrecv', direction:
+ * 'stopped'} on exactly that pair.
+ */
+function isFullyStopped(t) {
+  if (!t) return false;
+  return !!(t._stopped || t.currentDirection === 'stopped');
+}
+
 
 /**
  * JSEP legitimate-owner test — the single source of truth for "may this
@@ -537,11 +622,16 @@ function applyDirectionsFromAnswer(state, parsed, isLocalAnswer) {
     // birth-mid collision is the grab itself — legitimate owners only.
     if (t && !isLegitimateOwner(t)) t = null;
     if (!t) continue;
-    // A STOPPED transceiver is final: applying a negotiated direction
+    // A FULLY STOPPED transceiver is final: applying a negotiated direction
     // over it resurrected it (direction came back as recvonly), which
     // also defeated the retirement sweep — a stopped transceiver could
     // never be retired and the list grew forever.
-    if (isStopped(t)) continue;
+    //
+    // A merely STOPPING one is not final. Its m-section is still live and
+    // media still flows until a negotiation retires it, so the direction the
+    // answer agreed on must be recorded. Skipping those left currentDirection
+    // null on a transceiver that was actively carrying media.
+    if (isFullyStopped(t)) continue;
 
     if (m.port === 0) {
       t.currentDirection = 'stopped';
@@ -624,7 +714,20 @@ function checkIfNegotiationIsNeeded(state) {
 
   for (var i = 0; i < state.transceivers.length; i++) {
     var t = state.transceivers[i];
-    if (isStopped(t)) continue;
+
+    // A STOPPING transceiver needs negotiation — that is the whole point of
+    // the state. W3C 4.7.3: stop() marks [[Stopping]], and only a subsequent
+    // negotiation retires the m-section and moves it to [[Stopped]]. Until
+    // that happens the connection is out of sync with what the application
+    // asked for, so negotiationneeded must fire.
+    //
+    // Lumping stopping in with stopped and skipping both meant the event
+    // never fired: the application called stop(), nothing prompted it to
+    // renegotiate, and the m-section stayed live forever. Anything awaiting
+    // negotiationneeded after a stop() waited indefinitely.
+    if (isFullyStopped(t)) continue;
+    if (isStopped(t)) return true;      // stopping, not yet retired
+
     if (t.mid == null) return true;
     if (t.direction !== t.currentDirection) return true;
   }
@@ -641,6 +744,8 @@ export {
 
   // Transceiver creation
   createTransceiver,
+  ensureSendSsrc,
+  isFullyStopped,
 
   // Lookups
   findByMid,
