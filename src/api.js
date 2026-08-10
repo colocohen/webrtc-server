@@ -944,6 +944,8 @@ function RTCPeerConnection(config) {
   // Publish the RTCError constructor for lower layers (sdp_offer_answer
   // builds sdp-syntax-error rejections and cannot import api.js back).
   try { manager.state._RTCErrorCtor = RTCError; } catch (ePub) {}
+  // Lower layers emit RTCErrorEvent too and cannot import it without a cycle.
+  try { manager.state._RTCErrorEventCtor = RTCErrorEvent; } catch (ePub2) {}
 
   // WPT harvest — muted follows NEGOTIATED receive-ability too: after
   // every description apply, receiver tracks mute/unmute per the
@@ -5299,7 +5301,58 @@ function RTCIceTransport(manager) {
   // comparisons across them hold field-for-field (WPT requirement).
   function _normCand(c) {
     if (!c) return null;
+    // THE `candidate` STRING IS THE IDENTITY. W3C 4.8.1 makes it the primary
+    // member of RTCIceCandidate — the a=candidate line itself — and it is how
+    // applications compare candidates across the two peers:
+    //
+    //   assert_equals(pair1.local.candidate, pair2.remote.candidate)
+    //
+    // Omitting it left every comparison of that kind reading undefined on
+    // both sides, so two unrelated candidates compared EQUAL and code that
+    // matched a selected pair against its own signalled candidates silently
+    // matched nothing.
+    var _line = c.candidate || c.sdp || null;
+    if (!_line) {
+      // Rebuild the a=candidate line from the parts (RFC 5245 15.1) when the
+      // source only carried the decomposed form.
+      var _typ = c.type || 'host';
+      // A foundation is an ICE-chars token (RFC 8839): no colons. Internally
+      // it can be a composite like 'prflx:192.0.2.2', which would produce a
+      // malformed a=candidate line — the peer, and any string comparison
+      // against a signalled candidate, would reject it. Take the leading
+      // token.
+      var _fnd = (c.foundation != null) ? String(c.foundation) : '0';
+      if (_fnd.indexOf(':') !== -1) _fnd = _fnd.split(':')[0];
+      var _parts = [
+        _fnd,
+        (c.component === 2 ? 2 : 1),
+        (c.protocol || 'udp').toUpperCase(),
+        (c.priority != null ? c.priority : 0),
+        (c.ip || c.address || ''),
+        (c.port != null ? c.port : 0),
+        'typ', _typ,
+      ];
+      var _ra = c.raddr || c.relatedAddress;
+      var _rp = (c.rport != null) ? c.rport : c.relatedPort;
+      if (_ra != null && _rp != null) _parts.push('raddr', _ra, 'rport', _rp);
+      if (c.tcpType) _parts.push('tcptype', c.tcpType);
+      _line = 'candidate:' + _parts.join(' ');
+    }
+    // Return a REAL RTCIceCandidate. W3C 4.8: getSelectedCandidatePair() and
+    // getRemoteCandidates() hand back RTCIceCandidate objects, and code tests
+    // `pair.local instanceof RTCIceCandidate` before trusting them. A plain
+    // object carries the same fields and fails that check, so a defensive
+    // caller treats a perfectly good candidate as foreign data.
+    try {
+      return new RTCIceCandidate({
+        candidate:        _line,
+        sdpMid:           c.sdpMid != null ? String(c.sdpMid) : '0',
+        sdpMLineIndex:    c.sdpMLineIndex != null ? c.sdpMLineIndex : 0,
+        usernameFragment: c.ufrag || c.usernameFragment || null,
+      });
+    } catch (eIC) { /* fall through to the plain shape below */ }
     return {
+      candidate:  _line,
       foundation: c.foundation != null ? String(c.foundation) : null,
       component:  c.component === 2 ? 'rtcp' : 'rtp',
       protocol:   (c.protocol || 'udp').toLowerCase(),

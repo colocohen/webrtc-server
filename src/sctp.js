@@ -26,6 +26,11 @@ var CHUNK_COOKIE_ECHO       = 10;
 var CHUNK_COOKIE_ACK        = 11;
 var CHUNK_SHUTDOWN_COMPLETE = 14;     // RFC 4960 §3.3.13
 var CHUNK_FORWARD_TSN       = 0xC0;
+// RFC 8260 — user message interleaving. I-DATA carries MID + FSN instead of
+// SSN, so fragments of one message no longer need a contiguous TSN range and
+// a sender may interleave fragments from several streams.
+var CHUNK_I_DATA            = 0x40;
+var CHUNK_I_FORWARD_TSN     = 0xC2;
 var CHUNK_RECONFIG          = 130;
 
 // INIT parameter types
@@ -155,6 +160,10 @@ var HEARTBEAT_MAX_RETRANS = 5;
 var DEFAULT_PMTU             = 1200;
 var SCTP_HEADER_OVERHEAD     = 12;   // common header
 var DATA_CHUNK_OVERHEAD      = 16;   // chunk header (4) + DATA metadata (12)
+// I-DATA carries four more bytes than DATA: SSN(2)+reserved(2) becomes
+// MID(4) plus a PPID-or-FSN word (RFC 8260 2.1). Fragments are correspondingly
+// smaller, so this feeds the same maxPerChunk arithmetic.
+var I_DATA_CHUNK_OVERHEAD    = 20;   // chunk header (4) + I-DATA metadata (16)
 var DEFAULT_MAX_MESSAGE_SIZE = 262144;
 
 // SCTP-8: receive-window accounting. We advertise a dynamic a_rwnd equal
@@ -310,6 +319,26 @@ function SctpAssociation(config) {
 
   // Stream state
   var sendSSN = {};      // streamId → next SSN (sequence number within stream)
+  // streamId → next MID (RFC 8260 message identifier). Separate from SSN
+  // because it must increment for EVERY message, ordered or not: the receiver
+  // groups fragments by MID, so two concurrent messages sharing one are
+  // indistinguishable. SSN is fixed at 0 for unordered messages, and data
+  // channels are unordered.
+  //
+  // Per stream, not per association: RFC 8260 scopes MID to the stream, and
+  // reassembly looks it up inside that stream's fragment store. An
+  // association-wide counter also works numerically but wastes the space and
+  // — measured — breaks tests that open many channels at once.
+  //
+  // SCTP-14: TWO counters, not one. RFC 8260 §2.2.1 gives each stream a
+  // SEPARATE MID space for ordered and for unordered messages. A single
+  // shared counter still yields unique MIDs, so reassembly works — but the
+  // ORDERED space then has holes wherever an unordered message consumed a
+  // value, and the receiver's in-order gate (deliverAssembled) waits forever
+  // for a MID that was never sent. Symptom: mix ordered and unordered sends
+  // on one stream and the ordered ones stop arriving entirely.
+  var sendMIDOrdered   = {};
+  var sendMIDUnordered = {};
   var recvSSN = {};      // streamId → expected next SSN (default 0). Pre-Patch-2
                          // this was declared but never read; Patch 2 makes it
                          // the source of truth for ordered delivery.
@@ -332,11 +361,44 @@ function SctpAssociation(config) {
   // back-forever streams (peer-bug or attack).
   var pendingMsgs = {};
   var MAX_PENDING_MSGS_PER_STREAM = 1000;
-  // SCTP-11 N4: max fragment-store entries per stream. ~256 fragments
-  // covers a max-size DataChannel message (262144B) at the conservative
-  // 1180-byte fragment size, so this cap never affects legit flows.
-  // Defends against BEGIN-only floods that fill memory.
-  var MAX_FRAGS_PER_STREAM = 256;
+  // SCTP-11 N4: max fragment-store entries per stream. Defends against
+  // BEGIN-only floods that fill memory.
+  //
+  // SCTP-14: the old value (256) was sized for ONE max-size DataChannel
+  // message in flight per stream — 262144B at ~1180B/fragment is ~222
+  // fragments, "so this cap never affects legit flows". Interleaving breaks
+  // that assumption: under RFC 8260 several messages on the same stream are
+  // partially reassembled AT THE SAME TIME, and they all live in this one
+  // store. Two 200KB messages interleaved on one stream overflow it, the
+  // eviction drops the oldest fragment, and BOTH messages become
+  // unassemblable — a silent stall that looks exactly like "nothing
+  // arrives".
+  //
+  // The real bound on this buffer is byte-based and already enforced:
+  // myReceiverWindowCredit() advertises (maxReceiveBufferSize − held), so
+  // the peer's window closes before memory runs away. This count cap is a
+  // secondary guard, so it is sized for the worst legitimate case —
+  // maxReceiveBufferSize entirely full of minimum-size fragments — and
+  // clamped to a sane range.
+  // Sizing must admit BOTH legitimate worst cases at once:
+  //   (a) buffer-bound: maxReceiveBufferSize of minimum-size fragments;
+  //   (b) message-bound: ONE maxMessageSize message, whose fragment count is
+  //       message bytes over the smallest real fragment payload. This can
+  //       EXCEED (a): the peer's a_rwnd check admits a fragment while the
+  //       buffer is merely not-yet-full, so a 1MB message against a 1MB
+  //       buffer needs ~907 slots while (a) alone allows only ~889 — and the
+  //       silent oldest-first eviction then discards fragments of a message
+  //       that is still assembling. Audit finding: a single maxMessageSize
+  //       transfer completed on the wire (fully SACKed) yet never delivered,
+  //       with the receiver pinning the remainder in fragStore forever.
+  // The true byte-bound remains the advertised-rwnd flow control; this count
+  // cap is a secondary DoS guard and must never bind before flow control.
+  var _minFragPayload = Math.max(1, pmtu - SCTP_HEADER_OVERHEAD - I_DATA_CHUNK_OVERHEAD);
+  var MAX_FRAGS_PER_STREAM = (config.maxFragsPerStream != null)
+    ? config.maxFragsPerStream
+    : Math.max(256,
+               Math.ceil(maxReceiveBufferSize / 1180),
+               Math.ceil(maxMessageSize / _minFragPayload) + 8);
 
   // Receive tracking
   var lastCumulativeTsn = 0;  // highest contiguous TSN we've acked
@@ -479,6 +541,131 @@ function SctpAssociation(config) {
   // per tick so a same-tick send() burst bundles into one transmit.
   var _transmitScheduled = false;
 
+  // SCTP-14: highest TSN the peer has reported receiving, cumulative or via
+  // a gap block. Drives forward-progress detection for the RTO backoff.
+  var peerHighestSeen = null;
+
+  /* SCTP-14: the peer's a_rwnd from INIT/INIT-ACK — i.e. its receive buffer
+   * when empty. Used as the budget for how much may be left half-assembled
+   * over there at once. Captured once, at handshake, because the live rwnd is
+   * the very thing this budget is meant to protect. */
+  var peerInitialRwnd = 0;
+
+  /* ─── SCTP-14: bidirectional-load detection ───
+   *
+   * Slicing only shortens the time a message waits in OUR queue. When the
+   * peer is also sending hard, the latency an application observes is
+   * dominated by the PEER's scheduling of its own bulk traffic, which we
+   * cannot touch — our contribution becomes a small term in a large sum, and
+   * we are paying the full cost of interleaving for a fraction of the
+   * benefit. Measured by the caller on a both-directions-loaded run: p95
+   * improved only ~20% while throughput carried the whole overhead.
+   *
+   * Byte counters over a sliding window, sampled on a coarse clock; a rate
+   * ratio is all the decision needs, so there is no need for anything finer.
+   */
+  var rateRxBytes = 0, rateTxBytes = 0;      // accumulate within the window
+  var rateRxPerSec = 0, rateTxPerSec = 0;    // EWMA of the last windows
+  var rateWindowStart = 0;
+  var bidirectionalLoad = false;             // latched decision
+  var bidiStreak = 0;                        // consecutive windows agreeing
+
+  // SCTP-14: running sum of payloadLen over the PENDING region of sendQueue
+  // (entries with inFlight === false). Counterpart to outstandingBytes, which
+  // covers the in-flight prefix. Maintained incrementally because the pump
+  // consults it on every transmit pass and an O(queue) scan there would be
+  // quadratic on exactly the large transfers this code exists for.
+  var pendingBytes = 0;
+
+  /* ─── SCTP-14: user message interleaving (RFC 8260 §1, head-of-line) ───
+   *
+   * txJobs holds messages that are still being fed into sendQueue. A job is
+   * { payload, cursor, ... }: everything sendData settled up front (TSN-
+   * independent metadata — SID, MID, SSN, PPID, PR-SCTP limits) plus how far
+   * through the payload the pump has got.
+   *
+   * Only LONG messages get a job. Short ones are enqueued whole inside
+   * sendData exactly as before, so the common path — DCEP, control traffic,
+   * ordinary small sends — is untouched, including the tick on which its
+   * 'chunkSent' events fire.
+   *
+   * INTERLEAVE_SYNC_FRAGMENTS — at or below this many fragments a message is
+   *   too short to block anything meaningfully, and paying a pump round for
+   *   it would only add latency. At the default 1200-byte PMTU this is
+   *   ~9.3KB, which covers essentially all control and signalling traffic.
+   *
+   * INTERLEAVE_QUANTUM — fragments enqueued per job per round. This is the
+   *   latency/overhead dial: a small quantum interleaves more finely but
+   *   spends more event-loop turns per message. 8 fragments is ~9.4KB per
+   *   round, so a message never delays another by more than about that much
+   *   plus one turn of the loop.
+   */
+  var txJobs = [];
+  var _txPumpScheduled = false;
+  var INTERLEAVE_SYNC_FRAGMENTS = (config.interleaveSyncFragments != null)
+    ? config.interleaveSyncFragments : 8;
+  var INTERLEAVE_QUANTUM = (config.interleaveQuantum != null)
+    ? config.interleaveQuantum : 8;
+  /* INTERLEAVE_MAX_ACTIVE — how many long messages may be in progress on the
+   * wire at once. Interleaving has a cost that is easy to miss: the receiver
+   * holds every partially-assembled message in its fragment store until the
+   * message completes, so where the old serial behaviour held ONE message's
+   * fragments, interleaving N holds N. Past maxReceiveBufferSize the peer's
+   * advertised window collapses and the association degenerates into
+   * one-chunk-per-RTT probing — measured here at 32 concurrent 64KB messages
+   * against a 1MB buffer: correct, but ~20x slower than serial.
+   *
+   * Capping the ACTIVE set fixes it without giving up anything: messages past
+   * the cap wait in FIFO order and start as earlier ones finish. Latency for
+   * short messages is unaffected either way, since those never become jobs —
+   * they are enqueued whole inside sendData and overtake the bulk regardless.
+   * Interleaving among a handful of bulk transfers is all that head-of-line
+   * blocking ever needed; a larger active set only buys buffer pressure. */
+  /* Default 2, not 4. Measured on a saturating transfer, throughput falls as
+   * this rises (5.31 / 4.75 / 4.19 Mbps at 1 / 2 / 4) because every extra
+   * concurrent message is another one the receiver holds half-assembled,
+   * spending the window we need. Latency does NOT pay for it: p95 is flat
+   * across the whole range, because the win comes from the pump YIELDING so
+   * short messages can take TSNs mid-transfer — not from interleaving bulk
+   * messages against each other.
+   *
+   * 1 would be fastest but is a trap: selectActiveJobs always seats the
+   * OLDEST job, so at 1 there is no second slot and shortest-remaining-first
+   * is effectively off. A 40KB message behind a 256KB one then waits for it
+   * — measured 3846ms at 1 versus 360ms at 2. Two is the smallest value that
+   * keeps both properties. */
+  var INTERLEAVE_MAX_ACTIVE = (config.interleaveMaxActive != null)
+    ? config.interleaveMaxActive : 2;
+  /* Ceiling on fragments built in one synchronous refill. Bounds the
+   * event-loop stall from packet construction (alloc + CRC per fragment)
+   * when cwnd is large; whatever is left is picked up by the next pass. */
+  var TX_REFILL_BURST = (config.txRefillBurst != null) ? config.txRefillBurst : 64;
+
+  /* interleaveMode:
+   *   'always'   — slice every long message (default; the measured behaviour)
+   *   'never'    — never slice, identical to the pre-SCTP-14 send path
+   *   'adaptive' — slice only while the reverse direction is quiet
+   *
+   * 'adaptive' exists because interleaving is not free and is not always
+   * worth its price. It is NOT the default: the benefit is workload-specific
+   * and the switch itself can only ever be a guess about traffic that has not
+   * arrived yet, so it should be chosen deliberately, after measuring.
+   */
+  var interleaveMode = config.interleaveMode || 'always';
+  var INTERLEAVE_RATE_WINDOW_MS = (config.interleaveRateWindowMs != null)
+    ? config.interleaveRateWindowMs : 500;
+  /* Reverse traffic counts as "heavy" at this fraction of our own send rate.
+   * 0.5 means the peer is sending at least half what we are — at that point
+   * its queue is comparable to ours and its scheduling dominates what the
+   * application sees. */
+  var INTERLEAVE_BIDI_RATIO = (config.interleaveBidiRatio != null)
+    ? config.interleaveBidiRatio : 0.5;
+  /* Windows of agreement before flipping, in each direction. Hysteresis: a
+   * policy that toggles per burst would slice half a message and enqueue the
+   * rest whole, which is the worst of both. */
+  var INTERLEAVE_BIDI_STREAK = (config.interleaveBidiStreak != null)
+    ? config.interleaveBidiStreak : 3;
+
   /* ─── SCTP-6: PR-SCTP state ───
    *
    * peerSupportsForwardTsn — set during INIT/INIT-ACK exchange when peer
@@ -498,12 +685,20 @@ function SctpAssociation(config) {
    * spam the peer.
    */
   var peerSupportsForwardTsn = false;
+  // Set when the peer advertises I-DATA (RFC 8260). Read by stage 2b before
+  // any I-DATA is sent; exposed on the public surface so the application can
+  // report whether interleaving was negotiated, as Pion does through
+  // getStats().
+  var peerSupportsIData = false;
   var nextMessageSeq         = 0;
   var lastForwardTsnSent;     // undefined until first FORWARD-TSN sent
   // SCTP-6: highest abandoned SSN per ordered stream since last FORWARD-TSN.
   // Cleared after each emit. Pairs added to FORWARD-TSN body so peer can
   // advance recvSSN past abandoned ordered messages without waiting.
   var abandonedSSNPerStream  = {};
+  // SCTP-14: I-FORWARD-TSN skip tracker — streamId+('o'|'u') → highest
+  // abandoned 32-bit MID in that stream's ordered/unordered space.
+  var abandonedMidPerStream  = {};
 
   /* ─── SCTP-7: Stream Reset state (RFC 6525) ───
    *
@@ -714,6 +909,13 @@ function SctpAssociation(config) {
       handleCookieEcho(data);
     } else if (type === CHUNK_COOKIE_ACK) {
       handleCookieAck();
+    } else if (type === CHUNK_I_DATA) {
+      // RECEIVE-ONLY for now: we parse and reassemble interleaved messages a
+      // peer sends us, but do not advertise the extension and never send
+      // I-DATA ourselves. A peer only uses I-DATA when BOTH sides negotiated
+      // it (RFC 8260 3.1), so nothing reaches this path unless a future
+      // change starts advertising — at which point receive is already proven.
+      handleIData(flags, data);
     } else if (type === CHUNK_DATA) {
       handleData(flags, data);
     } else if (type === CHUNK_SACK) {
@@ -730,6 +932,8 @@ function SctpAssociation(config) {
       handleShutdownComplete();
     } else if (type === CHUNK_FORWARD_TSN) {
       handleForwardTsn(data);
+    } else if (type === CHUNK_I_FORWARD_TSN) {
+      handleIForwardTsn(data);              // SCTP-14 / RFC 8260 §2.3.1
     } else if (type === CHUNK_RECONFIG) {
       handleReconfig(data);                 // SCTP-7
     } else if (type === CHUNK_ABORT) {
@@ -799,7 +1003,7 @@ function SctpAssociation(config) {
     remoteVerificationTag = initiateTag;
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
-    remoteRwnd = aRwnd; ssthresh = aRwnd;
+    remoteRwnd = aRwnd; ssthresh = aRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
 
     // SCTP-6: detect PR-SCTP support. Params start after the fixed 16-byte
     // INIT prefix.
@@ -840,9 +1044,10 @@ function SctpAssociation(config) {
     // reset, RFC 6525). length = 4 (header) + 2 (bytes) = 6; padded to
     // 4-byte boundary so the next param starts aligned.
     initAckBody.writeUInt16BE(PARAM_SUPPORTED_EXTENSIONS, 16);
-    initAckBody.writeUInt16BE(6, 18);
+    initAckBody.writeUInt16BE(7, 18);
     initAckBody[20] = CHUNK_FORWARD_TSN;
     initAckBody[21] = CHUNK_RECONFIG;
+    initAckBody[22] = CHUNK_I_DATA;   // RFC 8260 — see the note on INIT
     // bytes 22-23: padding (Buffer.alloc gives zeros)
 
     // Pad supported extensions to 4 bytes
@@ -871,7 +1076,7 @@ function SctpAssociation(config) {
 
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
-    remoteRwnd = aRwnd; ssthresh = aRwnd;
+    remoteRwnd = aRwnd; ssthresh = aRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
 
     // SCTP-6: detect PR-SCTP support.
     detectSupportedExtensions(data.subarray(16));
@@ -920,7 +1125,7 @@ function SctpAssociation(config) {
     localTsn              = cookieData.readUInt32BE(8);
     remoteTsn             = cookieData.readUInt32BE(12);
     lastCumulativeTsn     = (remoteTsn - 1) >>> 0;
-    remoteRwnd = cookieData.readUInt32BE(16); ssthresh = remoteRwnd;
+    remoteRwnd = cookieData.readUInt32BE(16); ssthresh = remoteRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
 
     // Send COOKIE-ACK
     sendChunk(CHUNK_COOKIE_ACK, 0, Buffer.alloc(0), remoteVerificationTag);
@@ -944,22 +1149,82 @@ function SctpAssociation(config) {
 
   /* ── DATA ── */
 
-  function handleData(flags, data) {
-    // Per RFC 4960 §9.2, after we receive SHUTDOWN we must continue to
-    // accept and SACK any in-flight DATA from the peer (they may have
-    // chunks already on the wire when their SHUTDOWN was sent). After
-    // we send SHUTDOWN_ACK, the peer is required to stop sending DATA;
-    // we drop anything that arrives in those later states.
-    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) {
-      return;
-    }
-    if (data.length < 12) return;
+  /**
+   * I-DATA (RFC 8260 2.1). Same job as handleData, different header:
+   *
+   *     DATA    TSN(4) SID(2) SSN(2)      PPID(4)          payload
+   *     I-DATA  TSN(4) SID(2) reserved(2) MID(4) PPID/FSN(4) payload
+   *
+   * The fourth word is PPID on a first fragment (B flag set) and FSN on any
+   * other — the two never coexist, because a continuation inherits the PPID
+   * of the message it belongs to.
+   *
+   * Reassembly keys on SID+MID rather than a contiguous TSN run, which is the
+   * whole point of the extension: fragments of different messages may be
+   * interleaved on the wire.
+   */
+  function handleIData(flags, data) {
+    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) return;
+    if (data.length < 16) return;
 
     var tsn      = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
     var streamId = data[4] << 8 | data[5];
-    var ssn      = data[6] << 8 | data[7];
-    var ppid     = (data[8] << 24 | data[9] << 16 | data[10] << 8 | data[11]) >>> 0;
-    var payload  = data.subarray(12);
+    // data[6..7] reserved
+    var mid      = (data[8] << 24 | data[9] << 16 | data[10] << 8 | data[11]) >>> 0;
+    var fourth   = (data[12] << 24 | data[13] << 16 | data[14] << 8 | data[15]) >>> 0;
+    var payload  = data.subarray(16);
+
+    var isBegin = !!(flags & DATA_FLAG_BEGIN);
+    var ppid    = isBegin ? fourth : 0;
+    var fsn     = isBegin ? 0 : fourth;
+
+    // Hand the PARSED fields to the shared path. Everything after the header
+    // — TSN bookkeeping, SACK policy, the fragment store, delivery — is
+    // identical for both chunk types, and duplicating it would leave two
+    // copies of the most heavily-fixed code in this file.
+    //
+    // Passing fields rather than re-encoding a DATA-shaped buffer avoids
+    // copying the payload a second time, which on the large messages this
+    // extension exists for is the whole cost of the feature. It also keeps
+    // the 32-bit MID intact; squeezing it into DATA's 16-bit SSN field would
+    // alias two messages onto one identifier every 65536 messages.
+    _acceptDataFields(flags, tsn, streamId, mid, ppid, payload, mid, fsn);
+  }
+
+  /**
+   * @param iMid  RFC 8260 message identifier, when this arrived as I-DATA.
+   *              Null for classic DATA, where the TSN run carries the
+   *              ordering and there is no message id.
+   * @param iFsn  fragment number within that message; null likewise.
+   */
+  function handleData(flags, data) {
+    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) return;
+    if (data.length < 12) return;
+    _acceptDataFields(
+      flags,
+      (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0,   // tsn
+      data[4] << 8 | data[5],                                          // sid
+      data[6] << 8 | data[7],                                          // ssn
+      (data[8] << 24 | data[9] << 16 | data[10] << 8 | data[11]) >>> 0, // ppid
+      data.subarray(12),
+      null, null);                                                     // not interleaved
+  }
+
+  /**
+   * The shared receive path, from parsed header fields onward.
+   *
+   * @param seq   ordering key: SSN for DATA, MID for I-DATA.
+   * @param iMid  RFC 8260 message identifier, or null for classic DATA where
+   *              the contiguous TSN run carries the ordering instead.
+   * @param iFsn  fragment number within that message; null likewise.
+   */
+  function _acceptDataFields(flags, tsn, streamId, seq, ppid, payload, iMid, iFsn) {
+    rateRxBytes += payload.length;   // SCTP-14: reverse-direction load
+    // State gating and header parsing happen in the callers (handleData for
+    // DATA, handleIData for I-DATA) — RFC 4960 §9.2 still applies: after
+    // receiving SHUTDOWN we keep accepting and SACKing in-flight chunks, and
+    // drop anything arriving once SHUTDOWN_ACK has been sent.
+    var ssn = seq;
 
     var isBegin     = !!(flags & DATA_FLAG_BEGIN);
     var isEnd       = !!(flags & DATA_FLAG_END);
@@ -1028,6 +1293,12 @@ function SctpAssociation(config) {
       ssn: ssn, ppid: ppid,
       isBegin: isBegin, isEnd: isEnd, isUnordered: isUnordered,
       payload: Buffer.from(payload),
+      // Interleaving identity (RFC 8260). Null on classic DATA, where the
+      // TSN run itself carries the ordering; set on I-DATA, where fragments
+      // of one message are found by mid and ordered by fsn no matter what
+      // else sits between them in TSN space.
+      mid: (typeof iMid === 'number') ? iMid : null,
+      fsn: (typeof iFsn === 'number') ? iFsn : null,
     });
 
     // Try to extract any complete messages that are now assemblable.
@@ -1091,6 +1362,31 @@ function SctpAssociation(config) {
     var now = Date.now();
     var ackedSomething = false;
 
+    /* ── SCTP-14: forward-progress detection for the RTO backoff ──
+     *
+     * onT3Expire doubles rto every expiry, up to the 60s cap, and only a
+     * cumulative-ack advance ever brings it back down. Under scattered loss
+     * that is a trap the association cannot climb out of: the head chunk is
+     * missing, so cumTsn is pinned, so the backoff keeps growing, so the
+     * next retransmit attempt is further away, so cumTsn stays pinned.
+     * Observed: rto reached exactly 60000 and the transfer sat idle for
+     * minutes with a healthy window and 261 chunks queued.
+     *
+     * But a SACK carrying NEW gap blocks is proof the path is delivering,
+     * even while cumTsn stands still — that is precisely the situation
+     * interleaving produces, since a message's fragments no longer form one
+     * contiguous run whose head gates everything behind it. So progress is
+     * measured against the highest TSN the peer has reported receiving by
+     * ANY means, cumulative or gap-acked.
+     */
+    var peerHighestThisSack = cumTsn;
+    for (var pg = 0; pg < gaps.length; pg++) {
+      if (tsnGt(gaps[pg].end, peerHighestThisSack)) peerHighestThisSack = gaps[pg].end;
+    }
+    var peerMadeProgress = (peerHighestSeen === null) ||
+                           tsnGt(peerHighestThisSack, peerHighestSeen);
+    if (peerMadeProgress) peerHighestSeen = peerHighestThisSack;
+
     // Drop cumulatively acked chunks. Use Karn's algorithm: only sample
     // RTT from chunks that haven't been retransmitted (otherwise we
     // can't tell which transmission was acked). Each drop fires a
@@ -1126,7 +1422,26 @@ function SctpAssociation(config) {
 
     // SCTP-9: cum-ack progressed → loss event recovered. Allow another
     // fast-retransmit halving on the next loss.
+    // SCTP-14: forward progress also retires any T3 backoff still in effect.
     if (dropCount > 0) fastRetransmitCutThisRound = false;
+    // SCTP-14: any evidence the peer is still receiving retires the backoff.
+    // BOTH signals are needed and they are not the same event. A cum-ack
+    // advance is the obvious one. Gap progress catches the case where the
+    // head chunk is missing so cumTsn cannot move at all. And the reverse:
+    // when a retransmit finally plugs a hole, cumTsn leaps forward over TSNs
+    // the peer had already gap-acked — real progress, yet the HIGHEST TSN it
+    // has seen does not change, so the gap test alone misses it. Gating on
+    // only one of the two leaves the backoff stuck in the other case.
+    if (dropCount > 0 || peerMadeProgress) collapseRtoBackoff();
+    // SCTP-14: retire I-FORWARD-TSN skip entries the peer has provably
+    // consumed — its cumulative ack has moved past every TSN of the
+    // abandoned message, which can only happen after it processed the
+    // I-FORWARD-TSN covering that hole.
+    for (var akey in abandonedMidPerStream) {
+      if (tsnGt(cumTsn, abandonedMidPerStream[akey].tsn)) {
+        delete abandonedMidPerStream[akey];
+      }
+    }
     // A stream may have just gone quiet — release any reset waiting on it.
     _releaseReadyStreamResets();
     // SCTP-9: grow cwnd according to slow-start / CA rules.
@@ -1270,7 +1585,11 @@ function SctpAssociation(config) {
     // can exploit).
     if (inFlightCount === 0) {
       clearT3Timer();
-    } else if (ackedSomething || wasNoInFlight) {
+    } else if (ackedSomething || wasNoInFlight || peerMadeProgress) {
+      // SCTP-14: peerMadeProgress included. Without it a SACK that advances
+      // only the gap blocks leaves the old, backed-off deadline in place —
+      // so the timer that collapseRtoBackoff just shortened would still not
+      // fire for another minute. Re-arming applies the new RTO immediately.
       startT3Timer();
     }
 
@@ -1633,6 +1952,9 @@ function SctpAssociation(config) {
   function finalizeClose() {
     if (closed) return;   // idempotent
     closed = true;
+    // SCTP-14: drop any half-enqueued messages. The pump is unref'd and
+    // guards on state, but clearing here means no work is even attempted.
+    txJobs.length = 0;
     clearShutdownTimer();
     // SCTP-1: also clear retransmit + heartbeat timers, otherwise they
     // may fire after the association is supposedly gone, hitting
@@ -1670,24 +1992,118 @@ function SctpAssociation(config) {
    * The rebase model fixes it for free: rebaseBy drops everything ≤
    * newCumTsn from receivedRanges and shifts the rest, in one operation.
    */
-  function handleForwardTsn(data) {
+  /* SCTP-14 / RFC 8260 §2.3.1 — I-FORWARD-TSN (0xC2).
+   *
+   * TSN semantics are identical to FORWARD-TSN: advance cumTsn, sweep
+   * orphaned fragments. Only the skip entries differ — SID(2) Flags(2,
+   * bit0 = U) MID(4) instead of SID(2) SSN(2) — because under interleaving
+   * the receiver's in-order gate runs on 32-bit MIDs, and unordered
+   * messages have their own MID space whose holes also need announcing
+   * (their fragments may be parked in fragStore waiting for a middle piece
+   * that was abandoned).
+   *
+   * Both handlers share advanceCumTsnForAbandon for the common part rather
+   * than duplicating the fragment sweep — the sweep has wrap-around
+   * subtleties that must not fork. */
+  function handleIForwardTsn(data) {
     if (data.length < 4) return;
     var newCumTsn = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
     if (!tsnGt(newCumTsn, lastCumulativeTsn)) return;
+    /* CRITICAL DIFFERENCE from handleForwardTsn: NO blanket sweep of the
+     * (oldCum, newCum] TSN window. Under classic DATA a message occupies one
+     * contiguous TSN run, so every fragment inside an abandoned window
+     * belongs to an abandoned message and sweeping the window is safe. Under
+     * interleaving that is exactly false — a live message's fragments sit
+     * BETWEEN the abandoned one's TSNs, inside the advanced window. The
+     * sweep was deleting fragments of messages the peer fully delivered,
+     * leaving them pinned half-assembled forever (audit 6: message 3 held at
+     * 23984 bytes, never delivered, association otherwise idle).
+     * Orphan cleanup under I-DATA is identity-based instead: the skip
+     * entries below name the abandoned (SID, U, MID) exactly, and
+     * dropFragsForMid removes precisely those. */
+    advanceCumTsnKeepFrags(newCumTsn);
 
-    // SCTP-6: snapshot oldCumTsn BEFORE the rebase so we know the abandoned
-    // window is (oldCumTsn, newCumTsn]. fragStore entries in that window
-    // are orphans (e.g., we got BEGIN+MIDDLE of a message but peer abandoned
-    // it before sending END). Without explicit cleanup they'd sit in memory
-    // forever and confuse future tryAssemble walks.
+    var off = 4;
+    while (off + 8 <= data.length) {
+      var sid   = (data[off] << 8 | data[off + 1]);
+      var flags = (data[off + 2] << 8 | data[off + 3]);
+      var mid   = (data[off + 4] << 24 | data[off + 5] << 16 |
+                   data[off + 6] << 8  | data[off + 7]) >>> 0;
+      if (flags & 1) {
+        dropFragsForMid(sid, mid, true);
+      } else {
+        dropFragsForMid(sid, mid, false);
+        advanceRecvMidPastAbandoned(sid, mid);
+      }
+      off += 8;
+    }
+
+    // Mirror handleForwardTsn: the rebase may have exposed a contiguous
+    // prefix (a TSN above the old cum-ack we had already received).
+    drainPrefix();
+  }
+
+  // Identity-based orphan cleanup: drop stored fragments of the named
+  // stream/space whose MID is at or below the abandoned one. Fragments of
+  // other messages — even at TSNs inside the advanced window — are LIVE and
+  // must be kept; their missing pieces may still arrive as retransmissions.
+  function dropFragsForMid(streamId, abandonedMid, unordered) {
+    var store = fragStore[streamId];
+    if (!store) return;
+    var toDel = null;
+    store.forEach(function (frag, tsn) {
+      if (frag.mid != null && frag.isUnordered === unordered &&
+          (frag.mid === abandonedMid || tsnLt(frag.mid, abandonedMid))) {
+        (toDel || (toDel = [])).push(tsn);
+      }
+    });
+    if (toDel) {
+      for (var i = 0; i < toDel.length; i++) store.delete(toDel[i]);
+      if (store.size === 0) delete fragStore[streamId];
+    }
+  }
+
+  /* 32-bit twin of advanceRecvSSNPastAbandoned. Not merged with it: the
+   * two differ in every arithmetic step (mask, comparison, increment), and
+   * a shared body parameterised on width would bury exactly the 16/32
+   * distinction that already caused one delivery-stall bug here. */
+  function advanceRecvMidPastAbandoned(streamId, abandonedMid) {
+    var current = recvSSN[streamId] || 0;
+    if (current === abandonedMid || tsnLt(current, abandonedMid)) {
+      recvSSN[streamId] = (abandonedMid + 1) >>> 0;
+    }
+    var pending = pendingMsgs[streamId];
+    if (pending) {
+      var toDel = [];
+      pending.forEach(function (_msg, mid) {
+        if (mid === abandonedMid || tsnLt(mid, abandonedMid)) toDel.push(mid);
+      });
+      for (var di = 0; di < toDel.length; di++) pending.delete(toDel[di]);
+      var expected = recvSSN[streamId];
+      while (pending.has(expected)) {
+        var nxt = pending.get(expected);
+        pending.delete(expected);
+        processMessage(streamId, nxt.ppid, nxt.payload);
+        expected = (expected + 1) >>> 0;
+      }
+      recvSSN[streamId] = expected;
+      if (pending.size === 0) delete pendingMsgs[streamId];
+    }
+  }
+
+  /* Shared TSN-advance for both FORWARD-TSN flavours: rebase past the
+   * abandoned window and sweep fragStore orphans inside it. Snapshot
+   * oldCumTsn BEFORE the rebase — the abandoned window is
+   * (oldCumTsn, newCumTsn], and fragments there (e.g. BEGIN+MIDDLE of a
+   * message whose END was abandoned) would otherwise sit in memory forever
+   * and confuse future tryAssemble walks. */
+  function advanceCumTsnForAbandon(newCumTsn) {
     var oldCumTsn = lastCumulativeTsn;
     var delta     = (newCumTsn - oldCumTsn) >>> 0;
 
     rebaseBy(delta);
 
-    // Sweep fragStore for orphans. Each stream's store maps tsn → fragment;
-    // we walk it once per stream collecting tsns to delete (Map iteration
-    // is safe but mutation isn't, hence the two-pass).
+    // Two-pass sweep: Map iteration is safe but mutation during it isn't.
     for (var sidStr in fragStore) {
       var store = fragStore[sidStr];
       var toDel = null;
@@ -1705,6 +2121,20 @@ function SctpAssociation(config) {
         if (store.size === 0) delete fragStore[sidStr];
       }
     }
+  }
+
+  // I-DATA variant of the cum-TSN advance: rebase the received-TSN ranges
+  // but leave fragStore alone (see handleIForwardTsn for why).
+  function advanceCumTsnKeepFrags(newCumTsn) {
+    var delta = (newCumTsn - lastCumulativeTsn) >>> 0;
+    rebaseBy(delta);
+  }
+
+  function handleForwardTsn(data) {
+    if (data.length < 4) return;
+    var newCumTsn = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
+    if (!tsnGt(newCumTsn, lastCumulativeTsn)) return;
+    advanceCumTsnForAbandon(newCumTsn);
 
     // Parse optional Stream/SSN pairs (RFC 3758 §3.2). Each pair tells us
     // "peer abandoned an ordered message on stream S with sequence N";
@@ -1902,6 +2332,11 @@ function SctpAssociation(config) {
     }
 
     var sidSet = new Set(streams);
+    // SCTP-14: also drop the un-enqueued tail of any message still being
+    // pumped onto a stream being reset — otherwise the pump would keep
+    // appending DATA for a stream whose sequence numbering has just been
+    // reset out from under it.
+    dropTxJobs(function (j) { return sidSet.has(j.streamId); });
     // Drop unacked DATA for the requested streams from sendQueue. Each
     // dropped chunk fires chunkAcked so bufferedAmount stays correct.
     for (var qi = sendQueue.length - 1; qi >= 0; qi--) {
@@ -1989,6 +2424,14 @@ function SctpAssociation(config) {
   function _streamHasOutstanding(sid) {
     for (var i = 0; i < sendQueue.length; i++) {
       if (sendQueue[i].streamId === sid) return true;
+    }
+    // SCTP-14: a message still being pumped is outstanding too, even when
+    // the fragments enqueued so far have all been acked. Checking only
+    // sendQueue would report the stream idle mid-message and let the
+    // RECONFIG overtake the tail — the same "send(msg); close();" loss this
+    // guard exists to prevent, just moved one layer down.
+    for (var j = 0; j < txJobs.length; j++) {
+      if (txJobs[j].streamId === sid) return true;
     }
     return false;
   }
@@ -2088,6 +2531,19 @@ function SctpAssociation(config) {
     // piece is why that first chunk never leaves. Next probe: trace
     // transmitPending's selection for a stream whose channel entered
     // 'closing' in the same turn.
+    // SCTP-14: W3C close() flushes what the application already sent, so
+    // finish enqueuing any in-progress message on these streams rather than
+    // dropping its tail. This also settles _streamHasOutstanding into its
+    // sendQueue-only answer below.
+    var _resetSids = new Set(streamIds);
+    for (var _ji = txJobs.length - 1; _ji >= 0; _ji--) {
+      if (!_resetSids.has(txJobs[_ji].streamId)) continue;
+      var _fj = txJobs[_ji];
+      while (emitFragment(_fj)) { /* drain this message fully */ }
+      txJobs.splice(_ji, 1);
+    }
+    scheduleTransmit();
+
     var _busy = streamIds.some(_streamHasOutstanding);
     if (_busy) {
       var _entry = { streamIds: streamIds.slice(), send: _sendReset, timer: null };
@@ -2197,8 +2653,52 @@ function SctpAssociation(config) {
 
   /* ========================= Message delivery ========================= */
 
+  // Queue of reassembled messages awaiting delivery, and the drain that hands
+  // them up ONE PER TASK. See processMessage.
+  var _deliverQueue = [];
+  var _deliverScheduled = false;
+
+  function _drainDeliveries() {
+    _deliverScheduled = false;
+    if (closed) { _deliverQueue.length = 0; return; }
+    var item = _deliverQueue.shift();
+    if (item) {
+      try { ev.emit('data', item[0], item[1], item[2]); } catch (e) { /* a handler must not stall the queue */ }
+    }
+    if (_deliverQueue.length > 0) _scheduleDelivery();
+  }
+
+  function _scheduleDelivery() {
+    if (_deliverScheduled) return;
+    _deliverScheduled = true;
+    var t = setTimeout(_drainDeliveries, 0);
+    if (t.unref) t.unref();
+  }
+
+  /**
+   * Hand a reassembled message to the application — ONE PER TASK.
+   *
+   * Messages arrive in bursts: a single SCTP packet can carry several, and the
+   * reordering drain can release a whole run at once. Emitting them in a
+   * synchronous loop delivered the entire burst before the application got a
+   * chance to run, which breaks the ordinary pattern of consuming one message
+   * at a time:
+   *
+   *     const {data} = await new Promise(r => channel.onmessage = r);
+   *
+   * The handler is only reattached after the await — a microtask — so every
+   * message after the first in each burst landed on a handler that had already
+   * been removed. Measured with 100 messages: 3 arrived, 97 were lost.
+   *
+   * Browsers deliver each message as its own task, which is why the pattern
+   * works there. A macrotask per message matches that, and gives handlers,
+   * promise continuations and reattached listeners a chance to run in between.
+   * Ordering is preserved: the queue is FIFO and the drain takes one item.
+   */
   function processMessage(streamId, ppid, payload) {
-    ev.emit('data', streamId, ppid, payload);
+    _deliverQueue.push([streamId, ppid, payload]);
+    _scheduleDelivery();
+    return;
   }
 
 
@@ -2294,110 +2794,530 @@ function SctpAssociation(config) {
       sendSSN[streamId] = (ssn + 1) & 0xFFFF;
     }
 
+    // RFC 8260 MID: one per message on this stream, always incremented.
+    // Allocated even when not sending I-DATA — it costs a counter bump and
+    // keeps the two paths from diverging if the peer's support changes.
+    //
+    // SCTP-14: ordered and unordered draw from SEPARATE per-stream spaces
+    // (RFC 8260 §2.2.1). See the sendMIDOrdered/sendMIDUnordered comment.
+    var midSpace = unordered ? sendMIDUnordered : sendMIDOrdered;
+    var mid = midSpace[streamId] || 0;
+    midSpace[streamId] = (mid + 1) >>> 0;
+
     // SCTP-6: messageSeq groups fragments for abandon/lookup. Distinct from
     // SSN (which is per-stream and on-the-wire); messageSeq is purely local.
     var messageSeq = nextMessageSeq;
     nextMessageSeq = (nextMessageSeq + 1) >>> 0;
 
-    var maxPerChunk = pmtu - SCTP_HEADER_OVERHEAD - DATA_CHUNK_OVERHEAD;
+    // RFC 8260: send I-DATA only when the peer ADVERTISED it. A peer that did
+    // not has no parser for chunk type 0x40 and would treat the whole packet
+    // as malformed — so this single flag is the difference between the new
+    // wire format and the old one, and everything below keys off it.
+    var useIData = (peerSupportsIData === true);
+    var chunkOverhead = useIData ? I_DATA_CHUNK_OVERHEAD : DATA_CHUNK_OVERHEAD;
+    var maxPerChunk = pmtu - SCTP_HEADER_OVERHEAD - chunkOverhead;
     var numFragments = payload.length === 0
                          ? 1
                          : Math.ceil(payload.length / maxPerChunk);
 
-    var now = Date.now();
+    // ── SCTP-14: enqueue policy ──────────────────────────────────────
+    // Everything below builds fragments; the only question is WHEN. A
+    // message small enough to not matter is built here and now, exactly as
+    // before. A long one becomes a job that the pump feeds into sendQueue a
+    // few fragments at a time, yielding in between, so a send() that happens
+    // later still gets its TSNs interleaved between this message's.
+    //
+    // Interleaving REQUIRES I-DATA. Under classic DATA the receiver
+    // reassembles by walking a contiguous TSN run (tryAssemble's
+    // expectTsn = tsn + 1 walk), so any fragment of another message landing
+    // in the middle breaks the chain — for messages on OTHER streams too,
+    // since a gap in the run is a gap regardless of who filled it. So
+    // without I-DATA we keep the old all-at-once behaviour, which is also
+    // what a peer that never advertised the extension expects.
+    var job = {
+      streamId:       streamId,
+      payload:        payload,
+      ppid:           ppid,
+      ssn:            ssn,
+      mid:            mid,
+      messageSeq:     messageSeq,
+      unordered:      unordered,
+      maxRetransmits: maxRetransmits,
+      maxLifetime:    maxLifetime,
+      useIData:       useIData,
+      chunkOverhead:  chunkOverhead,
+      maxPerChunk:    maxPerChunk,
+      numFragments:   numFragments,
+      cursor:         0,
+      // PR-SCTP deadlines run from the send() call, not from the moment a
+      // fragment happens to reach the queue — otherwise a message's later
+      // fragments would each get a fresh lifetime and outlive their deadline.
+      createdAt:      Date.now(),
+    };
 
-    for (var f = 0; f < numFragments; f++) {
-      var fragStart   = f * maxPerChunk;
-      var fragEnd     = Math.min(fragStart + maxPerChunk, payload.length);
-      var fragPayload = payload.subarray(fragStart, fragEnd);
-
-      var tsn = localTsn;
-      localTsn = (localTsn + 1) >>> 0;
-
-      var flags = 0;
-      if (f === 0)                  flags |= DATA_FLAG_BEGIN;
-      if (f === numFragments - 1)   flags |= DATA_FLAG_END;
-      if (unordered)                flags |= DATA_FLAG_UNORDERED;
-
-      // Performance: single Buffer.alloc per fragment that holds the FULL
-      // wire packet (SCTP common header + chunk header + DATA metadata +
-      // payload + padding). Pre-optimization we allocated `body` and then
-      // a separate packet inside sendChunk, copying body in. For a 100KB
-      // user message that's 88 fragments × 2 allocs = 176; now it's 88.
-      // We retain the packet in sendQueue so retransmit is just a re-emit
-      // (no rebuild) — see onT3Expire / fast-retransmit. None of the
-      // packet bytes change between transmissions: vtag, ports, flags,
-      // TSN, payload, even the CRC are identical.
-      var chunkLen    = 16 + fragPayload.length;   // 4 chunk hdr + 12 data meta + payload
-      var chunkPadded = chunkLen + ((chunkLen % 4) ? (4 - chunkLen % 4) : 0);
-      var pktLen      = 12 + chunkPadded;
-      var pkt = Buffer.alloc(pktLen);
-
-      // Common header
-      pkt.writeUInt16BE(localPort,             0);
-      pkt.writeUInt16BE(remotePort,            2);
-      pkt.writeUInt32BE(remoteVerificationTag, 4);
-      // bytes 8-11: checksum (set after CRC; Buffer.alloc gives zeros)
-
-      // Chunk header
-      pkt[12] = CHUNK_DATA;
-      pkt[13] = flags;
-      pkt.writeUInt16BE(chunkLen, 14);
-
-      // DATA metadata
-      pkt.writeUInt32BE(tsn,      16);
-      pkt.writeUInt16BE(streamId, 20);
-      pkt.writeUInt16BE(ssn,      22);
-      pkt.writeUInt32BE(ppid,     24);
-
-      // Payload
-      fragPayload.copy(pkt, 28);
-
-      // CRC32c — checksum field is currently zeros from Buffer.alloc.
-      pkt.writeUInt32LE(crc32c(pkt), 8);
-
-      sendQueue.push({
-        tsn:            tsn,
-        streamId:       streamId,
-        ppid:           ppid,
-        ssn:            ssn,
-        payloadLen:     fragPayload.length,
-        flags:          flags,
-        packet:         pkt,            // full pre-built wire packet, reused on retransmit
-        firstSentAt:    now,
-        sentAt:         now,
-        retransmits:    0,
-        missingReports: 0,
-        messageSeq:     messageSeq,
-        maxRetransmits: maxRetransmits,
-        maxLifetime:    maxLifetime,
-        unordered:      unordered,
-        inFlight:       false,          // SCTP-8: transmitPending flips this when rwnd allows
-      });
-      sctpStats.chunksSent++;
-
-      // chunkSent fires for ALL queued chunks (in-flight or pending) so
-      // bufferedAmount reflects user's intent. Counterpart chunkAcked
-      // fires from handleSack on cum-ack OR from abandonMessage on PR-SCTP
-      // drop OR from incoming-reset cleanup.
-      try {
-        ev.emit('chunkSent', {
-          streamId: streamId,
-          ppid:     ppid,
-          bytes:    fragPayload.length,
-        });
-      } catch (e) {}
+    sampleRates();
+    if (!shouldSlice(useIData, numFragments)) {
+      while (emitFragment(job)) { /* drain synchronously */ }
+      // SCTP-13: coalesced transmit. Instead of transmitting inline on every
+      // send(), schedule a single transmit pass on the microtask queue. A
+      // burst of send() calls in the same tick therefore all land in
+      // sendQueue *before* the one pass runs, so transmitPending() can bundle
+      // them into full packets (RFC 4960 §6.10) — the whole point of adaptive
+      // bundling. A microtask runs at the end of the current synchronous
+      // stack, before any I/O or timers, so a lone send() still goes out this
+      // same tick: zero real added latency, no Nagle-style waiting.
+      scheduleTransmit();
+      return;
     }
 
-    // SCTP-13: coalesced transmit. Instead of transmitting inline on every
-    // send(), schedule a single transmit pass on the microtask queue. A
-    // burst of send() calls in the same tick therefore all land in
-    // sendQueue *before* the one pass runs, so transmitPending() can bundle
-    // them into full packets (RFC 4960 §6.10) — the whole point of adaptive
-    // bundling. A microtask runs at the end of the current synchronous
-    // stack, before any I/O or timers, so a lone send() still goes out this
-    // same tick: zero real added latency, no Nagle-style waiting.
+    // Long message: register the job. If the active set has room, push its
+    // first quantum right now so the head of the message leaves in this same
+    // tick (no added latency on the first bytes); otherwise it waits its turn
+    // in FIFO order and the pump picks it up as earlier messages finish.
+    txJobs.push(job);
+    // Fill toward the window right now so the head of the message leaves in
+    // this same tick; scheduleTransmit's pass will pick it up.
+    fillTxQueue(TX_REFILL_BURST);
     scheduleTransmit();
+    scheduleTxPump();
+  }
+
+  /* ── SCTP-14: fragment builder ───────────────────────────────────────
+   *
+   * Builds ONE fragment of `job` (the one at job.cursor), appends it to
+   * sendQueue, and advances the cursor. Returns true while the job still
+   * has fragments left.
+   *
+   * This is the body of what used to be sendData's `for (f...)` loop,
+   * lifted out unchanged apart from reading its inputs off `job`. Lifting
+   * it is the whole point: the loop can now be driven from sendData
+   * (synchronously, for short messages) or from the pump (a few per tick,
+   * for long ones) without the two paths diverging.
+   *
+   * TSN ORDER — the invariant everything downstream leans on — survives
+   * because this function is the ONLY place a TSN is allocated, it always
+   * allocates from localTsn, and it always push()es onto the TAIL. Queue
+   * position therefore still tracks TSN order exactly, no matter how the
+   * calls are interleaved between jobs or spread across ticks. Nothing
+   * reorders the queue; handleSack's front-drain, forwardTsn's
+   * sendQueue[0].tsn - 1, and T3's "sendQueue[0] is the oldest" all keep
+   * holding. That is what makes this the safe place to interleave, and the
+   * reason interleaving at drain time was not.
+   */
+  function emitFragment(job) {
+    var f = job.cursor;
+    if (f >= job.numFragments) return false;
+    job.cursor++;
+
+    var fragStart   = f * job.maxPerChunk;
+    var fragEnd     = Math.min(fragStart + job.maxPerChunk, job.payload.length);
+    var fragPayload = job.payload.subarray(fragStart, fragEnd);
+
+    var tsn = localTsn;
+    localTsn = (localTsn + 1) >>> 0;
+
+    var flags = 0;
+    if (f === 0)                      flags |= DATA_FLAG_BEGIN;
+    if (f === job.numFragments - 1)   flags |= DATA_FLAG_END;
+    if (job.unordered)                flags |= DATA_FLAG_UNORDERED;
+
+    // Performance: single Buffer.alloc per fragment that holds the FULL
+    // wire packet (SCTP common header + chunk header + DATA metadata +
+    // payload + padding). Pre-optimization we allocated `body` and then
+    // a separate packet inside sendChunk, copying body in. For a 100KB
+    // user message that's 88 fragments x 2 allocs = 176; now it's 88.
+    // We retain the packet in sendQueue so retransmit is just a re-emit
+    // (no rebuild) — see onT3Expire / fast-retransmit. None of the
+    // packet bytes change between transmissions: vtag, ports, flags,
+    // TSN, payload, even the CRC are identical.
+    var chunkLen    = job.chunkOverhead + fragPayload.length;
+    var chunkPadded = chunkLen + ((chunkLen % 4) ? (4 - chunkLen % 4) : 0);
+    var pktLen      = 12 + chunkPadded;
+    var pkt = Buffer.alloc(pktLen);
+
+    // Common header
+    pkt.writeUInt16BE(localPort,             0);
+    pkt.writeUInt16BE(remotePort,            2);
+    pkt.writeUInt32BE(remoteVerificationTag, 4);
+    // bytes 8-11: checksum (set after CRC; Buffer.alloc gives zeros)
+
+    // Chunk header
+    pkt[12] = job.useIData ? CHUNK_I_DATA : CHUNK_DATA;
+    pkt[13] = flags;
+    pkt.writeUInt16BE(chunkLen, 14);
+
+    if (job.useIData) {
+      // I-DATA metadata (RFC 8260 2.1):
+      //
+      //   TSN(4) SID(2) reserved(2) MID(4) PPID-or-FSN(4)
+      //
+      // The last word is the PPID on a first fragment and the FSN on any
+      // other — a continuation inherits its message's PPID, so the two
+      // never need to travel together. RFC 8260 §2.1: the first fragment's
+      // FSN is implicit 0 (the field carries the PPID instead), so the
+      // second fragment is FSN 1 — which is what `f` gives for f >= 1.
+      pkt.writeUInt32BE(tsn,          16);
+      pkt.writeUInt16BE(job.streamId, 20);
+      pkt.writeUInt16BE(0,            22);   // reserved
+      // MID must be UNIQUE per message on this stream — it is the key the
+      // receiver groups fragments by (RFC 8260 2.1) — and it must come from
+      // the right one of the stream's two MID spaces (ordered / unordered,
+      // RFC 8260 §2.2.1), because for ordered messages the receiver also
+      // uses it as the in-order delivery sequence.
+      //
+      // SSN cannot serve. Unordered messages all take ssn = 0, and data
+      // channels are unordered, so every message would claim MID 0. Under
+      // classic DATA that is harmless: reassembly follows a contiguous TSN
+      // run and two runs cannot overlap. Under I-DATA it is fatal as soon
+      // as two messages are in flight together — their fragments become
+      // indistinguishable and neither reassembles.
+      pkt.writeUInt32BE(job.mid, 24);   // MID
+      pkt.writeUInt32BE((f === 0) ? job.ppid : f, 28);
+      fragPayload.copy(pkt, 32);
+    } else {
+      // DATA metadata (RFC 4960 3.3.1)
+      pkt.writeUInt32BE(tsn,          16);
+      pkt.writeUInt16BE(job.streamId, 20);
+      pkt.writeUInt16BE(job.ssn,      22);
+      pkt.writeUInt32BE(job.ppid,     24);
+      fragPayload.copy(pkt, 28);
+    }
+
+    // CRC32c — checksum field is currently zeros from Buffer.alloc.
+    pkt.writeUInt32LE(crc32c(pkt), 8);
+
+    var nowTs = Date.now();
+    sendQueue.push({
+      tsn:            tsn,
+      streamId:       job.streamId,
+      ppid:           job.ppid,
+      ssn:            job.ssn,
+      payloadLen:     fragPayload.length,
+      flags:          flags,
+      packet:         pkt,            // full pre-built wire packet, reused on retransmit
+      firstSentAt:    job.createdAt,  // PR-SCTP deadline runs from send(), not from enqueue
+      sentAt:         nowTs,
+      retransmits:    0,
+      missingReports: 0,
+      needsRetx:      false,      // SCTP-14: set by T3 (RFC 4960 §6.3.3 E3)
+      messageSeq:     job.messageSeq,
+      mid:            job.mid,        // SCTP-14: needed for I-FORWARD-TSN skips
+      maxRetransmits: job.maxRetransmits,
+      maxLifetime:    job.maxLifetime,
+      unordered:      job.unordered,
+      inFlight:       false,          // SCTP-8: transmitPending flips this when rwnd allows
+    });
+    pendingBytes += fragPayload.length;
+    rateTxBytes  += fragPayload.length;   // SCTP-14
+    sctpStats.chunksSent++;
+
+    // chunkSent fires for ALL queued chunks (in-flight or pending) so
+    // bufferedAmount reflects user's intent. Counterpart chunkAcked
+    // fires from handleSack on cum-ack OR from abandonMessage on PR-SCTP
+    // drop OR from incoming-reset cleanup.
+    try {
+      ev.emit('chunkSent', {
+        streamId: job.streamId,
+        ppid:     job.ppid,
+        bytes:    fragPayload.length,
+      });
+    } catch (e) {}
+
+    return job.cursor < job.numFragments;
+  }
+
+  /* ── SCTP-14: the interleaving pump ──────────────────────────────────
+   *
+   * One round = one quantum of fragments from EVERY active job, in
+   * round-robin order. Then we yield and let the event loop run: SACKs get
+   * processed, timers fire, and — the point of the exercise — a send() that
+   * arrives in the meantime gets its TSNs allocated between this message's
+   * fragments instead of behind all of them.
+   *
+   * Round-robin rather than "finish one slice of message A, then a slice of
+   * message B" because fairness must not depend on the order the yields
+   * happen to resolve in. Every job gets the same quantum every round, so
+   * N concurrent messages each progress at 1/N of the rate with no
+   * per-message timers to coordinate and nothing that degrades as N grows.
+   *
+   * Why setImmediate and not setTimeout(0): setTimeout has a >=1ms clamp in
+   * Node, which would cap a 220-fragment message at ~28 rounds/second. And
+   * why not queueMicrotask: microtasks drain completely before the event
+   * loop advances, so the pump would starve the very I/O it is yielding
+   * for — no SACKs, no incoming data, and the yield buys nothing.
+   * setImmediate runs in the check phase, after pending I/O, which is
+   * exactly the "let the socket breathe, then continue" semantics wanted.
+   *
+   * SCHEDULING AFTER EVERY ROUND IS LOAD-BEARING. Each round appends to
+   * sendQueue and those entries start life with inFlight = false; nothing
+   * moves them until a transmitPending() pass runs. scheduleTransmit()'s
+   * _transmitScheduled flag only coalesces callers within a single tick, so
+   * a round that lands in a later tick needs its own call. Omit it and the
+   * first quantum leaves, every later one accumulates in the queue unsent,
+   * and the transfer stalls with a full send queue and an open window.
+   */
+  function scheduleTxPump() {
+    if (_txPumpScheduled || txJobs.length === 0) return;
+    _txPumpScheduled = true;
+    var t = setImmediate(runTxPump);
+    if (t && typeof t.unref === 'function') t.unref();
+  }
+
+  /* ── SCTP-14: window-driven refill ─────────────────────────────────
+   *
+   * Keep the PENDING region of sendQueue stocked to roughly one send window,
+   * and no more. Both numbers matter, and getting either wrong shows up
+   * immediately in production traffic.
+   *
+   * TOO LITTLE queued starves the congestion controller. handleSack grows
+   * cwnd only when `hasPending` — when chunks are sitting in the queue that
+   * the window would not let out. That is the standard "was the sender
+   * cwnd-limited?" test, and it is how a sender avoids inflating its window
+   * on traffic it never actually offered. A fixed-quantum pump feeding a
+   * handful of fragments per event-loop turn empties the pending region
+   * between SACKs, so the sender reports itself application-limited, cwnd
+   * stops growing, and throughput plateaus far below the path capacity. This
+   * is why the first version of the pump halved server-direction throughput
+   * while fixing latency: the pacing was the ceiling, not the link.
+   *
+   * TOO MUCH queued destroys the latency win. Interleaving allocates TSNs at
+   * enqueue time, so a small message can only overtake fragments that have
+   * not been enqueued YET. Once a long message has dumped hundreds of
+   * fragments into the queue, a control message enqueued afterwards sits
+   * behind all of them no matter how small it is. An unbounded pump does
+   * exactly that whenever the window is closed — it keeps appending while
+   * nothing drains — which is how a short message ends up seconds late.
+   *
+   * One window's worth satisfies both: enough that cwnd growth never sees a
+   * starved queue, little enough that a message arriving now waits at most
+   * about one window ahead of it.
+   *
+   * The refill runs synchronously from transmitPending, so a SACK that opens
+   * the window tops the queue back up in the same turn it arrived — no
+   * event-loop round trip between "window opened" and "data available". The
+   * setImmediate pump remains for the case where nothing is draining yet
+   * (the initial burst) and to spread a very large refill over several turns.
+   */
+  /* Roll the rate window if it has elapsed and re-evaluate the latch.
+   * Called from the send path, so it is driven by traffic rather than by a
+   * timer — an idle association neither samples nor decides anything. */
+  function sampleRates() {
+    var now = Date.now();
+    if (rateWindowStart === 0) { rateWindowStart = now; return; }
+    var dt = now - rateWindowStart;
+    if (dt < INTERLEAVE_RATE_WINDOW_MS) return;
+    var rx = rateRxBytes * 1000 / dt;
+    var tx = rateTxBytes * 1000 / dt;
+    // EWMA so one quiet window does not flip the decision on its own.
+    rateRxPerSec = rateRxPerSec === 0 ? rx : (rateRxPerSec * 0.7 + rx * 0.3);
+    rateTxPerSec = rateTxPerSec === 0 ? tx : (rateTxPerSec * 0.7 + tx * 0.3);
+    rateRxBytes = 0; rateTxBytes = 0; rateWindowStart = now;
+
+    // "Heavy" needs an absolute floor as well as a ratio: a trickle of
+    // control traffic in both directions satisfies any ratio test while
+    // meaning nothing. One MTU per window is the smallest rate that could
+    // plausibly be a bulk transfer.
+    var floor = pmtu * 1000 / INTERLEAVE_RATE_WINDOW_MS;
+    var heavy = (rateRxPerSec > floor) &&
+                (rateRxPerSec >= rateTxPerSec * INTERLEAVE_BIDI_RATIO);
+
+    if (heavy === bidirectionalLoad) { bidiStreak = 0; return; }
+    if (++bidiStreak >= INTERLEAVE_BIDI_STREAK) {
+      bidirectionalLoad = heavy;
+      bidiStreak = 0;
+      // Only report a change the mode actually acts on — under 'always' or
+      // 'never' the latch is advisory and announcing a flip that changes
+      // nothing is misleading telemetry.
+      if (interleaveMode === 'adaptive') {
+        try { ev.emit('interleaveMode', { slicing: !heavy, rxBytesPerSec: Math.round(rateRxPerSec), txBytesPerSec: Math.round(rateTxPerSec) }); } catch (e) {}
+      }
+    }
+  }
+
+  /* Should this message be sliced? */
+  function shouldSlice(useIData, numFragments) {
+    if (!useIData) return false;                        // classic DATA cannot interleave
+    if (numFragments <= INTERLEAVE_SYNC_FRAGMENTS) return false;
+    if (interleaveMode === 'never') return false;
+    if (interleaveMode === 'adaptive' && bidirectionalLoad) return false;
+    return true;
+  }
+
+  function txRefillTarget() {
+    // Only what the window can absorb RIGHT NOW, plus a quantum of headroom.
+    //
+    // Queueing a whole window's worth was wrong: absent loss cwnd grows until
+    // it hits rwnd, so the target became ~1MB and the pending region turned
+    // into a multi-second standing buffer. Since interleaving hands out TSNs
+    // at enqueue time, a control message enqueued behind that buffer waits
+    // for all of it — measured 5.2s at p95 on a 2Mbit link. Textbook
+    // bufferbloat, self-inflicted, in our own queue.
+    //
+    // The pending region has exactly two jobs: have data ready the instant
+    // the window opens, and keep handleSack's hasPending test true so cwnd
+    // still grows. Both need only the unfilled part of the window plus a
+    // little headroom — not a second copy of the window.
+    var w    = Math.min(cwnd, remoteRwnd);
+    var room = Math.max(0, w - outstandingBytes);
+    return room + INTERLEAVE_QUANTUM * pmtu;
+  }
+
+  /* Fill the pending region toward the target, round-robin across the active
+   * jobs so their fragments stay interleaved. Returns true if work remains.
+   * maxFragments bounds the synchronous burst — a large cwnd would otherwise
+   * build hundreds of packets (alloc + CRC each) in one turn and stall the
+   * event loop; the caller reschedules for the rest. */
+  var _fillingTx = false;   // SCTP-14: reentrancy latch, see below
+  function fillTxQueue(maxFragments) {
+    if (txJobs.length === 0) return false;
+    if (state !== STATE_ESTABLISHED) { txJobs.length = 0; return false; }
+    /* REENTRANCY. This function is reachable from inside itself:
+     * emitFragment fires 'chunkSent', a listener may call send(); and any
+     * path that leads to handlePacket (delayed delivery inside the same
+     * process, tests, loopback) can run handleSack -> transmitPending ->
+     * fillTxQueue while an outer fill is mid-loop. The outer loop's `order`
+     * array then holds stale job references whose cursors the inner call
+     * has already advanced — the two interleave their quantum loops on the
+     * SAME job and the accounting (built, pendingBytes vs target) splits
+     * across two frames. Audit finding: ~11 fragments of a live message
+     * silently never emitted (sent=68992 of 81920) when an abandon ran
+     * re-entrantly under an active fill. One latch, not a queue of deferred
+     * fills: the outer call resumes its own loop with fresh state on the
+     * next iteration, and the pump reschedules anyway. */
+    if (_fillingTx) return txJobs.length > 0;
+    _fillingTx = true;
+    try {
+      return _fillTxQueueInner(maxFragments);
+    } finally {
+      _fillingTx = false;
+    }
+  }
+
+  function _fillTxQueueInner(maxFragments) {
+    var target = txRefillTarget();
+    var built  = 0;
+    var order  = selectActiveJobs();
+    while (pendingBytes < target && built < maxFragments && txJobs.length > 0) {
+      var progressed = false;
+      for (var i = order.length - 1; i >= 0; i--) {
+        var job = order[i];
+        if (txJobs.indexOf(job) === -1) continue;   // finished earlier this pass
+        var more = true;
+        for (var q = 0; q < INTERLEAVE_QUANTUM && more; q++) {
+          more = emitFragment(job);
+          built++;
+          progressed = true;
+        }
+        if (!more) {
+          var idx = txJobs.indexOf(job);
+          if (idx !== -1) txJobs.splice(idx, 1);
+          if (txJobs.length === 0) { order = []; break; }
+          order = selectActiveJobs();   // a slot freed — promote a waiter
+        }
+      }
+      if (!progressed) break;
+    }
+    return txJobs.length > 0;
+  }
+
+  /* Which jobs get to run this pass. Shortest REMAINING work first, not
+   * arrival order.
+   *
+   * FIFO admission recreated head-of-line blocking one level up. A 40KB
+   * summary is 35 fragments — over INTERLEAVE_SYNC_FRAGMENTS, so it becomes a
+   * job — and behind a dozen 256KB bulk jobs it waited for all of them:
+   * measured 11.2 seconds. The fragment-level interleaving was working
+   * perfectly; the message never reached it, because it was still queued.
+   *
+   * Shortest-remaining-first is the right rule here (it minimises mean
+   * completion time), and it is the rule that matches what people expect: the
+   * small thing does not wait for the big thing. To stop a steady drip of
+   * small messages from starving a large transfer, the OLDEST job always
+   * holds one slot regardless of size, so the bulk transfer keeps draining.
+   */
+  function selectActiveJobs() {
+    // Total on an empty list. fillTxQueue re-selects every time a job
+    // finishes, and the job that finishes may have been the last one — which
+    // is the normal end of every transfer, not an edge case.
+    if (txJobs.length === 0) return [];
+    var oldest = txJobs[0];
+    var pool   = txJobs.slice(1).sort(function (x, y) {
+      return (x.numFragments - x.cursor) - (y.numFragments - y.cursor);
+    });
+
+    /* ── Byte budget, not just a message count ──
+     *
+     * Every message being interleaved is a message the RECEIVER cannot
+     * deliver yet, so it holds all of its fragments in the reassembly store
+     * until the last one lands. Held bytes therefore scale with how many
+     * messages we interleave times how big they are — and the peer advertises
+     * (its buffer minus what it is holding), so we are spending its receive
+     * window to buy our own latency.
+     *
+     * A fixed count of 4 is fine for 40KB messages and ruinous for 256KB
+     * ones: four of those is ~1MB against a 1MB default buffer, and the
+     * advertised window collapses. Measured on a saturating transfer, rwnd
+     * spiked down to 37KB and throughput halved, while the identical workload
+     * on the serial path held a steady ~900KB window. The interleaving was
+     * not costing CPU or pacing — it was eating the receiver's buffer.
+     *
+     * So the active set is capped by both: at most INTERLEAVE_MAX_ACTIVE
+     * messages, and at most a fraction of the peer's advertised buffer in
+     * total outstanding message bytes. Half leaves the other half as working
+     * room so the window never approaches zero. One job is always admitted
+     * regardless — a single message larger than the whole budget must still
+     * be able to make progress, exactly as it did before interleaving.
+     */
+    var budget = peerInitialRwnd > 0 ? (peerInitialRwnd >> 1) : (64 * pmtu);
+    var chosen = [oldest];
+    var used   = oldest.payload.length;
+    for (var i = 0; i < pool.length && chosen.length < INTERLEAVE_MAX_ACTIVE; i++) {
+      var cand = pool[i];
+      if (used + cand.payload.length > budget) break;   // sorted: rest are bigger
+      chosen.push(cand);
+      used += cand.payload.length;
+    }
+    return chosen;
+  }
+
+  function runTxPump() {
+    _txPumpScheduled = false;
+    if (txJobs.length === 0) return;
+    // The pump outlives the tick that started it, so the association may
+    // have gone away underneath us. Queueing DATA after ESTABLISHED means
+    // emitting packets with a torn-down verification tag.
+    if (state !== STATE_ESTABLISHED) { txJobs.length = 0; return; }
+
+    // Only the first INTERLEAVE_MAX_ACTIVE jobs run (inside fillTxQueue).
+    // txJobs is FIFO, so a waiting message is promoted automatically the
+    // moment an earlier one finishes and is spliced out — no separate queue,
+    // no starvation.
+    fillTxQueue(TX_REFILL_BURST);
+
+    scheduleTransmit();   // see note above — required every round
+    scheduleTxPump();     // more jobs left? keep going
+  }
+
+  /* SCTP-14: drain every outstanding job into sendQueue synchronously.
+   * Used by close(), which must get all user data into the queue before
+   * SHUTDOWN_PENDING — attemptShutdownTransition gates on sendQueue being
+   * EMPTY, so a job still holding fragments would either be lost or, worse,
+   * be enqueued after the shutdown drain had already decided it was done. */
+  function flushTxJobs() {
+    for (var i = 0; i < txJobs.length; i++) {
+      var job = txJobs[i];
+      while (emitFragment(job)) { /* drain */ }
+    }
+    txJobs.length = 0;
+  }
+
+  /* SCTP-14: drop the un-enqueued remainder of jobs matching a predicate.
+   * Fragments already in sendQueue are handled by the existing splice
+   * paths; this is only about the tail that never made it there. */
+  function dropTxJobs(pred) {
+    for (var i = txJobs.length - 1; i >= 0; i--) {
+      if (pred(txJobs[i])) txJobs.splice(i, 1);
+    }
   }
 
   // SCTP-13: microtask-coalesced transmit trigger. Collapses a same-tick
@@ -2412,6 +3332,42 @@ function SctpAssociation(config) {
   // Run the pending transmit pass now (also called synchronously by close()
   // so queued data leaves before SHUTDOWN). Safe to call when nothing is
   // scheduled — it just runs a transmitPending() pass.
+  /**
+   * Interleave at SEND time, not in the queue (RFC 8260 head-of-line
+   * blocking).
+   *
+   * WHAT THE FIRST ATTEMPT GOT WRONG, because it is the thing to know before
+   * touching this again: it reordered the pending region of sendQueue so
+   * fragments of different messages alternated. Control latency p95 fell from
+   * 585ms to 27ms — and throughput went to ZERO. Only 9 of ~240 messages
+   * arrived.
+   *
+   * sendQueue is required to be in ascending TSN order. At least four places
+   * depend on it, and they are all hot:
+   *
+   *   handleSack    drains acknowledged entries from the FRONT and stops at
+   *                 the first TSN above the cumulative ack (twice, lines
+   *                 ~1199 and ~1563)
+   *   forwardTsn    computes advancedPeerAckPoint as sendQueue[0].tsn - 1
+   *   T3 timeout    treats sendQueue[0] as the oldest outstanding chunk
+   *
+   * TSNs are allocated in send() as fragments are built, so reordering the
+   * queue divorces queue position from TSN order: the drain loop hits an
+   * out-of-order TSN, stops early, and the queue never empties. Everything
+   * downstream stalls behind it.
+   *
+   * THE FIX IS TO SCHEDULE EARLIER. Interleaving has to happen where TSNs are
+   * assigned, so the wire order and the queue order stay the same thing. That
+   * means send() must be able to emit a message's fragments in more than one
+   * pass, yielding between them — a change to how a message is enqueued, not
+   * to how the queue is drained.
+   *
+   * Deliberately not attempted here: it restructures the send path, and the
+   * measurement above shows exactly how a plausible-looking change to this
+   * area fails. Stages 1-2b stand on their own — the wire format is
+   * negotiated and working against Firefox — and this is the remaining piece.
+   */
+
   function flushTransmit() {
     _transmitScheduled = false;
     var wasNoInFlight = (inFlightCount === 0);
@@ -2438,9 +3394,37 @@ function SctpAssociation(config) {
    * Hot path: gets called from sendData and handleSack, both per-message.
    */
   function transmitPending() {
+    // SCTP-14: top the queue up FIRST, in this same turn. A SACK that opened
+    // the window must find data ready to go, and handleSack's cwnd-growth
+    // test must find a non-empty pending region.
+    if (txJobs.length > 0) fillTxQueue(TX_REFILL_BURST);
     if (inFlightCount === sendQueue.length) return;   // nothing pending
     var effectiveWindow = Math.min(cwnd, remoteRwnd);
-    var probeAllowed    = (outstandingBytes === 0 && effectiveWindow === 0 && inFlightCount === 0);
+    // ── SCTP-14: window-probe condition (RFC 4960 §6.1) ──
+    //
+    // The probe must fire whenever nothing is in flight and the next chunk
+    // does not fit — NOT only when the window is exactly zero. A window that
+    // is non-zero but smaller than one fragment (say 880 bytes against a
+    // 1168-byte fragment) failed the old `effectiveWindow === 0` test, so no
+    // chunk was sent, so no SACK came back, so the window was never updated:
+    // a permanent deadlock with a full send queue, an idle link, and no
+    // retransmit timer running because nothing was ever in flight.
+    //
+    // It is reachable without interleaving but interleaving walks straight
+    // into it. The receiver advertises (maxReceiveBufferSize − bytes held in
+    // reassembly), and interleaving is precisely the feature that keeps N
+    // messages PARTIALLY assembled at once instead of completing them one at
+    // a time. Held bytes therefore scale with concurrency, the advertised
+    // window shrinks toward zero, and it passes through "smaller than one
+    // fragment" on the way — where the old condition left it stuck. That is
+    // the sharp "works at 4 messages, dead at 8" threshold: it is not a
+    // count, it is the point where N partial messages fill the peer's
+    // receive buffer.
+    //
+    // Sending one chunk into a too-small window is what the RFC allows and
+    // what usrsctp and the Linux stack do: the peer buffers or drops it, but
+    // either way it SACKs, and that SACK carries the current a_rwnd.
+    var probeAllowed    = (outstandingBytes === 0 && inFlightCount === 0);
     var now = Date.now();
 
     // ── Opportunistic chunk bundling (RFC 4960 §6.10) ──
@@ -2503,12 +3487,25 @@ function SctpAssociation(config) {
       var entry = sendQueue[i];
       // Invariant: entry.inFlight === false here.
       if ((outstandingBytes + entry.payloadLen) > effectiveWindow && !probeAllowed) {
-        break;   // FIFO: stop at first non-fitting
+        break;   // stop at the first non-fitting entry
       }
-      probeAllowed = false;   // probe is one-shot
+      probeAllowed = false;   // probe is one-shot: only the first chunk of a
+                              // pass may exceed the window, and only when the
+                              // link is otherwise idle
+      // SCTP-14: a chunk released by T3 (RFC 4960 §6.3.3 E3) is going back out
+      // as a RETRANSMISSION, not a first transmission. Counting it as one
+      // keeps Karn's algorithm honest — sampling RTT off a resent chunk is
+      // how an RTO collapses toward the minimum during exactly the loss burst
+      // that needs it long — and keeps the PR-SCTP retransmit budget real.
+      if (entry.needsRetx) {
+        entry.needsRetx = false;
+        entry.retransmits++;
+        sctpStats.chunksRetransmitted++;
+      }
       entry.inFlight    = true;
       entry.sentAt      = now;     // first-transmit timestamp (RTT via Karn)
       outstandingBytes += entry.payloadLen;
+      pendingBytes     -= entry.payloadLen;
       inFlightCount++;
 
       var chunkLen = entry.packet.length - SCTP_HEADER_OVERHEAD;
@@ -2584,6 +3581,31 @@ function SctpAssociation(config) {
     // the peer couldn't tell that some TSNs had reached us twice.
     var gaps = computeGapBlocks();
     var dups = dupTsns;
+
+    // ── SCTP-14: bound the SACK to one packet ──
+    // computeGapBlocks emits one block per received range with no ceiling.
+    // Under loss the range count grows without limit and the SACK chunk
+    // grows past the PMTU: the packet is then fragmented or dropped by the
+    // path, so the sender gets NO acknowledgement at all — exactly when it
+    // most needs one — and recovery falls back to T3 timeouts.
+    //
+    // Interleaving makes this reachable much sooner. Serial sending loses a
+    // contiguous run of TSNs (one gap block); interleaving spreads a
+    // message's fragments across the TSN space, so the same loss rate
+    // produces many small scattered gaps instead of a few large ones.
+    //
+    // Truncate to what fits, keeping the LOWEST blocks: those sit just above
+    // the cumulative ack, they are the ones that drive fast retransmit, and
+    // the sender re-learns the rest from the next SACK as cumTsn advances.
+    // Duplicates are the first thing sacrificed — they are diagnostic, while
+    // gap blocks are what actually drives recovery.
+    var sackCapacity = pmtu - SCTP_HEADER_OVERHEAD - 4 /* chunk header */ - 12 /* SACK fixed fields */;
+    var maxEntries   = Math.max(1, Math.floor(sackCapacity / 4));
+    if (gaps.length > maxEntries) gaps = gaps.slice(0, maxEntries);
+    if (gaps.length + dups.length > maxEntries) {
+      dups = dups.slice(0, Math.max(0, maxEntries - gaps.length));
+    }
+
     var bodyLen = 12 + gaps.length * 4 + dups.length * 4;
     var body = Buffer.alloc(bodyLen);
 
@@ -2905,8 +3927,56 @@ function SctpAssociation(config) {
       return;
     }
 
+    // ── SCTP-14: RFC 4960 §6.3.3 E3 — release the whole outstanding window ──
+    //
+    // The old code retransmitted sendQueue[0] and left every OTHER in-flight
+    // chunk marked inFlight = true. Those chunks were presumed lost, yet they
+    // kept their share of outstandingBytes forever, so transmitPending's
+    //
+    //     (outstandingBytes + entry.payloadLen) > effectiveWindow  ->  break
+    //
+    // test could never pass again: cwnd had just been cut to one MTU while
+    // outstandingBytes still counted the entire pre-loss window. From that
+    // point the association advanced only by one T3 retransmit per RTO, with
+    // the RTO doubling each time — and because only one chunk was ever in
+    // flight, the peer's SACKs carried no gap blocks, so fast retransmit
+    // could not fire either. Measured: 10 retransmits in 80 seconds, all T3,
+    // zero fast retransmits, cwnd pinned at 1200.
+    //
+    // E3 says to mark all outstanding data for retransmission and then send
+    // what cwnd allows. Clearing inFlight puts them back in the pending
+    // region, where transmitPending re-sends them in TSN order as the window
+    // reopens. needsRetx keeps two things honest on the way back out: the
+    // chunk must count as a retransmission, and it must not produce an RTT
+    // sample (Karn's algorithm — sendQueue's retransmits === 0 test is what
+    // gates that).
+    //
+    // Interleaving is what made this pre-existing bug load-bearing. Serial
+    // sending lays a message's fragments in one contiguous TSN run, so when a
+    // T3 finally pushes sendQueue[0] through, the cumulative ack sweeps the
+    // whole already-received run behind it and frees a large block of
+    // outstandingBytes in one go — the association claws its way out.
+    // Interleaved, the holes are scattered among four messages, each cum-ack
+    // advance stops at the next hole a few chunks later, and the recovery
+    // never gets going.
+    for (var ri = 0; ri < inFlightCount; ri++) {
+      var re = sendQueue[ri];
+      re.inFlight  = false;
+      re.needsRetx = true;
+      pendingBytes += re.payloadLen;   // SCTP-14: moved in-flight -> pending
+    }
+    outstandingBytes = 0;
+    inFlightCount    = 0;
+
     oldest.sentAt = now;
     oldest.missingReports = 0;   // expiry supersedes any in-flight gap reporting
+    // Retransmit the oldest chunk here and now; the rest go out through
+    // transmitPending as cwnd (one MTU, then slow start) permits.
+    oldest.needsRetx = false;    // already counted via oldest.retransmits++ above
+    oldest.inFlight  = true;
+    outstandingBytes = oldest.payloadLen;
+    pendingBytes    -= oldest.payloadLen;
+    inFlightCount    = 1;
     // P2: re-emit pre-built packet (zero-alloc retransmit path).
     ev.emit('packet', oldest.packet);
     sctpStats.chunksRetransmitted++;
@@ -2978,6 +4048,8 @@ function SctpAssociation(config) {
     if (entry.inFlight) {
       outstandingBytes -= entry.payloadLen;
       inFlightCount--;
+    } else {
+      pendingBytes -= entry.payloadLen;   // SCTP-14
     }
     try {
       ev.emit('chunkAcked', {
@@ -2990,6 +4062,10 @@ function SctpAssociation(config) {
 
   function abandonMessage(messageSeq) {
     var anyAbandoned = false;
+    // SCTP-14: a message can be abandoned while the pump is still feeding
+    // it. Kill the job first, or the fragments it goes on to enqueue would
+    // re-open a hole we just told the peer to skip past with FORWARD-TSN.
+    dropTxJobs(function (j) { return j.messageSeq === messageSeq; });
     for (var i = sendQueue.length - 1; i >= 0; i--) {
       if (sendQueue[i].messageSeq === messageSeq) {
         var entry = sendQueue.splice(i, 1)[0];
@@ -3001,7 +4077,20 @@ function SctpAssociation(config) {
         // — without this, peer holds the stream waiting for a message
         // that will never arrive (until the MAX_PENDING_MSGS_PER_STREAM
         // safety cap kicks in, which is a coarse fallback).
-        if (!entry.unordered) {
+        if (peerSupportsIData) {
+          // SCTP-14 / RFC 8260 §2.3.1: under interleaving the skip list
+          // carries 32-bit MIDs, and — unlike classic FORWARD-TSN — entries
+          // exist for UNORDERED messages too (their MID space also has a
+          // hole the receiver must be told to not wait on). Keyed by
+          // sid + U-bit, since the two MID spaces are independent.
+          var iKey = entry.streamId + (entry.unordered ? 'u' : 'o');
+          var iPrev = abandonedMidPerStream[iKey];
+          if (iPrev === undefined || tsnGt(entry.mid, iPrev.mid)) {
+            abandonedMidPerStream[iKey] = { mid: entry.mid, tsn: entry.tsn };
+          } else if (entry.mid === iPrev.mid && tsnGt(entry.tsn, iPrev.tsn)) {
+            iPrev.tsn = entry.tsn;   // same message, later fragment: track its highest TSN
+          }
+        } else if (!entry.unordered) {
           var prev = abandonedSSNPerStream[entry.streamId];
           if (prev === undefined || ssnGt(entry.ssn, prev)) {
             abandonedSSNPerStream[entry.streamId] = entry.ssn;
@@ -3012,7 +4101,21 @@ function SctpAssociation(config) {
         anyAbandoned = true;
       }
     }
-    if (anyAbandoned) maybeFwdTsn();
+    if (anyAbandoned) {
+      maybeFwdTsn();
+      // SCTP-14: lost wakeup. Abandoning frees in-flight window space, but
+      // nothing here restarted the sender. If the abandoned chunks were the
+      // last ones in flight, the association is left with inFlightCount = 0,
+      // outstandingBytes = 0, a queue full of PENDING chunks, and no timer:
+      // T3 is cleared precisely because nothing is in flight, and the only
+      // other trigger — handleSack — needs a SACK that will never come,
+      // because nothing is being sent. Measured: 151 chunks frozen
+      // indefinitely with an idle link and a wide-open window.
+      //
+      // Reachable from the T3 abandon branch too, which returns without any
+      // transmit pass. Scheduling one here covers every abandon path at once.
+      scheduleTransmit();
+    }
   }
 
   /* maybeFwdTsn — emit a FORWARD-TSN if the head of sendQueue indicates
@@ -3066,6 +4169,43 @@ function SctpAssociation(config) {
     // that never arrives (until MAX_PENDING_MSGS_PER_STREAM trips). We
     // emit one pair per stream with abandoned ordered chunks since the
     // last FORWARD-TSN.
+    if (peerSupportsIData) {
+      // SCTP-14 / RFC 8260 §2.3.1: with interleaving negotiated the
+      // I-FORWARD-TSN chunk (0xC2) MUST be used instead of FORWARD-TSN.
+      // Entry layout per §2.3.1: SID(2) + Flags(2, bit0 = U) + MID(4).
+      // Sending the classic chunk here would hand the peer a 16-bit SSN
+      // where it expects a 32-bit MID — a silent interop break with any
+      // compliant receiver (and our own receive side, once it complies).
+      var iKeys   = Object.keys(abandonedMidPerStream);
+      var iBody   = Buffer.alloc(4 + iKeys.length * 8);
+      iBody.writeUInt32BE(newCumTsn, 0);
+      for (var k = 0; k < iKeys.length; k++) {
+        var key   = iKeys[k];
+        var isU   = key.charAt(key.length - 1) === 'u';
+        var sidN  = parseInt(key.slice(0, -1), 10);
+        var off   = 4 + k * 8;
+        iBody.writeUInt16BE(sidN & 0xFFFF, off);
+        iBody.writeUInt16BE(isU ? 1 : 0,   off + 2);
+        iBody.writeUInt32BE(abandonedMidPerStream[key].mid >>> 0, off + 4);
+      }
+      sendChunk(CHUNK_I_FORWARD_TSN, 0, iBody, remoteVerificationTag);
+      lastForwardTsnSent = newCumTsn;
+      /* The tracker is NOT cleared here. Two ways a one-shot tracker loses
+       * skip entries for good, both observed:
+       *   1. maybeFwdTsn's dedup can decline to send at all when the advance
+       *      point hasn't moved (live fragments of another message still
+       *      hold the queue head) — the entry recorded just before is then
+       *      dropped without ever reaching the wire;
+       *   2. the handleSack re-emit path resends when the peer looks behind,
+       *      and a cleared tracker makes that resend carry ZERO entries, so
+       *      a peer that missed the first chunk never learns the skips.
+       * Entries are pruned in handleSack once the peer's cumulative ack
+       * proves the hole has been passed. Until then, repeating a skip the
+       * peer already applied is harmless — advanceRecvMidPastAbandoned is
+       * idempotent (serial-arithmetic ≤ checks throughout). */
+      return;
+    }
+
     var streams = Object.keys(abandonedSSNPerStream);
     var bodyLen = 4 + streams.length * 4;
     var body    = Buffer.alloc(bodyLen);
@@ -3080,6 +4220,32 @@ function SctpAssociation(config) {
     // Clear the per-stream tracker — peer's been told. New abandons
     // beyond this point will accumulate fresh entries.
     abandonedSSNPerStream = {};
+  }
+
+  /* SCTP-14: undo the T3 exponential backoff once the peer proves the path
+   * is alive again.
+   *
+   * onT3Expire doubles rto on every expiry, and the ONLY thing that ever
+   * lowers it is updateRtt — which Karn's algorithm gates on
+   * retransmits === 0. During a loss burst practically every outstanding
+   * chunk has been retransmitted, so no sample is admissible, so the doubling
+   * is a one-way ratchet: 150ms -> 300 -> 600 -> ... -> the 60s cap, and the
+   * association is left waiting a minute between retransmits long after the
+   * link has recovered. Measured at 15% loss: RTO climbed until forward
+   * progress stopped entirely while the path was still perfectly usable.
+   *
+   * Karn's algorithm is about not MEASURING off an ambiguous chunk. It does
+   * not say the backoff must persist once new data is acknowledged — RFC 6298
+   * §5.7 is explicit that the sender should recompute RTO from the smoothed
+   * estimators at that point. Cumulative-ack progress is unambiguous
+   * evidence, so that is the trigger here. With no SRTT yet (no clean sample
+   * has ever been taken) there is nothing to recompute from and the backed-off
+   * value stands.
+   */
+  function collapseRtoBackoff() {
+    if (srtt === null) return;
+    var newRto = Math.round(srtt + Math.max(1, 4 * rttvar));
+    rto = Math.max(rtoMinMs, Math.min(rtoMaxMs, newRto));
   }
 
   // RFC 4960 §6.3.1 RTO calculation.
@@ -3223,14 +4389,26 @@ function SctpAssociation(config) {
     body.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
     body.writeUInt32BE(localTsn, 12);
 
-    // Supported Extensions: FORWARD-TSN (PR-SCTP) + RECONFIG (stream reset)
+    // Supported Extensions: FORWARD-TSN (PR-SCTP), RECONFIG (stream reset),
+    // and I-DATA (RFC 8260 user message interleaving).
+    //
+    // Advertising I-DATA is a statement that we can RECEIVE it — the receive
+    // path landed in stage 1. It does not commit us to sending it: a peer
+    // that also advertises it may start sending I-DATA to us, which is
+    // exactly what we want to exercise, while our own send path stays on
+    // classic DATA until stage 2b.
+    //
+    // Both directions of an association negotiate this independently in the
+    // sense that each side advertises what it can receive, so this is safe
+    // asymmetrically (RFC 8260 3.1).
     body.writeUInt16BE(PARAM_SUPPORTED_EXTENSIONS, 16);
-    body.writeUInt16BE(6, 18);
+    body.writeUInt16BE(7, 18);
 
     var padded = Buffer.alloc(24);
     body.copy(padded, 0, 0, 20);
     padded[20] = CHUNK_FORWARD_TSN;
     padded[21] = CHUNK_RECONFIG;
+    padded[22] = CHUNK_I_DATA;
 
     sendChunk(CHUNK_INIT, 0, padded, 0);  // INIT always has vtag=0
   }
@@ -3436,7 +4614,57 @@ function SctpAssociation(config) {
         return {
           ssn: head.ssn, ppid: head.ppid, unordered: head.isUnordered,
           payload: head.payload,
+          wide: (head.mid != null),   // SCTP-14: I-DATA -> ssn holds a 32-bit MID
         };
+      }
+
+      // INTERLEAVED (RFC 8260): fragments of this message are found by mid
+      // and ordered by fsn, wherever they sit in TSN space. That is the
+      // entire point of the extension — another stream's fragments may be
+      // interleaved between them — so the contiguous-TSN walk below cannot
+      // be used.
+      if (head.mid != null) {
+        // Index this message's fragments by fsn in ONE pass, then walk them.
+        //
+        // The obvious shape — rescan the store for each fsn in turn — is
+        // O(n^2), and n here is the fragment count of a large message: a
+        // 256KB payload at a 1200-byte MTU is ~218 fragments, so ~47,000
+        // comparisons per assembly. This code path exists precisely for large
+        // messages, so that is the wrong cost to carry.
+        var byFsn = new Map();
+        for (var ik = 0; ik < tsns.length; ik++) {
+          var cand = store.get(tsns[ik]);
+          if (!cand || cand.mid !== head.mid) continue;
+          // Same consistency rules the contiguous path enforces: a fragment
+          // claiming this message must agree about what the message is.
+          if (cand.ppid !== head.ppid && cand.ppid !== 0) continue;   // N2
+          if (cand.isUnordered !== head.isUnordered) continue;        // N15
+          if (!byFsn.has(cand.fsn)) byFsn.set(cand.fsn, [cand, tsns[ik]]);
+        }
+
+        var iParts = [head.payload];
+        var iConsumed = [tsns[i]];
+        var iDone = false;
+        for (var want = 1; ; want++) {
+          var hit = byFsn.get(want);
+          if (!hit) break;                         // chain incomplete — wait
+          iParts.push(hit[0].payload);
+          iConsumed.push(hit[1]);
+          if (hit[0].isEnd) { iDone = true; break; }
+        }
+        if (iDone) {
+          for (var ic = 0; ic < iConsumed.length; ic++) store.delete(iConsumed[ic]);
+          if (store.size === 0) delete fragStore[streamId];
+          return {
+            ssn: head.ssn, ppid: head.ppid, unordered: head.isUnordered,
+            payload: Buffer.concat(iParts),
+            // SCTP-14: ssn here is a 32-bit MID, not a 16-bit SSN. The
+            // ordered-delivery gate needs to know which, because the two
+            // wrap at different points.
+            wide: true,
+          };
+        }
+        continue;   // not yet complete; try the next BEGIN
       }
 
       // Multi-fragment: walk forward from BEGIN.
@@ -3498,25 +4726,38 @@ function SctpAssociation(config) {
       return;
     }
 
+    // SCTP-14: DATA's ordering key is a 16-bit SSN; I-DATA's is a 32-bit
+    // MID (RFC 8260 §2.1). Both arrive here as msg.ssn, so the modular
+    // arithmetic has to follow the width of whichever it is. Advancing a
+    // MID with `& 0xFFFF` pins the local counter at 65535 while the peer's
+    // MIDs keep climbing past it: every later message on the stream is
+    // filed as "future", held in pendingMsgs, and never delivered. On a
+    // busy stream that is a permanent stall, and one that only shows up
+    // after 64K messages — long after any test would have stopped looking.
+    var wide = (msg.wide === true);
+    var step = wide ? function (v) { return (v + 1) >>> 0; }
+                    : function (v) { return (v + 1) & 0xFFFF; };
+    var gt   = wide ? tsnGt : ssnGt;   // tsnGt is the same serial comparison, 32-bit
+
     var expected = recvSSN[streamId] || 0;
 
     if (msg.ssn === expected) {
       processMessage(streamId, msg.ppid, msg.payload);
-      expected = (expected + 1) & 0xFFFF;
+      expected = step(expected);
       // Drain any held messages whose SSN is now next.
       var held = pendingMsgs[streamId];
       while (held && held.has(expected)) {
         var nxt = held.get(expected);
         held.delete(expected);
         processMessage(streamId, nxt.ppid, nxt.payload);
-        expected = (expected + 1) & 0xFFFF;
+        expected = step(expected);
       }
       recvSSN[streamId] = expected;
       if (held && held.size === 0) delete pendingMsgs[streamId];
       return;
     }
 
-    if (ssnGt(msg.ssn, expected)) {
+    if (gt(msg.ssn, expected)) {
       // Future SSN — hold it.
       if (!pendingMsgs[streamId]) pendingMsgs[streamId] = new Map();
       var pending = pendingMsgs[streamId];
@@ -3582,6 +4823,10 @@ function SctpAssociation(config) {
     for (var i = 0; i < ext.length; i++) {
       if (ext[i] === CHUNK_FORWARD_TSN) peerSupportsForwardTsn = true;
       if (ext[i] === CHUNK_RECONFIG)    peerSupportsReconfig    = true;
+      // RFC 8260: the peer telling us it can RECEIVE I-DATA. Recorded now so
+      // stage 2b can gate sending on it — a peer that did not advertise must
+      // never be sent I-DATA, since it has no parser for the chunk type.
+      if (ext[i] === CHUNK_I_DATA)      peerSupportsIData       = true;
     }
   }
 
@@ -3597,6 +4842,13 @@ function SctpAssociation(config) {
       finalizeClose();
       return;
     }
+
+    // SCTP-14: a long message may still be half-enqueued in a txJob. Push
+    // the remainder into sendQueue FIRST — W3C close() semantics flush what
+    // the application already handed us, and attemptShutdownTransition gates
+    // on sendQueue being empty, so a job left holding fragments would either
+    // vanish or arrive after shutdown had concluded the queue was drained.
+    flushTxJobs();
 
     // SCTP-13: flush any microtask-coalesced transmit NOW, so data queued
     // in this same tick is actually in-flight before we begin the SHUTDOWN
@@ -3617,7 +4869,40 @@ function SctpAssociation(config) {
   }
 
 
+  /* ========================= abort ========================= */
+
+  /**
+   * Tear the association down ABRUPTLY (RFC 4960 3.3.7).
+   *
+   * close() is the graceful path — SHUTDOWN, drain, await SHUTDOWN_ACK — and
+   * it is right when a channel is closing while the connection lives on.
+   *
+   * pc.close() is not that case. The peer connection is being destroyed, so
+   * nothing survives to complete the handshake: the SHUTDOWN may not even
+   * reach the wire, and the remote peer is left holding channels that stay
+   * 'open' forever with no event to tell it otherwise.
+   *
+   * ABORT is one packet and needs no reply, which is what a terminal close
+   * can actually guarantee. Cause code 12 is User-Initiated Abort, which the
+   * remote side reports as sctpCauseCode.
+   */
+  function abort(causeCode) {
+    if (closed) return;
+    try {
+      if (state === STATE_ESTABLISHED) sendAbort(causeCode == null ? 12 : causeCode);
+    } catch (e) { /* a failed ABORT must never block teardown */ }
+    finalizeClose();
+  }
+
   /* ========================= Public API ========================= */
+
+  this.abort = abort;
+
+  // Did the peer advertise RFC 8260 interleaving? Useful for diagnostics and
+  // for the interop harness, which reports whether it was negotiated.
+  Object.defineProperty(this, 'interleavingNegotiated', {
+    get: function () { return peerSupportsIData === true; },
+  });
 
   Object.defineProperty(this, 'state', { get: function() { return STATE_NAMES[state]; } });
   Object.defineProperty(this, 'established', { get: function() { return state === STATE_ESTABLISHED; } });
@@ -3649,6 +4934,23 @@ function SctpAssociation(config) {
       rttvar:              rttvar,
       rto:                 rto,
       sendQueueDepth:      sendQueue.length,
+      /* SCTP-14: bytes accepted by send() that are NOT yet fragmented into
+       * sendQueue. Without this the queue looks empty while megabytes sit in
+       * txJobs, and anything pacing on sendQueueDepth over-sends badly. */
+      unfragmentedBytes:   (function () {
+        var n = 0;
+        for (var ji = 0; ji < txJobs.length; ji++) {
+          n += txJobs[ji].payload.length -
+               txJobs[ji].cursor * txJobs[ji].maxPerChunk;
+        }
+        return n > 0 ? n : 0;
+      })(),
+      pendingMessages:     txJobs.length,
+      // SCTP-14: bidirectional-load view, for tuning interleaveMode.
+      slicing:             interleaveMode === 'never' ? false
+                            : (interleaveMode === 'adaptive' ? !bidirectionalLoad : true),
+      rxBytesPerSec:       Math.round(rateRxPerSec),
+      txBytesPerSec:       Math.round(rateTxPerSec),
       // SCTP-8 visibility: in-flight bytes vs rwnd lets the upper layer
       // see when we're rwnd-bound (outstandingBytes near remoteRwnd).
       inFlightCount:       inFlightCount,
@@ -3664,6 +4966,34 @@ function SctpAssociation(config) {
       lastCumulativeTsn:   lastCumulativeTsn,
     };
   } });
+
+  // SCTP-14 test hook: snapshot of sendQueue TSNs, for asserting the
+  // ascending-order invariant from outside. Read-only; no protocol effect.
+  this._debugSendQueue = function () {
+    var out = new Array(sendQueue.length);
+    for (var i = 0; i < sendQueue.length; i++) out[i] = sendQueue[i].tsn;
+    return out;
+  };
+  this._debugRecv = function (sid) {
+    var frags=[]; var st=fragStore[sid];
+    if(st) st.forEach(function(f,tsn){frags.push({mid:f.mid,fsn:f.fsn,B:f.isBegin,E:f.isEnd});});
+    var pend=[]; var pm=pendingMsgs[sid];
+    if(pm) pm.forEach(function(m,k){pend.push(k);});
+    return { recvSSN: recvSSN[sid], frags: frags, pending: pend };
+  };
+  this._debugState = function () {
+    return {
+      q: sendQueue.length, inFlight: inFlightCount, outBytes: outstandingBytes,
+      cwnd: cwnd, ssthresh: ssthresh, rwnd: remoteRwnd, rto: rto, srtt: srtt,
+      t3Armed: !!t3Timer, jobs: txJobs.length,
+      head: sendQueue.length ? {
+        tsn: sendQueue[0].tsn, inFlight: sendQueue[0].inFlight,
+        retx: sendQueue[0].retransmits, miss: sendQueue[0].missingReports,
+        needsRetx: sendQueue[0].needsRetx, sid: sendQueue[0].streamId,
+      } : null,
+      lastCumTsn: lastCumulativeTsn, localTsn: localTsn,
+    };
+  };
 
   this.handlePacket = handlePacket;
   this.connect      = connect;       // connect([cb])  — symmetric for both roles

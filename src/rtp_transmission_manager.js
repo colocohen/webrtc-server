@@ -634,7 +634,22 @@ function applyDirectionsFromAnswer(state, parsed, isLocalAnswer) {
     if (isFullyStopped(t)) continue;
 
     if (m.port === 0) {
-      t.currentDirection = 'stopped';
+      // TWO STEPS. Retiring an m-section spans a full offer/answer, and W3C
+      // 5.4 gives the midpoint its own observable state:
+      //
+      //   our own OFFER carries the rejection   currentDirection = 'inactive'
+      //   the ANSWER confirms it                currentDirection = 'stopped'
+      //
+      // The transceiver is on its way out either way, but until the answer
+      // lands the negotiation is not finished and the spec does not call it
+      // stopped yet. Committing 'stopped' at offer time skipped that state
+      // and made the retirement sweep — which keys on it — run a round early.
+      //
+      // isLocalAnswer is true when WE are answering — the negotiation is
+      // complete from our side and the section is retired. False means a
+      // remote description is being applied to our own offer, i.e. the
+      // midpoint, which only reaches 'inactive'.
+      t.currentDirection = isLocalAnswer ? 'stopped' : 'inactive';
       continue;
     }
 
@@ -707,6 +722,151 @@ function hasApplicationMediaInLocalDescription(state) {
  * @param {Object} state
  * @returns {boolean}
  */
+
+/**
+ * What direction did our own most recent local description declare for this
+ * m-section? Null when we have not described it. See the note in
+ * checkIfNegotiationIsNeeded on why this, and not currentDirection, is the
+ * thing to compare a transceiver's direction against.
+ */
+/**
+ * Have we already PROPOSED this transceiver's direction to the peer?
+ *
+ * The question exists because `direction` and `currentDirection` legally
+ * differ: direction is what the application asked for, currentDirection is
+ * what the peer agreed to, and a peer that declines half of a request leaves
+ * them apart permanently and correctly:
+ *
+ *     direction        sendrecv     we are willing to send and receive
+ *     currentDirection sendonly     they are not sending
+ *
+ * Renegotiating there would produce the identical offer and get the identical
+ * answer, so the difference alone must not mean "negotiation needed". What
+ * decides is whether the peer has SEEN our request.
+ *
+ * Only an OFFER states a request. An answer states the agreed direction — the
+ * same value currentDirection already holds — so it can never tell us
+ * anything, and reading it as a proposal makes this check compare a value with
+ * itself.
+ *
+ * Three cases:
+ *
+ *   our local description is an offer   → compare the direction it carries
+ *   we have only ever answered          → we have proposed nothing; the
+ *                                         request is unsent, so NEEDED
+ *   no local description yet            → nothing proposed, NEEDED
+ */
+function _proposedDirection(state, mid) {
+  var pend = state.pendingLocalDescription;
+  var curr = state.currentLocalDescription;
+  // pendingLocalDescription wins while a round is in flight; otherwise the
+  // completed one stands.
+  var live = pend || curr;
+  if (!live || live.type !== 'offer') return null;   // we proposed nothing
+  var d = state.parsedLocalSdp;
+  if (!d || !d.media) return null;
+  for (var i = 0; i < d.media.length; i++) {
+    var m = d.media[i];
+    if (!m || String(m.mid) !== String(mid)) continue;
+    return m.direction || null;
+  }
+  return null;
+}
+
+
+/**
+ * Has the msid for this transceiver's m-section drifted from what our last
+ * local description declared? setStreams() is the way that happens.
+ */
+
+
+/** Sorted, de-duplicated copy — the set form of a stream-id list. */
+function _uniqueSorted(ids) {
+  var seen = {}, out = [];
+  for (var i = 0; i < ids.length; i++) {
+    if (Object.prototype.hasOwnProperty.call(seen, ids[i])) continue;
+    seen[ids[i]] = true;
+    out.push(ids[i]);
+  }
+  return out.sort();
+}
+
+/** Stream ids an m-section declares, from either msid form. Null when it
+ *  declares none — a section that never carried an msid is not out of date,
+ *  it simply predates any. */
+function _streamIdsFromSection(m) {
+  var out = [];
+  if (m.msids && m.msids.length) {
+    for (var i = 0; i < m.msids.length; i++) {
+      var sid = String(m.msids[i]).trim().split(/\s+/)[0];
+      if (sid && sid !== '-') out.push(sid);
+    }
+    return out;
+  }
+  if (m.msid) {
+    var one = String(m.msid).trim().split(/\s+/)[0];
+    if (one && one !== '-') out.push(one);
+    return out;
+  }
+  return null;
+}
+
+/** The same, from the local SSRC slot the application's setStreams wrote. */
+function _streamIdsFromMsid(slot) {
+  var out = [];
+  var list = (slot.msids && slot.msids.length) ? slot.msids
+           : (slot.msid ? [slot.msid] : null);
+  if (!list) return null;
+  for (var i = 0; i < list.length; i++) {
+    var sid = String(list[i]).trim().split(/\s+/)[0];
+    if (sid && sid !== '-') out.push(sid);
+  }
+  return out;
+}
+
+function _msidOutOfDate(state, t) {
+  if (!t || t.mid == null) return false;
+  var slot = state.localSsrcs && state.localSsrcs[t.mid];
+  if (!slot || !slot.msid) return false;
+  var d = state.parsedLocalSdp;
+  if (!d || !d.media) return false;
+  for (var i = 0; i < d.media.length; i++) {
+    var m = d.media[i];
+    if (!m || String(m.mid) !== String(t.mid)) continue;
+    // Only compare when the description actually carried an msid; a section
+    // that never had one is not "out of date", it simply predates any.
+    // COMPARE THE SET OF STREAM IDS, NOT THE MSID TEXT.
+    //
+    // A track's membership is a SET: the same streams in a different order are
+    // the same membership, and re-assigning the streams a track already
+    // belongs to changes nothing the peer needs to hear about. W3C 5.2 says
+    // negotiation is needed when the streams DIFFER, not whenever setStreams
+    // is called.
+    //
+    // Comparing the rendered msid text made both of those look like changes —
+    // setStreams(s1, s2) followed by setStreams(s2, s1), or even the identical
+    // call twice, each fired negotiationneeded and produced an offer whose SDP
+    // said the same thing. An application that re-asserts its streams (a
+    // common way to keep state in sync) renegotiated on every assertion.
+    var declaredIds = _streamIdsFromSection(m);
+    if (declaredIds == null) return false;
+    var currentIds = _streamIdsFromMsid(slot);
+    if (currentIds == null) return false;
+    // A SET IGNORES DUPLICATES TOO. setStreams(s1, s1, s2) assigns the same
+    // membership as setStreams(s1, s2) — the track belongs to s1 and s2
+    // either way, and the SDP that results is identical. Counting the repeat
+    // as a change fired negotiationneeded for an assignment that changed
+    // nothing.
+    var a = _uniqueSorted(declaredIds), b = _uniqueSorted(currentIds);
+    if (a.length !== b.length) return true;
+    for (var k = 0; k < a.length; k++) {
+      if (a[k] !== b[k]) return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 function checkIfNegotiationIsNeeded(state) {
   if (state.dataChannels && state.dataChannels.length > 0) {
     if (!hasApplicationMediaInLocalDescription(state)) return true;
@@ -729,7 +889,40 @@ function checkIfNegotiationIsNeeded(state) {
     if (isStopped(t)) return true;      // stopping, not yet retired
 
     if (t.mid == null) return true;
-    if (t.direction !== t.currentDirection) return true;
+
+    // W3C 4.7.3 compares the transceiver's direction against what the LAST
+    // OFFER/ANSWER ACTUALLY OFFERED — not against currentDirection.
+    //
+    // currentDirection is the direction that was AGREED, and the two legally
+    // differ whenever the peer declines half of what we asked for:
+    //
+    //   direction        sendrecv     we are willing to send and receive
+    //   currentDirection sendonly     they are not sending, so we only send
+    //
+    // That is a settled, correct outcome — offering again would produce the
+    // identical SDP and the peer would give the identical answer. Treating it
+    // as a mismatch made negotiationneeded fire forever after any asymmetric
+    // call: one side adds a track, the other does not, and the connection
+    // never stops asking to renegotiate.
+    //
+    // The check that belongs here is whether the description we last sent
+    // still describes what the application has asked for. If our own
+    // description already carries this direction, there is nothing to
+    // renegotiate.
+    if (t.direction !== t.currentDirection) {
+      var _proposed = _proposedDirection(state, t.mid);
+      if (_proposed !== t.direction) return true;
+    }
+
+    // The msid in our last description must still match the streams the
+    // application has assigned. sender.setStreams() changes which
+    // MediaStreams a track belongs to, and that is carried in the SDP as
+    // a=msid — so the peer only learns of it through a new offer.
+    //
+    // Nothing compared it, so setStreams() updated the internal state and
+    // then reported no negotiation needed: the event never fired and the
+    // remote side went on grouping the track under its old stream forever.
+    if (_msidOutOfDate(state, t)) return true;
   }
 
   return false;

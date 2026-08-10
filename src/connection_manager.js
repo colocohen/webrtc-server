@@ -488,6 +488,37 @@ function ConnectionManager(config) {
           ufrag: state.localIceUfrag,
           pwd:   state.localIcePwd,
         });
+        // AND START THE NEW PHASE. restart() only ARMS the agent — it clears
+        // the checklist and sets _reEmitOnGather — but something has to ask
+        // it to gather, exactly as connection setup does. Nothing did, so a
+        // restart produced fresh credentials and then zero candidates to
+        // authenticate with them, and gathering sat at 'new' forever.
+        //
+        // With no candidates there are no pairs to check, so the connection
+        // an ICE restart exists to rescue never recovered.
+        //
+        // gather() is idempotent, and the state machine below handles the
+        // announcement — the agent reports 'gathering' and later 'complete'
+        // exactly as it does for the first negotiation, so the observable
+        // sequence is identical and needs no special casing here.
+        // Start the new phase on the NEXT task, not inline.
+        //
+        // prepareForCreateOffer runs during createOffer — before
+        // setLocalDescription. Gathering inline meant the whole phase, and
+        // both of its state events, completed before the description was even
+        // applied, so an application listening after setLocalDescription
+        // resolved had already missed them.
+        //
+        // The initial negotiation does not have this problem because the
+        // agent has nothing to re-announce and reports asynchronously. A
+        // restart does: the agent re-emits kept candidates immediately.
+        // Deferring puts both on the same footing.
+        if (typeof iceAgent.gather === 'function') {
+          setTimeout(function () {
+            if (state.closed) return;
+            iceAgent.gather();
+          }, 0);
+        }
       }
       ensureFingerprint();
       prepareIceForSdp();
@@ -510,8 +541,82 @@ function ConnectionManager(config) {
     // but no ICE restart concept (we're answering an offer); `setup` is
     // either our pinned DTLS role or echoes the remote's offer per
     // RFC 5763 negotiation (resolveSetup).
+    // Record the ICE credentials of a remote description as it is applied.
+    // Called for BOTH offers and answers, because that is the only moment we
+    // learn what the peer is using — and either can be the one that changes
+    // them. Without the answer case, a side that offered the first round had
+    // no baseline at all, and the first restart it had to ANSWER looked like
+    // a first description and was missed entirely.
+    recordRemoteIceCredentials: function (parsed) {
+      recordRemoteIceCredentials(parsed);
+    },
+
+    // Take ICE gathering back to its initial state. Called by rollback when
+    // no local description remains — see the note there.
+    resetIceGathering: function () {
+      state.localGatheredCandidates = [];
+      state.iceGatheringComplete = false;
+      if (state.iceGatheringState !== 'new') {
+        setState({ iceGatheringState: 'new' });
+      }
+    },
+
     prepareForCreateAnswer: function (cb) {
-      ensureIceCredentials();
+      // ANSWERING AN ICE RESTART RESTARTS OUR SIDE TOO.
+      //
+      // RFC 8829 3.5.1: a remote offer carrying new ICE credentials IS an ICE
+      // restart, and the answerer must supply fresh credentials of its own —
+      // a restart replaces the pair on BOTH sides, and connectivity checks
+      // authenticate against it.
+      //
+      // Only createOffer had a restart path, so an answerer kept its old
+      // ufrag and pwd. The peer that restarted was left half-restarted: its
+      // credentials new, ours stale. In the field that is precisely the
+      // network-change case — the side that moved restarts, the side that
+      // stayed put never refreshes, and the new candidate pairs are checked
+      // against credentials one of them has forgotten.
+      //
+      // It also left our own restart request outstanding, so
+      // negotiationneeded kept firing after a restart the peer had already
+      // satisfied.
+      var _remoteRestart = _remoteCredentialsChanged();
+      ensureIceCredentials(_remoteRestart);
+      if (_remoteRestart) {
+        state.localGatheredCandidates = [];
+        if (iceAgent && typeof iceAgent.restart === 'function') {
+          iceAgent.restart();
+          iceAgent.setLocalParameters({
+            ufrag: state.localIceUfrag,
+            pwd:   state.localIcePwd,
+          });
+          // AND GATHER. Same omission the offer path had (fix 42): restart()
+          // only arms the agent. Without this the ANSWERER of a restart
+          // rotated its credentials and then gathered nothing, so it had no
+          // candidates to pair with the ones the offerer had just sent.
+          //
+          // The first restart of a session survived it, because the answerer
+          // still held the candidates from the original negotiation and could
+          // pair against those. A SECOND restart could not — those had been
+          // cleared by the first — and the call stopped dead:
+          //
+          //   after restart#1: ~100 packets per 2s, ice=connected
+          //   after restart#2: 0 packets for 10s,   ice=checking
+          //
+          // Repeated restarts are exactly what a flapping network produces,
+          // so this is the case that matters most.
+          //
+          // Deferred for the same reason as the offer path: this runs while
+          // the answer is being prepared, and the gathering phase belongs to
+          // the description once it is applied.
+          if (typeof iceAgent.gather === 'function') {
+            setTimeout(function () {
+              if (state.closed) return;
+              iceAgent.gather();
+            }, 0);
+          }
+        }
+        try { sdpOA.clearNeedsIceRestart(); } catch (eR) {}
+      }
       ensureFingerprint();
       prepareIceForSdp();
       var remoteSetup = state.parsedRemoteSdp &&
@@ -942,7 +1047,23 @@ function ConnectionManager(config) {
         }, 0);
         return;
       }
-      setState({ iceGatheringState: newState });
+      // EVERY gathering-state announcement is a QUEUED TASK (W3C 4.4.1).
+      //
+      // The agent reports when it reports: on a first negotiation 'gathering'
+      // arrives after setLocalDescription has already resolved, but on a
+      // RESTART the whole burst arrives synchronously inside it, because the
+      // agent still holds candidates to re-announce. Publishing on arrival
+      // therefore delivered the same transition before the promise in one
+      // case and after it in the other.
+      //
+      // An application cannot be asked to install its listener at a different
+      // moment depending on which of those it is. Deferring uniformly makes
+      // the sequence observable from after the promise resolves in both:
+      // harmless when the report was already late, decisive when it was not.
+      setTimeout(function () {
+        if (state.closed) return;
+        setState({ iceGatheringState: newState });
+      }, 0);
     });
 
     iceAgent.on('selectedpair', function(pair, prev) {
@@ -1104,6 +1225,45 @@ function ConnectionManager(config) {
   }
 
   // Lazy ICE credentials — only generated when SDP needs them
+  // Did the remote description just bring ICE credentials different from the
+  // ones we last saw? That is the wire signal for an ICE restart (RFC 8829
+  // 3.5.1), compared against what we recorded on the previous apply.
+  // Remember the ICE credentials of a remote description as it is applied.
+  // The comparison baseline for detecting a restart (RFC 8829 3.5.1).
+  function recordRemoteIceCredentials(parsed) {
+    if (!parsed || !parsed.media) return;
+    var ufrag = null;
+    for (var i = 0; i < parsed.media.length; i++) {
+      if (parsed.media[i] && parsed.media[i].iceUfrag) { ufrag = parsed.media[i].iceUfrag; break; }
+    }
+    if (!ufrag) ufrag = parsed.iceUfrag;
+    if (ufrag) state._lastRemoteIceUfrag = ufrag;
+  }
+
+  function _remoteCredentialsChanged() {
+    var d = state.parsedRemoteSdp;
+    if (!d || !d.media || !d.media.length) return false;
+    var ufrag = null;
+    for (var i = 0; i < d.media.length; i++) {
+      if (d.media[i] && d.media[i].iceUfrag) { ufrag = d.media[i].iceUfrag; break; }
+    }
+    if (!ufrag) ufrag = d.iceUfrag;
+    if (!ufrag) return false;
+    // Compare against the ufrag of the description we ANSWERED last, not
+    // against the most recent one seen — this function runs while the new
+    // offer is already applied, so reading and updating in one step compares
+    // the offer with itself.
+    // READ ONLY. The baseline is recorded on EVERY remote description that is
+    // applied — see recordRemoteIceCredentials — because a peer alternates
+    // between offering and answering, and a side that offered last round has
+    // still seen the other's credentials. Recording only here meant a side
+    // that had never answered had no baseline, so the first restart it
+    // answered looked like a first description and was missed.
+    var prev = state._lastRemoteIceUfrag;
+    if (prev == null) return false;      // no baseline yet: not a restart
+    return String(prev) !== String(ufrag);
+  }
+
   function ensureIceCredentials(forceNew) {
     TransportController.ensureLocalIceCreds(state, forceNew);
   }
@@ -1440,6 +1600,28 @@ function ConnectionManager(config) {
             var ut = state.transceivers[ui];
             if (ut._associated) continue;
             if (ut.kind !== bm.type) continue;
+            // ONLY BIND AGAINST A LOCAL DESCRIPTION THAT IS STILL CURRENT.
+            //
+            // This step exists to give a transceiver the mid its own offer
+            // assigned it. But parsedLocalSdp survives the retirement of the
+            // section it describes, so after a stop/retire cycle it still
+            // lists a slot that no longer exists — and this loop then bound
+            // a fresh transceiver to that dead slot.
+            //
+            // The damage was downstream: the transceiver came out
+            // _associated, so the adoption loop in processRemoteMedia passed
+            // over it when the peer's offer arrived, and built a SECOND
+            // transceiver for the recycled m-section. The application ended
+            // up holding two where the spec has one, the extra one with no
+            // track and no direction.
+            //
+            // A slot is only bindable if a live transceiver still owns it or
+            // it is genuinely free — a slot whose owner has retired is
+            // neither, so skip it and let the remote description's own
+            // adoption path place this transceiver.
+            if (bm.port === 0) continue;
+            var _slotOwner = RtpManager.findByMid(state, bm.mid);
+            if (_slotOwner && RtpManager.isFullyStopped(_slotOwner)) continue;
             // FULLY stopped only. A transceiver that is merely STOPPING still
             // has a live m-section in this very offer — stop() marks
             // [[Stopping]], and [[Stopped]] only arrives once a negotiation
@@ -2433,6 +2615,42 @@ function ConnectionManager(config) {
       //
       // The track ends with it, on a task, for the same reason as fix 25.
       if (_rejectedSection && existing) {
+        // TWO STEPS, NOT ONE. Applying the peer's rejecting OFFER is only
+        // half the negotiation — our answer has yet to be created. W3C 5.4
+        // splits what happens at each point:
+        //
+        //   after their offer is applied   currentDirection = 'inactive'
+        //                                  direction        unchanged
+        //   after our answer is applied    both become 'stopped'
+        //
+        // Between the two, the application can still inspect a transceiver
+        // that is on its way out but not yet gone, and the spec says it
+        // reports its own direction with an inactive current one — the
+        // m-section carries no media, but the transceiver has not been
+        // retired. Collapsing both steps into 'stopped' at offer time lost
+        // that state, and the retirement sweep then ran a round early.
+        //
+        // 'have-remote-offer' is exactly the window: their offer applied,
+        // our answer not yet.
+        // WHO STOPPED IT DECIDES. Two cases reach this line and W3C 5.4
+        // treats them differently:
+        //
+        //   THE PEER stopped it — we learn of it from their offer. There is
+        //     nothing left for us to negotiate about, so the transceiver goes
+        //     straight to [[Stopped]]: direction and currentDirection both
+        //     read 'stopped' immediately, before we answer.
+        //
+        //   WE stopped it — our own stop() marked it [[Stopping]] and this
+        //     offer is the round retiring it. It keeps its direction and only
+        //     reaches currentDirection 'inactive' here; both become 'stopped'
+        //     when the answer lands.
+        //
+        // `_stopped` is set by our own stop(); its absence means the
+        // rejection is news from the peer.
+        if (existing._stopped && state.signalingState === 'have-remote-offer') {
+          existing.currentDirection = 'inactive';
+          continue;
+        }
         existing.direction        = 'stopped';
         existing.currentDirection = 'stopped';
         existing._stopped         = true;
@@ -3491,12 +3709,27 @@ function ConnectionManager(config) {
     if (offered == null) return;
     var prev = weAreOfferer ? state.localIceUfrag : state.remoteIceUfrag;
     var isRestart = (prev != null && offered !== prev);
-    // First negotiation: agent-birth heuristic already set the role; only
-    // explicit restarts re-determine it afterwards.
+    // ROLES SURVIVE AN ICE RESTART. RFC 8445 7.3.1.1: the controlling and
+    // controlled roles are fixed when the session is established and persist
+    // for its lifetime — a restart replaces credentials and candidates, not
+    // who is in charge of nominating pairs.
+    //
+    // Re-deriving them from "who offered this time" swapped them whenever the
+    // ANSWERER initiated the restart, and because both sides re-derived
+    // independently they could land on the same value:
+    //
+    //   after answerer-initiated restart: pc1=controlled pc2=controlled
+    //
+    // With no controlling agent nobody nominates a pair, so the restart
+    // completes on paper and the connection never selects a path.
+    //
+    // The role is set once, at agent birth, from the first negotiation. Role
+    // CONFLICTS — both sides genuinely believing they are controlling, which
+    // happens in glare — are resolved by the tie-breaker in the agent
+    // (RFC 8445 7.3.1.1), which is the mechanism the spec provides for it.
+    // This function no longer second-guesses that.
     if (!isRestart) return;
-    if (iceAgent && typeof iceAgent.setRole === 'function') {
-      iceAgent.setRole(weAreOfferer);
-    }
+    return;
   }
 
   this.setLocalDescription = function (desc, cb) {

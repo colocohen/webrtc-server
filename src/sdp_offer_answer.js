@@ -595,11 +595,54 @@ class SdpOfferAnswer extends EventEmitter {
       // extensions with IDs the peer won't recognize.
       _selfL._deps.syncStamperExtMap(commit.parsed);
 
+      // EVERY TRANSPORT CLOSED? THEN THERE IS NOTHING TO GATHER FOR.
+      //
+      // A renegotiation can close them all — stop the last transceiver and
+      // every m-section comes back with port 0. iceGatheringState then still
+      // read 'complete', describing candidates for a session that no longer
+      // exists, and an application waiting for the next phase saw a state it
+      // had already passed through.
+      //
+      // Same rule as the rollback reset (fix 41), reached from the other
+      // direction. It lives here rather than in the agent's gathering handler
+      // because closing a transceiver produces no report from the agent —
+      // there is no gathering event to hang it on, only this apply.
+      try {
+        var _lm = (commit.parsed && commit.parsed.media) || [];
+        var _anyOpen = false;
+        for (var _li = 0; _li < _lm.length; _li++) {
+          if (_lm[_li] && _lm[_li].port !== 0) { _anyOpen = true; break; }
+        }
+        if (_lm.length > 0 && !_anyOpen && _selfL._deps.resetIceGathering) {
+          _selfL._deps.resetIceGathering();
+        }
+      } catch (eCl) { /* never let this break the apply */ }
+
       if (desc.type === 'answer' || desc.type === 'pranswer') {
         // W3C §4.4.1.6 step 11.1.7.4 — commit the negotiated direction onto
         // each associated transceiver's [[CurrentDirection]] slot. This is
         // OUR answer, so directions are already in our perspective.
         RtpManager.applyDirectionsFromAnswer(state, commit.parsed, true);
+      } else if (desc.type === 'offer') {
+        // A section WE are rejecting reaches 'inactive' as soon as our offer
+        // is applied — W3C 5.4 gives that midpoint its own state, and the
+        // application can observe a stopping transceiver there before the
+        // answer confirms the retirement:
+        //
+        //   after stop() + our offer   direction 'stopped', current 'inactive'
+        //   after their answer         both 'stopped'
+        //
+        // Only rejected sections are touched; live ones commit nothing at
+        // offer time, since nothing has been negotiated yet.
+        try {
+          var _om = (commit.parsed && commit.parsed.media) || [];
+          for (var _oi = 0; _oi < _om.length; _oi++) {
+            if (!_om[_oi] || _om[_oi].port !== 0) continue;
+            var _ot = RtpManager.findByMid(state, _om[_oi].mid);
+            if (!_ot || RtpManager.isFullyStopped(_ot)) continue;
+            _ot.currentDirection = 'inactive';
+          }
+        } catch (eOff) { /* never let this break the apply */ }
       }
 
       // ICE gathering is triggered reactively by the applyStateUpdates
@@ -777,6 +820,14 @@ class SdpOfferAnswer extends EventEmitter {
         // downstream consumers (processRemoteMedia below, future getStats
         // readers) observe a consistent post-negotiation state.
         RtpManager.applyDirectionsFromAnswer(state, commit.parsed, false);
+        // An ANSWER's credentials become the baseline immediately — the round
+        // is over, and the next thing we compare against is what the peer is
+        // using now. An OFFER's credentials must NOT be recorded here: the
+        // answer prelude compares against the previous value, and recording
+        // first would compare the offer with itself.
+        if (_selfR._deps.recordRemoteIceCredentials) {
+          try { _selfR._deps.recordRemoteIceCredentials(commit.parsed); } catch (eRc) {}
+        }
       }
 
       // Feed remote candidates to ICE agent (if it exists already).
@@ -1460,6 +1511,28 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
     state.parsedRemoteSdp          = snap.parsedRemoteSdp;
     state.parsedCurrentLocalSdp    = snap.parsedCurrentLocalSdp;
     state.parsedCurrentRemoteSdp   = snap.parsedCurrentRemoteSdp;
+
+    // ICE GATHERING IS PART OF THE DESCRIPTION BEING ROLLED BACK.
+    //
+    // W3C 4.4.1.6: rolling back a local description undoes the gathering
+    // phase it started. With no local description left, gathering has not
+    // begun and iceGatheringState reads 'new' again — the candidates that
+    // were collected belong to a session that no longer exists, and they
+    // authenticate against ICE credentials the rollback has discarded.
+    //
+    // Nothing reset it, so a connection that had gathered to 'complete' kept
+    // reporting 'complete' with no description to gather for. An application
+    // waiting for the NEXT gathering phase to finish saw a state that was
+    // already there and never fired again.
+    //
+    // Only when the rollback leaves NO local description. Rolling back to an
+    // earlier one — an ICE restart offer rolled back to the established
+    // description — leaves that session's gathering intact and its state
+    // must not move.
+    if (!state.currentLocalDescription && !state.pendingLocalDescription &&
+        this._deps.resetIceGathering) {
+      try { this._deps.resetIceGathering(); } catch (eG) {}
+    }
     // transceiver ARRAY: current spec/JSEP — transceivers CREATED BY the
     // rolled-back apply (never previously associated) are REMOVED from
     // the list; pre-existing ones survive dis-associated. (The union-

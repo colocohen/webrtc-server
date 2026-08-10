@@ -288,6 +288,11 @@ function buildOffer(state, options) {
     }
   }
 
+  // Which transceivers have already been given a section, by IDENTITY.
+  // Their internal mids are not reliable keys — see the note in the recycle
+  // loop below.
+  var _placedTransceivers = [];
+
   // Renegotiation: preserve existing m-sections.
   // We pin from state.parsedCurrentLocalSdp (the parsed view of the most
   // recently *completed* round). Using state.parsedLocalSdp here would be
@@ -322,6 +327,22 @@ function buildOffer(state, options) {
       var trStopped = !tr || RtpManager.isStopped(tr) ||
                       tr.direction === 'stopped';
 
+      // A STOPPING TRANSCEIVER STILL OWNS ITS SLOT. W3C 5.4 / JSEP: stop()
+      // marks [[Stopping]], and the slot only becomes free once a
+      // negotiation has RETIRED it — this very offer is that negotiation, and
+      // it must still carry the section (rejected, port 0) so the peer learns
+      // the transceiver is going away.
+      //
+      //   stop() then addTrack, then createOffer  →  2 m-lines
+      //     one rejected section for the stopping transceiver,
+      //     one new section for the new track
+      //   after the retiring round completes    →  the slot is reusable
+      //
+      // Recycling on [[Stopping]] reused the slot in the same offer that was
+      // supposed to retire it, so the peer never saw the rejection and the
+      // two sides disagreed about what that m-line meant.
+      var trRetired = !tr || RtpManager.isFullyStopped(tr);
+
       if (tr && !trStopped) {
         // Active transceiver — emit normally, preserving extmap/codecs.
         existingMids[em.mid] = true;
@@ -337,17 +358,30 @@ function buildOffer(state, options) {
         continue;
       }
 
-      // Stopped (or missing) transceiver — try to recycle this slot.
+      // Stopped (or missing) transceiver — try to recycle this slot,
+      // but only once it is RETIRED, not merely stopping (see above).
       // JSEP §5.2.2 / RFC 8829 §5.5.3: a new transceiver of matching kind
       // MAY take over a stopped m-section's slot rather than appending a
       // fresh one, keeping the m-section count bounded across many
       // add/stop cycles.
       var recycle = null;
-      for (var ti2 = 0; ti2 < state.transceivers.length; ti2++) {
+      if (trRetired) for (var ti2 = 0; ti2 < state.transceivers.length; ti2++) {
         var cand = state.transceivers[ti2];
         if (RtpManager.isStopped(cand)) continue;
-        if (existingMids[cand.mid]) continue;     // already placed
         if (cand.kind !== em.type) continue;
+        // "Already placed" is about the SECTION, not the transceiver's
+        // internal mid. A transceiver is born with an internal mid of its
+        // own and only means anything once ASSOCIATED — an unassociated one
+        // carrying mid "1" is not occupying section 1, it is occupying
+        // nothing, and it is exactly the candidate this recycle exists for.
+        //
+        // Keying the skip on existingMids[cand.mid] read that birth mid as a
+        // placement: the transceiver was passed over here and then appended
+        // its own section further down, so an offer that should have reused
+        // one slot emitted two. Every add/stop cycle then grew the SDP by a
+        // section that never went away.
+        if (cand._associated && existingMids[cand.mid]) continue;
+        if (_placedTransceivers.indexOf(cand) !== -1) continue;
         recycle = cand;
         break;
       }
@@ -374,11 +408,31 @@ function buildOffer(state, options) {
         // Re-key the transceiver onto the slot it is moving into, which keeps
         // its SSRC bookkeeping aligned too — the same re-key the adoption
         // path does.
-        var _slotMid = em.mid;
-        if (String(recycle.mid) !== String(_slotMid)) {
+        // THE POSITION IS REUSED; THE MID IS NOT.
+        //
+        // JSEP 5.2.2 / RFC 8829: recycling a rejected m-section reuses its
+        // PLACE in the m-line ordering — which must never shift, or every
+        // mid after it stops lining up with the peer's — but the section
+        // gets a FRESH mid. The peer has already seen the old mid rejected;
+        // reviving it would make one identifier mean two different things
+        // across the session.
+        //
+        //   assert_not_equals(pc.getTransceivers()[0].mid, stoppedMid0)
+        //
+        // Keeping the slot's mid also revived the very value the rejection
+        // retired, and it was what let two sections claim one mid: the
+        // recycled transceiver brought the slot's mid with it while its own
+        // section was emitted later with the same value.
+        var _slotMid = String(RtpManager.getNextMid(state));
+        while (existingMids[_slotMid]) {
+          _slotMid = String(parseInt(_slotMid, 10) + 1);
+        }
+        var _oldMid = recycle.mid;
+        if (String(_oldMid) !== _slotMid) {
           RtpManager.rebindMid(state, recycle, _slotMid);
         }
         existingMids[_slotMid] = true;
+        _placedTransceivers.push(recycle);
         var rspec = buildMediaForTransceiver(state, recycle);
         rspec.mid = String(_slotMid);
         // Pin extmap/codecs to the slot's previous values so the peer
@@ -457,6 +511,11 @@ function buildOffer(state, options) {
       while (existingMids[String(_fresh)]) _fresh++;
       RtpManager.rebindMid(state, t, _fresh);
     }
+    // Already given a section by the recycle pass? Its mid was rebound to
+    // the slot it moved into, so the mid lookup below would find it placed —
+    // but only because of that rebind. Check identity so the rule holds
+    // whether or not a rebind happened.
+    if (_placedTransceivers.indexOf(t) !== -1) continue;
     if (!existingMids[t.mid]) {
       existingMids[t.mid] = true;
       var newSpec = buildMediaForTransceiver(state, t);

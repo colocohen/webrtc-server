@@ -482,8 +482,29 @@ class DataChannelController extends EventEmitter {
       }
     }
 
+    // Report the transport failure BEFORE tearing SCTP down. abort() calls
+    // finalizeClose() synchronously, which fires 'close' on every channel
+    // through the sctp close handler — so an error emitted after it would
+    // arrive second, and the spec's order is error then close.
+    for (var k = 0; k < this._dataChannels.length; k++) {
+      var dck = this._dataChannels[k];
+      if (!dck || dck.readyState === 'closed') continue;
+      try { dck._ev.emit('error', this._buildSctpFailure()); } catch (e) {}
+    }
+
     if (this._sctp) {
-      try { this._sctp.close(); } catch (e) {}
+      // ABORT, not a graceful close. pc.close() is terminal — the transport
+      // is about to disappear, so a SHUTDOWN has nothing left to complete its
+      // round-trip on and the peer is never told. Its channels then stay
+      // 'open' forever with no error and no close event.
+      //
+      // ABORT is a single packet needing no reply, carrying cause code 12
+      // (User-Initiated Abort). Falls back to close() on an association that
+      // predates the method.
+      try {
+        if (typeof this._sctp.abort === 'function') this._sctp.abort(12);
+        else this._sctp.close();
+      } catch (e) {}
     }
 
     // pc.close() is terminal — don't leave channels parked in 'closing'
@@ -495,6 +516,9 @@ class DataChannelController extends EventEmitter {
       var dcj = this._dataChannels[j];
       if (!dcj || dcj.readyState === 'closed') continue;
       dcj.readyState = 'closed';
+      // 'error' was already emitted above, before the abort — see the note
+      // there on ordering. Channels the abort did not reach still need their
+      // close.
       try { dcj._ev.emit('close'); } catch (e) {}
     }
 
@@ -669,6 +693,13 @@ class DataChannelController extends EventEmitter {
       }
     });
 
+    sctp.on('pathFailure', function () {
+      // An ABORT from the peer, or a path that gave up: the association did
+      // NOT end by agreement. Recorded so the close handler below reports it
+      // as a transport failure rather than a clean shutdown — a graceful
+      // SHUTDOWN is not an error, and 'close' alone describes it correctly.
+      self._sctpEndedAbruptly = true;
+    });
     sctp.on('close', function () {
       // The association is gone — graceful SHUTDOWN completed, remote
       // ABORT, or path failure. W3C webrtc-pc §6.2: every channel riding
@@ -687,6 +718,11 @@ class DataChannelController extends EventEmitter {
           try { dc._ev.emit('closing'); } catch (e) {}
         }
         dc.readyState = 'closed';
+        // Same rule as the local terminal close: an abrupt end is a
+        // transport failure and is reported as one, in front of the close.
+        if (self._sctpEndedAbruptly) {
+          try { dc._ev.emit('error', self._buildSctpFailure()); } catch (e) {}
+        }
         try { dc._ev.emit('close'); } catch (e) {}
       }
       self._setSctpState('closed');
@@ -791,6 +827,45 @@ class DataChannelController extends EventEmitter {
       }
     };
     sctp.on('chunkSent', _drain);
+  }
+
+  /**
+   * The RTCErrorEvent a channel reports when its transport fails.
+   *
+   * W3C 11 fixes the shape an application sees: an RTCErrorEvent whose
+   * `error` is an RTCError with name 'OperationError', errorDetail
+   * 'sctp-failure', and sctpCauseCode 12 for a user-initiated abort. Code
+   * reads `e.error.errorDetail` and tests `e instanceof RTCErrorEvent`, so
+   * emitting a bare error leaves both broken.
+   *
+   * Built here rather than at each call site because two terminal paths need
+   * it — pc.close() finalising local channels, and the sctp 'close' handler
+   * after a remote ABORT — and they must produce the same thing.
+   *
+   * api.js publishes both constructors on state; lower layers cannot import
+   * them without a cycle.
+   */
+  _buildSctpFailure() {
+    var st = (this._deps && this._deps.getState) ? this._deps.getState() : null;
+    var ErrCtor = st && st._RTCErrorCtor;
+    var EvtCtor = st && st._RTCErrorEventCtor;
+    var err = null;
+    if (typeof ErrCtor === 'function') {
+      try {
+        err = new ErrCtor({ errorDetail: 'sctp-failure', sctpCauseCode: 12 },
+                          'The peer connection was closed');
+      } catch (e) { err = null; }
+    }
+    if (!err) {
+      err = new Error('The peer connection was closed');
+      err.name = 'OperationError';
+      err.errorDetail = 'sctp-failure';
+      err.sctpCauseCode = 12;
+    }
+    if (typeof EvtCtor === 'function') {
+      try { return new EvtCtor({ error: err }); } catch (e) {}
+    }
+    return { type: 'error', error: err };
   }
 
   _setSctpState(newState) {
