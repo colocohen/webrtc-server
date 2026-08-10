@@ -1,6 +1,6 @@
 {
   "name": "webrtc-server",
-  "version": "0.6.0",
+  "version": "0.6.5",
   "description": "Complete WebRTC stack for Node.js servers with browser-compatible API.",
   "type": "module",
   "main": "index.js",
@@ -67,9 +67,9 @@
     "flat-ranges": "^2.1.0",
     "lemon-tls": "^0.7.0",
     "rtp-packet": "^0.4.0",
-    "turn-server": "^0.6.0"
+    "turn-server": "^0.6.5"
   },
   "peerDependencies": {
-    "media-processing": "^0.4.0"
+    "media-processing": "^0.5.0"
   }
 }
