@@ -552,10 +552,39 @@ class MediaTransport extends EventEmitter {
     var state = this._state;
     var mapping = state.remoteSsrcMap[remoteSsrc];
     if (mapping && mapping.isRtx) return;   // PLI to RTX is invalid
-    var localSsrc = 1;
+    // RFC 4585 6.1: the sender SSRC identifies US. The natural choice is the
+    // SSRC we send on this mid — but a RECEIVE-ONLY mid has none, which is
+    // the normal case for an SFU consuming a producer's stream, and the
+    // fallback was the literal 1.
+    //
+    // A sender SSRC of 1 is not a value we ever advertise, so a peer looking
+    // it up finds nothing. Chrome is documented to be strict here, and a PLI
+    // it cannot attribute is a PLI it can drop — which shows up as "the
+    // producer never sends a keyframe when asked", with nothing in the logs
+    // because the packet did leave.
+    //
+    // Fall back to ANY SSRC we have allocated on this connection instead:
+    // still ours, still known to the peer from our own SDP.
+    var localSsrc = 0;
     if (mapping && state.localSsrcs[mapping.mid]) {
       localSsrc = state.localSsrcs[mapping.mid].id;
     }
+    if (!localSsrc && state.localSsrcs) {
+      var _lsKeys = Object.keys(state.localSsrcs);
+      for (var _lk = 0; _lk < _lsKeys.length; _lk++) {
+        var _cand = state.localSsrcs[_lsKeys[_lk]];
+        if (_cand && Number.isFinite(_cand.id) && _cand.id > 0) { localSsrc = _cand.id; break; }
+      }
+    }
+    if (!localSsrc) localSsrc = 1;   // nothing allocated at all — last resort
+    // Diagnostic for the field question this fallback exists for: in a live
+    // run, does the sender SSRC resolve to a real value or to the last-resort
+    // 1? If it is 1, state.localSsrcs is empty on that connection and the
+    // answer is to allocate one rather than to pick from an empty set.
+    // Gated on WEBRTC_DEBUG like every other diagnostic here.
+    this._diag('[pli-tx] localSsrc=' + localSsrc + ' remote=' + remoteSsrc +
+               ' mid=' + (mapping && mapping.mid) +
+               ' allocatedMids=' + Object.keys(state.localSsrcs || {}).join(','));
     this.sendRtcp(buildPLI(localSsrc, remoteSsrc));
   }
 
@@ -931,10 +960,31 @@ class MediaTransport extends EventEmitter {
               }
             }
           }
+          // Resolve the owning transceiver, exactly as the DECLARED path does
+          // when it builds this map from a=ssrc lines in the SDP.
+          //
+          // Without it the entry was { mid, rid, isRtx } only, and the
+          // consumer in _handleIncomingRtpInner gates on `_mapping.transceiver`
+          // — so receiver._ssrcEntries was never populated for rid-learned
+          // streams and getSynchronizationSources() returned [] forever on
+          // them. Anything identifying the live source through the W3C
+          // surface — an SFU resolving a producer's ssrc, or reading audio
+          // levels — was blind to simulcast layers while declared-ssrc
+          // streams worked, which is what made it look like a receiver bug
+          // rather than a mapping one.
+          var _ridTc = null;
+          if (_ownerMid != null && state.transceivers) {
+            for (var _rti = 0; _rti < state.transceivers.length; _rti++) {
+              var _rtc = state.transceivers[_rti];
+              if (_rtc && String(_rtc.mid) === String(_ownerMid)) { _ridTc = _rtc; break; }
+            }
+          }
           _mapping = state.remoteSsrcMap[ssrc] = {
-            mid:   _ownerMid,
-            rid:   null,
-            isRtx: false,
+            mid:         _ownerMid,
+            rid:         null,
+            isRtx:       false,
+            transceiver: _ridTc,
+            receiver:    _ridTc ? _ridTc.receiver : null,
           };
         }
 
@@ -1196,8 +1246,17 @@ class MediaTransport extends EventEmitter {
     // are skipped too.
     if (_mapping && !_mapping.isRtx && _mapping.transceiver) {
       var receiver = _mapping.transceiver.receiver;
+      // W3C: the sync-source timestamp is on the SAME clock as
+      // performance.timeOrigin + performance.now() — an absolute time, not
+      // a process-relative one.
+      //
+      // performance.now() alone is milliseconds since process start, so the
+      // value was off by however long the process had been running. It
+      // still compared sensibly against ITSELF, which is why ordering and
+      // the freshness window worked and this went unnoticed; anything
+      // comparing it to a wall clock got a number decades out.
       var nowWall = (typeof performance !== 'undefined' && performance.now)
-                    ? performance.now()
+                    ? ((performance.timeOrigin || 0) + performance.now())
                     : Date.now();
 
       if (parsed.csrc && parsed.csrc.length) {
@@ -1282,6 +1341,25 @@ class MediaTransport extends EventEmitter {
         var localSsrc = 1;
         if (mapping && state.localSsrcs[mapping.mid]) {
           localSsrc = state.localSsrcs[mapping.mid].id;
+        } else if (state.localSsrcs) {
+          // Same rule as requestKeyframe: a RECEIVE-ONLY mid has no SSRC of
+          // its own, and the literal 1 is not a value we ever advertise — a
+          // peer looking it up finds nothing, and feedback it cannot
+          // attribute is feedback it may drop. Any SSRC allocated on this
+          // connection is still ours and still in our own SDP.
+          //
+          // This bug was written twice, once here and once in the PLI path.
+          // Sharing one resolver between them is the better shape, but an
+          // attempt to refactor the surrounding loop dropped the regression
+          // gate to 7/8, so the two sites are fixed identically instead.
+          var _rrKeys = Object.keys(state.localSsrcs);
+          for (var _rk = 0; _rk < _rrKeys.length; _rk++) {
+            var _rrCand = state.localSsrcs[_rrKeys[_rk]];
+            if (_rrCand && Number.isFinite(_rrCand.id) && _rrCand.id > 0) {
+              localSsrc = _rrCand.id;
+              break;
+            }
+          }
         }
         remoteSsrcList.push(remoteSsrc);
 
@@ -1582,6 +1660,14 @@ class MediaTransport extends EventEmitter {
     var stamper = this._state.headerStamper;
     if (!stamper || !parsedLocal || !parsedLocal.media) return;
     var URI_TO_NAME = {
+      // RFC 6464 ssrc-audio-level. Missing here meant the rebuilt map had no
+      // 'audio-level' key at all — including the one set at construction —
+      // so the stamper's `alId != null` test never passed and the extension
+      // was never written, on a session that had negotiated it. Everything
+      // else was already in place: the level is computed per frame
+      // (computeAudioDbov), passed through sendRtp as a hint, and read and
+      // converted on the receive side. This one line was the gap.
+      'urn:ietf:params:rtp-hdrext:ssrc-audio-level':                             'audio-level',
       'http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time':              'abs-send-time',
       'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01': 'transport-cc',
       'urn:ietf:params:rtp-hdrext:sdes:mid':                                     'mid',

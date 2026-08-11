@@ -80,6 +80,7 @@ class SdpOfferAnswer extends EventEmitter {
     this._lastOffer = null;
     this._lastAnswer = null;
     this._negotiationNeeded = false;
+    this._nnAnnounced = false;
     this._needsIceRestart = false;
 
     // Pre-commit snapshot (W3C §4.4.1.5/6 rollback). _commitDescription
@@ -335,31 +336,39 @@ class SdpOfferAnswer extends EventEmitter {
                  this._needsIceRestart;
     if (!needed) {
       this._negotiationNeeded = false;
+      this._nnAnnounced = false;   // burst over; the next one may announce
       return;
     }
 
-    // 5. flag already true → dedupe.
+    // 5. already announced this burst → dedupe.
     //
-    // The flag is only meaningful between "we decided negotiation is needed"
-    // and "the event fired". Leaving it set past the firing turned it into a
-    // permanent latch: the first negotiationneeded of a connection's life
-    // fired, and every subsequent one was swallowed as a duplicate. An
-    // application that stops a transceiver after the first negotiation — and
-    // waits for the event that is supposed to prompt the retiring round —
-    // waited forever.
+    // TWO FACTS, TWO FIELDS. `_negotiationNeeded` is W3C's
+    // [[NegotiationNeeded]] — "a negotiation is owed" — and it is retired by
+    // a negotiation, which is what rollback restores and what a rolled-back
+    // ICE restart depends on (fix 62). `_nnAnnounced` is "we have already
+    // told the application about this burst", and it is retired the moment
+    // the burst ends.
     //
-    // Clearing it at emit time restores the dedupe to what it is for: one
-    // event per burst of state changes, not one per connection.
-    if (this._negotiationNeeded) return;
+    // They were one field, and every attempt to fix one behaviour broke the
+    // other: clearing at emit time gave one event per CALL (three
+    // addTransceivers, three negotiations); keeping it set past the emit gave
+    // one event per CONNECTION and lost the rolled-back restart. The two
+    // lifetimes are genuinely different, so they need two fields.
+    if (this._nnAnnounced) return;
 
     // 6. Set flag and queue task to fire event.
     this._negotiationNeeded = true;
+    this._nnAnnounced = true;      // step 5 above now suppresses the rest of the burst
     var self = this;
     setTimeout(function () {
       if (self._deps.getClosed()) return;
       // Could have been cleared between scheduling and execution.
+      // A negotiation that completed between scheduling and firing means
+      // there is nothing left to ask for.
       if (!self._negotiationNeeded) return;
-      self._negotiationNeeded = false;
+      // The OWED flag survives — only the announcement is spent here. It is
+      // retired by step 4 above when checkIfNegotiationIsNeeded goes false,
+      // which is exactly what applying a description brings about.
       self.emit('negotiationneeded');
     });
   }
@@ -421,7 +430,17 @@ class SdpOfferAnswer extends EventEmitter {
     this._yieldBeforeWork(function () {
     _selfO._deps.prepareForCreateOffer(iceRestart, function (err, prepCtx) {
       if (err) return cb(err);
-      if (iceRestart) self.clearNeedsIceRestart();
+      // [[NeedsIceRestart]] is cleared when the offer is APPLIED, not when it
+      // is created (W3C 4.4.1.6). createOffer produces a description the
+      // caller may never use — and if that offer is rolled back, the restart
+      // is still owed.
+      //
+      // Clearing here made the pre-commit snapshot record `false`, so rollback
+      // restored `false` and the obligation vanished. The next offer happened
+      // to carry fresh credentials anyway (the agent had already been armed by
+      // prepareForCreateOffer), which masked it — but negotiationneeded never
+      // re-fired, so an application waiting for that event before re-offering
+      // waited forever.
 
       // Build the SDP.
       var sdp;
@@ -594,6 +613,32 @@ class SdpOfferAnswer extends EventEmitter {
       // hardcoded defaults. Without this sync our outgoing RTP stamps
       // extensions with IDs the peer won't recognize.
       _selfL._deps.syncStamperExtMap(commit.parsed);
+
+      // AN APPLIED DESCRIPTION ENDS THE BURST.
+      //
+      // Only the announcement latch is cleared here, never
+      // [[NegotiationNeeded]] itself — step 4 retires that on its own terms
+      // when checkIfNegotiationIsNeeded goes false, and clearing it here
+      // would discard a request the description did not actually satisfy.
+      //
+      // Reopening the latch is what lets a transceiver the peer's
+      // description left unmatched ask again, one turn after the apply
+      // succeeds: the ordering W3C requires, and the half that the
+      // single-field version could never express.
+      _selfL._nnAnnounced = false;
+
+      // A description now stands: the rollback window closes.
+      var _tcsC = state.transceivers || [];
+      for (var _ci = 0; _ci < _tcsC.length; _ci++) {
+        if (_tcsC[_ci]) _tcsC[_ci]._offerRolledBack = false;
+      }
+
+      // The restart obligation is discharged now that OUR offer is applied.
+      // See the note in createOffer: clearing it at creation time made a
+      // rolled-back offer lose the restart.
+      if (desc.type === 'offer' && _selfL._needsIceRestart) {
+        _selfL.clearNeedsIceRestart();
+      }
 
       // EVERY TRANSPORT CLOSED? THEN THERE IS NOTHING TO GATHER FOR.
       //
@@ -875,6 +920,38 @@ class SdpOfferAnswer extends EventEmitter {
    *     update.
    */
   _commitDescription(desc, source) {
+    // Capture peer-learned SCTP state BEFORE parsing overwrites it.
+    //
+    // The rollback snapshot is taken further down, after the SDP has already
+    // been parsed — so by then these fields hold the NEW values and rolling
+    // back restores the description's own values rather than the ones that
+    // preceded it. Everything else in the snapshot is written after that
+    // point, which is why only these two needed the earlier capture.
+    var _st0 = this._sharedState;
+    this._preParseSctp = {
+      remoteMaxMessageSize: _st0.remoteMaxMessageSize,
+      remoteSctpPort:       _st0.remoteSctpPort,
+      // Header-extension ids are learned from the peer's extmap the same way,
+      // and they are read on the RTP hot path — remoteAudioLevelExtId decides
+      // whether an inbound audio level is found at all (fix 53), and the rid
+      // ids drive simulcast layer identification (fix 55). An id left behind
+      // by an undone description makes us look for extensions at offsets the
+      // next peer never agreed to.
+      remoteAudioLevelExtId:  _st0.remoteAudioLevelExtId,
+      remoteTransportCcExtId: _st0.remoteTransportCcExtId,
+      remoteRidExtId:         _st0.remoteRidExtId,
+      remoteRepairedRidExtId: _st0.remoteRepairedRidExtId,
+      remoteIceLite:          _st0.remoteIceLite,
+      // The peer's IDENTITY and the DTLS role derived from its a=setup.
+      //
+      // remoteFingerprint is what the handshake is verified against — a
+      // fingerprint left behind by an UNDONE offer means we would still trust
+      // a certificate the peer never actually offered us in the negotiation
+      // that stands. dtlsRole comes from the same description, and a stale one
+      // can leave both ends picking the same role on the next round.
+      remoteFingerprint:      _st0.remoteFingerprint,
+      dtlsRole:               _st0.dtlsRole,
+    };
     var state = this._sharedState;
     var isLocal = source === 'local';
 
@@ -892,6 +969,126 @@ class SdpOfferAnswer extends EventEmitter {
       state.remoteMaxMessageSize = _mmsM ? parseInt(_mmsM[1], 10) : null;
       if (_mmsM && isNaN(state.remoteMaxMessageSize)) state.remoteMaxMessageSize = null;
     }
+    // A REMOTE DESCRIPTION WITHOUT A FINGERPRINT CANNOT BE USED.
+    //
+    // RFC 8842: the DTLS handshake is verified against a=fingerprint. With
+    // none, there is nothing to verify the peer's certificate against — any
+    // certificate would be accepted, which is the whole of DTLS-SRTP's
+    // identity guarantee.
+    //
+    // We accepted such a description, created an answer for it, and would
+    // have proceeded to the handshake with remoteFingerprint === null. Checked
+    // here, alongside the rtcp-mux rule, so it rejects before any state is
+    // touched.
+    if (source === 'remote' && parsed && parsed.media) {
+      var _hasFp = !!(parsed.fingerprint && parsed.fingerprint.value);
+      if (!_hasFp) {
+        for (var _fpI = 0; _fpI < parsed.media.length; _fpI++) {
+          var _fpM = parsed.media[_fpI];
+          if (_fpM && _fpM.port !== 0 && _fpM.fingerprint && _fpM.fingerprint.value) {
+            _hasFp = true;
+            break;
+          }
+        }
+      }
+      // An all-rejected description (every port 0) carries no transport and
+      // legitimately has nothing to fingerprint.
+      var _anyLive = parsed.media.some(function (m) { return m && m.port !== 0; });
+      if (_anyLive && !_hasFp) {
+        throw new DOMException(
+          'setRemoteDescription: description has no a=fingerprint — the DTLS ' +
+          'handshake would have nothing to verify the peer against',
+          'InvalidAccessError');
+      }
+
+      // AND ICE CREDENTIALS (RFC 8839 5.4).
+      //
+      // ufrag and pwd authenticate every connectivity check: without them
+      // there is nothing to bind a STUN request to this session, so any host
+      // that can reach the port can answer as the peer. We accepted such a
+      // description and created an answer for it, leaving remoteIceUfrag and
+      // remoteIcePwd null.
+      //
+      // Same session-level-or-media-level lookup as the fingerprint, and the
+      // same exemption for an all-rejected description.
+      var _hasUfrag = !!(parsed.iceUfrag && parsed.icePwd);
+      if (!_hasUfrag) {
+        for (var _icI = 0; _icI < parsed.media.length; _icI++) {
+          var _icM = parsed.media[_icI];
+          if (_icM && _icM.port !== 0 && _icM.iceUfrag && _icM.icePwd) {
+            _hasUfrag = true;
+            break;
+          }
+        }
+      }
+      if (_anyLive && !_hasUfrag) {
+        throw new DOMException(
+          'setRemoteDescription: description has no a=ice-ufrag/a=ice-pwd — ' +
+          'connectivity checks could not be authenticated',
+          'InvalidAccessError');
+      }
+
+      // A BUNDLE GROUP MUST NAME MIDS THE PEER ACTUALLY SENT (RFC 8843 7.1).
+      //
+      // a=group:BUNDLE lists the mids sharing one transport, and the peer
+      // demultiplexes incoming RTP by them. A section with no a=mid cannot be
+      // named by any group — but the parser assigns it its index anyway, so
+      // the group looked satisfied, we answered with mids of our own
+      // invention, and both sides then claimed agreement on identifiers one
+      // of them never sent.
+      //
+      // section.midDeclared is what distinguishes "the peer said 0" from "we
+      // decided 0 because it was first"; without it this check cannot be
+      // written, which is why the parser records it.
+      //
+      // Only when a BUNDLE group is present: a description with neither group
+      // nor mids is a legal non-bundled session, and JSEP's assign-by-position
+      // rule is correct there.
+      if (parsed.bundleMids && parsed.bundleMids.length) {
+        for (var _bmI = 0; _bmI < parsed.media.length; _bmI++) {
+          var _bmM = parsed.media[_bmI];
+          if (!_bmM || _bmM.port === 0) continue;
+          if (_bmM.midDeclared === false) {
+            throw new DOMException(
+              'setRemoteDescription: media section ' + _bmI + ' has no a=mid ' +
+              'but the description declares a=group:BUNDLE',
+              'InvalidAccessError');
+          }
+        }
+      }
+
+      // AN ANSWER MUST ECHO THE OFFER'S MIDS (JSEP 5.10).
+      //
+      // The offer names the m-sections; the answer responds to them, section
+      // by section, and cannot introduce identifiers of its own. An answer
+      // whose mid did not match was treated as describing a NEW section, so
+      // it created a second transceiver — one the peer has no idea exists,
+      // for an m-line the offer never contained:
+      //
+      //   offer mid 0, answer mid 99  ->  tcs=2, mids=["0","99"]
+      //
+      // Compared against the pending LOCAL offer, since that is the
+      // description this answer is responding to.
+      if (desc.type === 'answer' || desc.type === 'pranswer') {
+        var _pend = state.parsedLocalSdp;
+        if (_pend && _pend.media) {
+          for (var _amI = 0; _amI < parsed.media.length; _amI++) {
+            var _amA = parsed.media[_amI];
+            var _amO = _pend.media[_amI];
+            if (!_amA || !_amO) continue;
+            if (_amA.port === 0 || _amO.port === 0) continue;
+            if (_amA.midDeclared === false) continue;   // nothing claimed
+            if (String(_amA.mid) !== String(_amO.mid)) {
+              throw new DOMException(
+                'setRemoteDescription: answer section ' + _amI + ' has mid "' +
+                _amA.mid + '" but the offer used "' + _amO.mid + '"',
+                'InvalidAccessError');
+            }
+          }
+        }
+      }
+    }
+
     // W3C: under rtcpMuxPolicy 'require' (the only modern value), a
     // remote description whose media sections do not declare a=rtcp-mux
     // is unusable — reject with InvalidAccessError before any state
@@ -1055,6 +1252,16 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       localIcePwd:               state.localIcePwd,
       negotiationNeeded:         this._negotiationNeeded,
       needsIceRestart:           this._needsIceRestart,
+      // SCTP attributes LEARNED FROM THE PEER's description. A rollback undoes
+      // the description, so what it told us about the peer has to go with it.
+      //
+      // remoteMaxMessageSize governs what send() will accept — the getter on
+      // RTCSctpTransport returns min(local, remote) — so a value left behind
+      // by an undone offer keeps capping (or un-capping) us on behalf of a
+      // negotiation that never completed. Same shape as every other
+      // peer-learned field that already rolls back; these two were simply
+      // never added to the snapshot.
+      preParsePeerState:         this._preParseSctp || null,
       preCommitSnapshot:         this._preCommitSnapshot,
     };
   }
@@ -1117,7 +1324,27 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       }
     }
     this._negotiationNeeded = snap.negotiationNeeded;
+    // A ROLLBACK REOPENS THE ANNOUNCEMENT.
+    //
+    // The burst that was announced led to an offer that no longer exists, so
+    // whatever is still owed has to be announceable again — otherwise the
+    // request survives (fix 62 keeps [[NeedsIceRestart]]) but the application
+    // is never told, and waits on an event that will not come.
+    this._nnAnnounced = false;
     this._needsIceRestart   = snap.needsIceRestart;
+    // Peer-learned state goes back with the description that taught it to us.
+    if (snap.preParsePeerState) {
+      var _pp = snap.preParsePeerState;
+      state.remoteMaxMessageSize  = _pp.remoteMaxMessageSize;
+      state.remoteSctpPort        = _pp.remoteSctpPort;
+      state.remoteAudioLevelExtId = _pp.remoteAudioLevelExtId;
+      state.remoteTransportCcExtId = _pp.remoteTransportCcExtId;
+      state.remoteRidExtId        = _pp.remoteRidExtId;
+      state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
+      state.remoteIceLite         = _pp.remoteIceLite;
+      state.remoteFingerprint     = _pp.remoteFingerprint;
+      state.dtlsRole              = _pp.dtlsRole;
+    }
     this._preCommitSnapshot = snap.preCommitSnapshot;
   }
 
@@ -1306,6 +1533,42 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
     try {
       var parsed = SDP.parseCandidate(candidate.candidate);
       if (parsed) {
+        // A CANDIDATE'S TYPE AND ADDRESS HAVE TO BE USABLE (RFC 8839 5.1).
+        //
+        // A candidate line arrives straight off the signalling channel, so
+        // this is peer-controlled input on every connection. The parser
+        // accepts the grammar; these two fields also have to mean something:
+        //
+        //   typ bogus     -> stored verbatim and fed to pair priority and
+        //                    nomination, which are defined only over the four
+        //                    RFC types
+        //   NOT.AN.IP     -> stored as the destination address and handed to
+        //                    the socket
+        //
+        // Port and priority were already range-checked; type and address were
+        // not, and both were kept exactly as sent.
+        var _cTyp = String(parsed.type || '').toLowerCase();
+        if (_cTyp !== 'host' && _cTyp !== 'srflx' && _cTyp !== 'prflx' && _cTyp !== 'relay') {
+          return cb(new DOMException(
+            'addIceCandidate: unknown candidate type "' + parsed.type + '"',
+            'OperationError'));
+        }
+        var _cIp = String(parsed.ip || parsed.address || '');
+        // IPv4 dotted quad, IPv6 (hex groups and ':'), or an mDNS/DNS name.
+        var _ipOk = /^\d{1,3}(\.\d{1,3}){3}$/.test(_cIp) ||
+                    /^[0-9A-Fa-f:]+$/.test(_cIp) ||
+                    /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$/.test(_cIp);
+        if (_cIp && /^\d{1,3}(\.\d{1,3}){3}$/.test(_cIp)) {
+          var _oct = _cIp.split('.');
+          for (var _oi = 0; _oi < 4; _oi++) {
+            if (parseInt(_oct[_oi], 10) > 255) { _ipOk = false; break; }
+          }
+        }
+        if (!_cIp || !_ipOk) {
+          return cb(new DOMException(
+            'addIceCandidate: unusable candidate address "' + _cIp + '"',
+            'OperationError'));
+        }
         TransportController.addTrickleCandidate(
           this._sharedState, parsed, this._deps.getIceAgent());
         // WPT harvest: the candidate must become VISIBLE — tests read
@@ -1573,12 +1836,29 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
         // _adopted set — and isLegitimateOwner accepts ANY of the three, so
         // the mid stayed publicly visible.
         if (!_st) continue;
-        if (!_st._associated && !_st._adopted && !_st._srdCreated) continue;
+        // A MID IS THE EVIDENCE, NOT THE FLAGS.
+        //
+        // The restore loop immediately above has already set _associated
+        // from the snapshot, so a transceiver THIS description associated
+        // reads false by the time we get here and is skipped — the loop
+        // could never act on the one case it exists for. Measured:
+        // `restore [0] mid=0 -> false`, then `cand mid=0 a=false ad=false`.
+        //
+        // The mid survives that restore and answers the question directly:
+        // a transceiver still carrying one was bound by a description, and
+        // this rollback is discarding that description.
+        if (!_st._associated && !_st._adopted && !_st._srdCreated &&
+            _st.mid == null) continue;
         if (snap.associatedAtSnapshot &&
             snap.associatedAtSnapshot.indexOf(_st) !== -1) continue;
         _st._associated = false;
         _st._adopted = false;
         _st._srdCreated = false;
+        // Open the rollback window: until the next description is applied,
+        // nothing may re-associate or re-adopt this transceiver from the
+        // description we just discarded. See _markAssociatedFromApplied and
+        // the reuse guards in connection_manager.
+        _st._offerRolledBack = true;
       }
 
       var createdDuring = state.transceivers.filter(function (t) {
@@ -1676,7 +1956,27 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       }
     }
     this._negotiationNeeded = snap.negotiationNeeded;
+    // A ROLLBACK REOPENS THE ANNOUNCEMENT.
+    //
+    // The burst that was announced led to an offer that no longer exists, so
+    // whatever is still owed has to be announceable again — otherwise the
+    // request survives (fix 62 keeps [[NeedsIceRestart]]) but the application
+    // is never told, and waits on an event that will not come.
+    this._nnAnnounced = false;
     this._needsIceRestart   = snap.needsIceRestart;
+    // Peer-learned state goes back with the description that taught it to us.
+    if (snap.preParsePeerState) {
+      var _pp = snap.preParsePeerState;
+      state.remoteMaxMessageSize  = _pp.remoteMaxMessageSize;
+      state.remoteSctpPort        = _pp.remoteSctpPort;
+      state.remoteAudioLevelExtId = _pp.remoteAudioLevelExtId;
+      state.remoteTransportCcExtId = _pp.remoteTransportCcExtId;
+      state.remoteRidExtId        = _pp.remoteRidExtId;
+      state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
+      state.remoteIceLite         = _pp.remoteIceLite;
+      state.remoteFingerprint     = _pp.remoteFingerprint;
+      state.dtlsRole              = _pp.dtlsRole;
+    }
 
     // ── ICE creds: restore + sync iceAgent. ──
     //

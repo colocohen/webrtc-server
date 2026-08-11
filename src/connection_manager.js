@@ -556,6 +556,17 @@ function ConnectionManager(config) {
     resetIceGathering: function () {
       state.localGatheredCandidates = [];
       state.iceGatheringComplete = false;
+      // AND the flag anything actually READS.
+      //
+      // iceGatheringEnded is what api.js consults to decide whether an
+      // RTCIceTransport may report 'complete' — a gathering phase that has
+      // been reset has not ended, so leaving it true let the transport claim
+      // a finished phase for a session that is starting a new one.
+      //
+      // iceGatheringComplete above is written here and in one other place and
+      // read nowhere; the two names are close enough that clearing the wrong
+      // one looked correct.
+      state.iceGatheringEnded = false;
       if (state.iceGatheringState !== 'new') {
         setState({ iceGatheringState: 'new' });
       }
@@ -728,6 +739,10 @@ function ConnectionManager(config) {
     getDtlsRole:                 function () { return state.dtlsRole; },
     updateNegotiationNeededFlag: function () { sdpOA.updateNegotiationNeededFlag(); },
     applyStateUpdates:           function (updates) { setState(updates); },
+    // The controller builds RTCError / RTCErrorEvent when the transport
+    // fails and cannot import either without a cycle — api.js publishes the
+    // constructors on state for exactly this.
+    getState:                    function () { return state; },
     SctpAssociation:             SctpAssociation,
     debug:                       _DBG,
   });
@@ -789,6 +804,10 @@ function ConnectionManager(config) {
         if (_dir !== 'sendrecv' && _dir !== 'recvonly') return;
         var tr = tc.receiver && tc.receiver.track;
         if (!tr || tr.muted !== true) return;
+        // Media has started arriving: start (or resume) the currentTime clock.
+        // Done here rather than on negotiation because currentTime measures
+        // RECEIVED media — a track negotiated but never fed must stay at 0.
+        if (!tr._ctFirstPacketAt) tr._ctFirstPacketAt = Date.now();
         tr.muted = false;
         try { tr.dispatchEvent && tr.dispatchEvent({ type: 'unmute' }); } catch (e1) {}
         return;
@@ -980,6 +999,34 @@ function ConnectionManager(config) {
 
     iceAgent.on('statechange', function(newState) {
       if (state.closed) return;
+      // 'checking' IS ANNOUNCED ON A QUEUED TASK; every other state inline.
+      //
+      // Measured: the agent reports 'checking' inside setRemoteDescription,
+      // in the same millisecond the promise resolves and just before it —
+      // so an application that installs its listener after `await sRD(...)`,
+      // which is the ordinary pattern, never sees the transition. It reads
+      // 'connected' as the first thing that ever happened.
+      //
+      // Only this one state is deferred, and that distinction is the whole
+      // fix. iceConnectionState is a TRIGGER as well as a report: the cascade
+      // starts the DTLS handshake the moment it reads 'connected', so
+      // deferring the value wholesale stalls connection setup outright — two
+      // earlier attempts did exactly that and were reverted. 'checking' gates
+      // nothing, so delaying its announcement by a task costs nothing and
+      // makes the sequence observable from where callers actually watch.
+      if (newState === 'checking') {
+        var _t = setTimeout(function () {
+          if (state.closed) return;
+          // Only if nothing has moved past it in the meantime — a fast
+          // connect can reach 'connected' before this task runs, and
+          // announcing 'checking' after that would be a lie.
+          if (state.iceConnectionState === 'new') {
+            setState({ iceConnectionState: 'checking' });
+          }
+        }, 0);
+        if (_t.unref) _t.unref();
+        return;
+      }
       setState({ iceConnectionState: newState });
     });
 
@@ -1548,6 +1595,21 @@ function ConnectionManager(config) {
     } catch (eRet) {}
   }
 
+  /**
+   * Mark transceivers whose mid appears in an applied description.
+   *
+   * Runs from setState on every parsed-SDP update — INCLUDING the update a
+   * rollback performs to restore the previous description. That is what made
+   * glare unfixable from the rollback side: the rollback released the
+   * transceiver, setState restored the SDP, and this marker immediately
+   * re-associated it from that SDP. Measured as two `markAssociated set
+   * mid=0` for one implicit rollback.
+   *
+   * `_offerRolledBack` marks the window between a rollback releasing a
+   * transceiver and the next description being applied. Inside it, a mid
+   * appearing in the restored SDP is evidence of the description we just
+   * discarded, not of one that stands.
+   */
   function _markAssociatedFromApplied() {
     try {
       var descs = [state.parsedLocalSdp, state.parsedRemoteSdp];
@@ -1571,6 +1633,7 @@ function ConnectionManager(config) {
             // association enters ONLY via SRD-creation, adoption, or
             // the local-offer binding step.
             if (!RtpManager.isLegitimateOwner(tW)) continue;
+            if (tW._offerRolledBack) continue;   // released by a rollback
             tW._associated = true;
           }
         }
@@ -1640,6 +1703,8 @@ function ConnectionManager(config) {
             // left the send machinery looking up an empty slot, so no
             // a=ssrc in the offer and no RTP ever transmitted. (Same
             // re-key the adoption path already does at its own site.)
+            // Do not re-associate a transceiver a rollback just released.
+            if (ut._offerRolledBack) continue;
             RtpManager.rebindMid(state, ut, bm.mid);
             ut._associated = true;
             break;
@@ -1715,7 +1780,15 @@ function ConnectionManager(config) {
           ev.emit('signalingstatechange', { type: 'signalingstatechange' });
         }
       }
-        if (key === 'iceConnectionState') ev.emit('iceconnectionstatechange');
+        // W3C 4.4.3: the transitions close() causes are SILENT — the same
+        // rule signalingState, connectionState and dtlsState already follow
+        // through the _closing flag. iceConnectionState was the one that did
+        // not, so closing a connection fired one last
+        // iceconnectionstatechange announcing 'closed' to a handler with
+        // nothing left to act on.
+        if (key === 'iceConnectionState' && !state._closing) {
+          ev.emit('iceconnectionstatechange');
+        }
         if (key === 'iceGatheringState') {
           ev.emit('icegatheringstatechange');
           if (state.iceGatheringState === 'complete' && state._emitNullOnComplete) {
@@ -2575,6 +2648,33 @@ function ConnectionManager(config) {
     };
   }
 
+  /**
+   * Give a REMOTE track a `currentTime` (W3C mediacapture-main).
+   *
+   * It reports how much media has been received on the track, starting at 0
+   * and advancing only while media actually arrives — a track that never
+   * receives a packet stays at 0 no matter how long it lives, which is what
+   * distinguishes it from wall-clock time.
+   *
+   * Defined here rather than in media-processing because the track object
+   * knows nothing about reception: this layer is the one that sees packets
+   * land. It is a getter over the receive clock, so nothing has to be updated
+   * per packet.
+   */
+  function _attachCurrentTime(track) {
+    if (!track || 'currentTime' in track) return;
+    track._ctFirstPacketAt = 0;   // set on the first inbound packet
+    track._ctAccumulated   = 0;   // frozen span across mute/unmute cycles
+    Object.defineProperty(track, 'currentTime', {
+      enumerable: true,
+      get: function () {
+        if (!track._ctFirstPacketAt) return track._ctAccumulated;
+        return track._ctAccumulated +
+               (Date.now() - track._ctFirstPacketAt) / 1000;
+      },
+    });
+  }
+
   function processRemoteMedia(parsed) {
     for (var i = 0; i < parsed.media.length; i++) {
       var m = parsed.media[i];
@@ -2684,8 +2784,18 @@ function ConnectionManager(config) {
           if (_jt._associated) continue;
           if (_jt.kind !== m.type) continue;
           if (RtpManager.isStopped(_jt)) continue;
+          // Glare: a transceiver the implicit rollback just released must not
+          // be re-adopted into the peer's colliding m-section — W3C 4.4.1.5
+          // gives that section its own. Field reuse carries no flag.
+          if (_jt._offerRolledBack) continue;
           if (_jt.sender && _jt.sender.track &&
               (m.direction === 'sendonly' || m.direction === 'inactive')) continue;
+          // An application-created transceiver keeps its own identity: the
+          // peer's section gets a new one rather than absorbing this. See the
+          // note at the addTransceiver call site; internally created
+          // transceivers carry no flag and still pair, which is the reuse the
+          // engine depends on.
+          if (_jt._appCreated) continue;
           RtpManager.rebindMid(state, _jt, m.mid);
           _jt._adopted = true;
           _jt._associated = true;
@@ -3004,6 +3114,8 @@ function ConnectionManager(config) {
             if (_rt._associated) continue;
             if (_rt.kind !== m.type) continue;
             if (RtpManager.isStopped(_rt)) continue;
+            // Same rule on the same-mid path — the exact shape glare takes.
+            if (_rt._offerRolledBack) continue;
             // JSEP compatibility (the ADOPTION-SWALLOW field bug): a
             // transceiver that intends to SEND must NOT be adopted into
             // a remote m-line where we cannot send (their sendonly/
@@ -3055,6 +3167,7 @@ function ConnectionManager(config) {
           try {
             _birthTrack = new MediaStreamTrack({ kind: m.type, label: 'remote ' + m.type });
             _birthTrack.muted = true;
+            _attachCurrentTime(_birthTrack);
           } catch (eBt) {}
           state.transceivers.push({
             _srdCreated: true,   // rollback removes ONLY these (JSEP)
@@ -3334,6 +3447,10 @@ function ConnectionManager(config) {
       // Born muted; unmuted on the first arriving packet (see
       // _unmuteReceiverForSsrc). 'about to arrive' is not 'arrived'.
       try { track.muted = true; } catch (eUm) {}
+      // currentTime reports received media and starts at 0 — see
+      // _attachCurrentTime. Applied to whichever object surfaces, including
+      // one reused from the transceiver's birth track.
+      try { _attachCurrentTime(track); } catch (eCt) {}
       // WPT harvest: tracks sharing a remote msid must surface in the
       // SAME MediaStream object (ontrack ordering tests compare object
       // identity), and the stream's id must equal the remote msid token.
@@ -3569,8 +3686,27 @@ function ConnectionManager(config) {
     // and tears down SCTP.
     try { dcController.close(); } catch (e) {}
 
-    if (iceAgent) { try { iceAgent.close(); } catch (e) {} }
-    if (state.dtlsSession) { try { state.dtlsSession.close(); } catch (e) {} }
+    // LET THE SCTP ABORT REACH THE WIRE.
+    //
+    // dcController.close() above sends an SCTP ABORT so the remote peer
+    // learns its channels are gone (RFC 4960 3.3.7). That ABORT travels over
+    // DTLS — closing the session in this same tick discarded it, and the peer
+    // was left holding channels stuck at 'open' with no error and no close,
+    // exactly as if we had never told it.
+    //
+    // One task of delay is enough for the datagram to be handed to the
+    // socket. Everything observable locally has already happened: channels
+    // are 'closed', signalingState is 'closed', and the connection is
+    // unusable — this only defers the physical teardown.
+    //
+    // Guarded on state.closed so a second close() cannot double-free, and the
+    // timer is unref'd so it never holds the process open.
+    var _teardown = function () {
+      if (iceAgent) { try { iceAgent.close(); } catch (e) {} }
+      if (state.dtlsSession) { try { state.dtlsSession.close(); } catch (e) {} }
+    };
+    var _tdTimer = setTimeout(_teardown, 0);
+    if (_tdTimer.unref) _tdTimer.unref();
 
     // Diagnostic packet-counts timer — installed lazily in iceAgent's
     // 'packet' handler. Without explicit cleanup it keeps firing forever
@@ -3885,7 +4021,13 @@ function ConnectionManager(config) {
   };
 
   // Transport — all data-plane send paths live in MediaTransport.
-  this.sendRtp     = function (rtpPacket) { mediaTransport.sendRtp(rtpPacket); };
+  // Forward the HINTS too. media_pipeline computes the RFC 6464 audio level
+  // per frame and passes it here as the second argument; dropping it meant
+  // the header stamper saw `hints === undefined`, its `hints.audioLevel !=
+  // null` test never passed, and the extension was never written — on a
+  // session that had negotiated it. Everything else in the chain was already
+  // built and correct.
+  this.sendRtp     = function (rtpPacket, hints) { mediaTransport.sendRtp(rtpPacket, hints); };
   this.sendRtcp    = function (rtcpPacket) { mediaTransport.sendRtcp(rtcpPacket); };
   this.sendPacket  = function (buf)        { mediaTransport.sendPacket(buf); };
 

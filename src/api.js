@@ -507,7 +507,17 @@ function RTCPeerConnection(config) {
 
   ev.on('icecandidateerror', function (payload) {
     if (!self._handlers.onicecandidateerror) return;
-    self._handlers.onicecandidateerror(new RTCPeerConnectionIceErrorEvent(payload || {}));
+    // The constructor takes (type, init). Passing the payload as the FIRST
+    // argument made it the event TYPE and left init empty, so every field
+    // fell to its default: errorCode 0, url '', address and port null.
+    //
+    // The payload itself was always complete —
+    // { url, errorText: 'STUN timeout', errorCode: 701, address, port } —
+    // so an application configuring several STUN/TURN servers got one event
+    // per failure carrying none of the information the event exists to
+    // deliver: which server failed, and why.
+    self._handlers.onicecandidateerror(
+      new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}));
   });
 
   // ondatachannel — wraps internal channel → RTCDataChannel.
@@ -853,10 +863,12 @@ function RTCPeerConnection(config) {
     // anyway, so no negotiationneeded is fired.
     if (manager.state.closed) return;
     if (!manager.state.currentLocalDescription && !manager.state.pendingLocalDescription) return;
-    if (manager.state.closed) {
-      var err = new DOMException('restartIce: peer connection is closed', 'InvalidStateError');
-      throw err;
-    }
+    // (A second closed-check used to sit here and throw InvalidStateError.
+    // It was unreachable behind the no-op above, and it contradicted it —
+    // whichever a reader saw first, they drew the wrong conclusion about
+    // which behaviour is intended. WPT's own test is named "restartIce() has
+    // no effect on a closed peer connection", so the no-op is correct and
+    // the throw was the mistake.)
     manager.restartIce();
   };
 
@@ -1081,11 +1093,24 @@ function RTCPeerConnection(config) {
       }
     }
     manager.state.iceServers = _validateIceServers(newConfig.iceServers, 'setConfiguration');
-    // Per W3C §4.4.1.4, iceTransportPolicy changes take effect on the next
-    // ICE gathering round (i.e. next ICE restart) — the running IceAgent
-    // instance keeps its current policy until restartIce() is called.
+    // Per W3C 4.4.1.4, iceTransportPolicy changes take effect on the next
+    // ICE gathering round — the running IceAgent keeps its current policy
+    // until a restart happens.
+    //
+    // But the change itself is what REQUIRES that restart (W3C 4.3.2: an
+    // altered policy sets [[NeedsIceRestart]]). Storing the value without
+    // setting the flag meant the next createOffer reused the same ufrag and
+    // gathered under the old policy — so `setConfiguration({
+    // iceTransportPolicy: 'relay' })` silently kept using host candidates,
+    // and an application that switched to relay for privacy or firewall
+    // reasons never actually did.
     if (newConfig.iceTransportPolicy) {
+      var _oldPolicy = manager.state.iceTransportPolicy || 'all';
       manager.state.iceTransportPolicy = newConfig.iceTransportPolicy;
+      if (newConfig.iceTransportPolicy !== _oldPolicy &&
+          typeof manager.restartIce === 'function') {
+        manager.restartIce();
+      }
     }
     if (typeof newConfig.iceCandidatePoolSize === 'number') {
       // Stored for getConfiguration round-trip. Pool pre-gathering is a
@@ -1359,24 +1384,31 @@ function RTCPeerConnection(config) {
       var allRid = true;
       for (var ei = 0; ei < encs.length; ei++) {
         var enc = encs[ei] || {};
-        if (!_audioKind && typeof enc.maxFramerate === 'number' && enc.maxFramerate < 0) {
-          throw new RangeError('addTransceiver: encoding maxFramerate must be >= 0');
-        }
-        if (!_audioKind && typeof enc.scaleResolutionDownBy === 'number' && enc.scaleResolutionDownBy < 1) {
-          throw new RangeError('addTransceiver: encoding scaleResolutionDownBy must be >= 1');
+        // Same shared rule as setParameters (encodingRangeProblem); audio
+        // carries neither member, so it is exempt here.
+        if (!_audioKind) {
+          var _encBad = RtpManager.encodingRangeProblem(enc);
+          if (_encBad === 'framerate') {
+            throw new RangeError('addTransceiver: encoding maxFramerate must be >= 0');
+          }
+          if (_encBad === 'scale') {
+            throw new RangeError('addTransceiver: encoding scaleResolutionDownBy must be >= 1');
+          }
         }
         if (enc.rid != null) {
           anyRid = true;
-          if (String(enc.rid).length > 16) {
-            // RFC 8852 §3.1 caps rid at 16 characters — enforced here at
-            // the API boundary so BOTH kinds reject before any
-            // kind-specific collapsing happens.
-            throw new TypeError('addTransceiver: rid must be at most 16 characters');
+          // One rid rule, in rtp_transmission_manager — see ridProblem. It is
+          // ENFORCED here, at the API boundary, so both kinds reject before
+          // any kind-specific collapsing happens; only the wording of the
+          // error belongs to this layer.
+          var _ridBad = RtpManager.ridProblem(enc.rid);
+          if (_ridBad === 'length') {
+            throw new TypeError('addTransceiver: rid must be at most ' +
+              RtpManager.RID_MAX_LENGTH + ' characters');
           }
-          if (!/^[A-Za-z0-9]{1,32}$/.test(enc.rid)) {
-            // RFC 8852: rid values are alphanumeric; '-' and '_' are
-            // SDP-level separators, so they are invalid inside a rid.
-            throw new TypeError('addTransceiver: invalid rid "' + enc.rid + '" (must match [A-Za-z0-9]{1,32})');
+          if (_ridBad === 'syntax') {
+            throw new TypeError('addTransceiver: invalid rid "' + enc.rid +
+              '" (must match [A-Za-z0-9]{1,32})');
           }
           if (seenRids[enc.rid]) {
             throw new TypeError('addTransceiver: duplicate rid "' + enc.rid + '"');
@@ -1390,10 +1422,10 @@ function RTCPeerConnection(config) {
       if (_audioKind) {
         // audio keeps `active` AND `maxBitrate`; only rid,
         // scaleResolutionDownBy and maxFramerate are video-only.
-        var _a0 = encs[0] || {};
-        encs = [typeof _a0.maxBitrate === 'number'
-          ? { active: _a0.active !== false, maxBitrate: _a0.maxBitrate }
-          : { active: _a0.active !== false }];
+        // One implementation, in rtp_transmission_manager. This rebuild used
+        // to be written out here as well as twice there, and all three copies
+        // dropped the codec pin — see the note on collapseAudioEncodings.
+        encs = RtpManager.collapseAudioEncodings(encs);
         init = Object.assign({}, init, { sendEncodings: encs });
       }
       // Spec: rid must be on all or none.
@@ -1403,6 +1435,18 @@ function RTCPeerConnection(config) {
     }
 
     var internal = manager.addTransceiver(kind, init);
+    // CREATED BY THE APPLICATION, WITH ITS OWN INTENT.
+    //
+    // W3C 4.4.1.6 pairs a remote m-section only with a transceiver that has
+    // never been associated AND was not created by addTransceiver — an
+    // application that asked for its own audio transceiver expects to keep
+    // it, and the peer's section to get one of its own.
+    //
+    // We had no way to tell the two apart, so any unassociated same-kind
+    // transceiver absorbed the peer's section. The reuse the engine relies on
+    // is a DIFFERENT case: those transceivers are created internally, not
+    // through this call, so they carry no flag and still pair.
+    if (internal) internal._appCreated = true;
     if (track) internal.sender.track = track;
     manager.updateNegotiationNeededFlag();
     return _tcCache(internal);
@@ -1816,7 +1860,8 @@ function RTCPeerConnection(config) {
       };
     } else if (name === 'icecandidateerror') {
       wrapped = function (payload) {
-        fn(new RTCPeerConnectionIceErrorEvent(payload || {}));
+        // (type, init) — see the note on the on-handler path.
+        fn(new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}));
       };
     } else if (name === 'datachannel') {
       // Subscribe to the WRAPPED channel; the wrapped event arrives
@@ -2827,10 +2872,10 @@ function RTCRtpSender(internal, track, manager) {
     return out;
   };
 
-  impl.setParameters = function(params) {
+  impl.setParameters = function(params, setParameterOptions) {
     return _setParametersInner.apply(this, arguments);
   };
-  var _setParametersInner = function (params) {
+  var _setParametersInner = function (params, setParameterOptions) {
     // W3C §5.2.4 validation order:
     //   1. transactionId match (InvalidStateError)
     //   2. transceiver stopped → InvalidStateError
@@ -2917,11 +2962,21 @@ function RTCRtpSender(internal, track, manager) {
     // Audio senders carry no video-only members: strip rather than
     // reject, matching addTransceiver's audio handling.
     if (internal.kind === 'audio' && Array.isArray(params.encodings)) {
+      // The FOURTH copy of the audio collapse — fix 61 unified three in the
+      // creation path (two in rtp_transmission_manager, one in api.js) and
+      // this one, on the UPDATE path, kept its own field list and its own
+      // omission: it dropped `codec`, so a pin set through setParameters was
+      // discarded before any validation or copying saw it.
+      //
+      // rid survives here where the creation collapse drops it, because
+      // setParameters must reject a rid CHANGE rather than silently ignore
+      // one; the shared helper handles active, maxBitrate and codec, and rid
+      // is re-attached after.
       params = Object.assign({}, params, {
         encodings: params.encodings.map(function (e) {
-          return { active: (e || {}).active !== false,
-                   rid: (e || {}).rid,
-                   maxBitrate: (e || {}).maxBitrate };
+          var one = RtpManager.collapseAudioEncodings([e || {}])[0];
+          if ((e || {}).rid !== undefined) one.rid = e.rid;
+          return one;
         }),
       });
     }
@@ -2999,11 +3054,14 @@ function RTCRtpSender(internal, track, manager) {
     if (params && Array.isArray(params.encodings)) {
       for (var _rv = 0; _rv < params.encodings.length; _rv++) {
         var _re = params.encodings[_rv] || {};
-        if (typeof _re.scaleResolutionDownBy === 'number' && _re.scaleResolutionDownBy < 1) {
+        // One range rule, in rtp_transmission_manager — see
+        // encodingRangeProblem. This layer owns only the message.
+        var _reBad = RtpManager.encodingRangeProblem(_re);
+        if (_reBad === 'scale') {
           return Promise.reject(new RangeError(
             'setParameters: encodings[' + _rv + '].scaleResolutionDownBy must be >= 1.0'));
         }
-        if (typeof _re.maxFramerate === 'number' && _re.maxFramerate < 0) {
+        if (_reBad === 'framerate') {
           return Promise.reject(new RangeError(
             'setParameters: encodings[' + _rv + '].maxFramerate must be >= 0'));
         }
@@ -3076,12 +3134,12 @@ function RTCRtpSender(internal, track, manager) {
         }
         // RangeError checks (spec §5.2.4): scaleResolutionDownBy must be
         // >= 1.0 and maxFramerate must be >= 0.0.
-        if (typeof srcEnc.scaleResolutionDownBy === 'number' &&
-            srcEnc.scaleResolutionDownBy < 1) {
+        var _srcBad = RtpManager.encodingRangeProblem(srcEnc);
+        if (_srcBad === 'scale') {
           return Promise.reject(new RangeError(
             'setParameters: encodings[' + vi + '].scaleResolutionDownBy must be >= 1.0'));
         }
-        if (typeof srcEnc.maxFramerate === 'number' && srcEnc.maxFramerate < 0) {
+        if (_srcBad === 'framerate') {
           return Promise.reject(new RangeError(
             'setParameters: encodings[' + vi + '].maxFramerate must be >= 0.0'));
         }
@@ -3134,6 +3192,19 @@ function RTCRtpSender(internal, track, manager) {
         // "read parameters, delete maxFramerate, write back" is the
         // documented way to clear a cap. Merging kept the old value
         // forever and made every cap one-way.
+        // The codec pin travels the same way (W3C 5.2): present means set,
+        // absent means unset. It is not numeric, so it sits outside the loop
+        // below — and being in no copy list at all is exactly why a pin set
+        // through setParameters was silently ignored while one set at
+        // addTransceiver worked.
+        if (src.codec) {
+          dst.codec = src.codec;
+          if (tdst) tdst.codec = src.codec;
+        } else if (Object.prototype.hasOwnProperty.call(src, 'codec')) {
+          delete dst.codec;
+          if (tdst) delete tdst.codec;
+        }
+
         var _numMembers = ['maxBitrate', 'maxFramerate', 'scaleResolutionDownBy'];
         for (var _nm = 0; _nm < _numMembers.length; _nm++) {
           var _k = _numMembers[_nm];
@@ -3209,6 +3280,27 @@ function RTCRtpSender(internal, track, manager) {
     _mergeRequested();
     // Per spec, a new transactionId is generated after successful apply.
     currentParams.transactionId = '';
+
+    // W3C 5.2 setParameterOptions — the SECOND argument can ask for a key
+    // frame:
+    //
+    //   sender.setParameters(p, { encodings: [{ requestKeyFrame: true }] })
+    //
+    // This is how an application refreshes a decoder without waiting for the
+    // receiver to send a PLI. The pipeline already serves exactly this
+    // request for PLI/FIR; only the entry point was missing.
+    try {
+      var _kfEncs = setParameterOptions && setParameterOptions.encodings;
+      if (_kfEncs && _kfEncs.length && pipeline &&
+          typeof pipeline.requestKeyFrame === 'function') {
+        for (var _ki = 0; _ki < _kfEncs.length; _ki++) {
+          if (_kfEncs[_ki] && _kfEncs[_ki].requestKeyFrame === true) {
+            pipeline.requestKeyFrame();
+            break;
+          }
+        }
+      }
+    } catch (eKf) { /* a key-frame request must never fail setParameters */ }
     // W3C 5.2: setParameters is ASYNCHRONOUS — it must not settle in the
     // same turn (WPT checks the promise is still pending after a
     // microtask). It does NOT use the operations chain; it simply
@@ -3891,8 +3983,10 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
                    internalTransceiver.receiver._csrcEntries) || [];
     if (!entries.length) return [];
 
+    // Absolute clock, matching how media_transport stamps the entries — see
+    // the note in getSynchronizationSources.
     var nowWall = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
+                  ? ((performance.timeOrigin || 0) + performance.now())
                   : Date.now();
     var cutoff = nowWall - 10000;
 
@@ -5205,6 +5299,18 @@ function RTCIceTransport(manager) {
   } catch (eWG) {}
   try {
     manager.ev.on('iceconnectionstatechange', function () {
+      // W3C 5.6: pc.close() transitions every transport to 'closed'
+      // SYNCHRONOUSLY and fires NO event for it — closing is not a state
+      // change the application observes, it is the end of observation.
+      //
+      // Every other transition is queued and evented as normal; only this
+      // one is silent. Forwarding it made an application that watches
+      // statechange see a final event for a connection it had just closed
+      // itself.
+      if (manager.state && manager.state.closed) return;
+      // The closed flag can lag the event, so also gate on the transport's
+      // OWN current state — the same double guard the DTLS forwarder uses.
+      try { if (_selfET.state === 'closed') return; } catch (eSt) {}
       var evO = { type: 'statechange', target: _selfET };
       try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
       try { _selfET.dispatchEvent(evO); } catch (e2) {}

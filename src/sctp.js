@@ -3217,7 +3217,23 @@ function SctpAssociation(config) {
       }
       if (!progressed) break;
     }
-    return txJobs.length > 0;
+    // "DID WE BUILD ANYTHING", not "is there work left".
+    //
+    // These are different questions, and returning the second one spun the
+    // pump. When the window or the queue is full the while loop above exits
+    // without a single iteration, so nothing was built — but txJobs is still
+    // non-empty, so the caller re-armed setImmediate and arrived at the same
+    // blocked state again, forever.
+    //
+    // Measured in a live 4-participant demo: Immediate and TickObject at
+    // ~214,000/second with PROMISE flat. The check phase is starved, so every
+    // await in the process stops progressing and even SIGINT goes unanswered,
+    // while timers and UDP keep running — which is why it presents as a hang
+    // rather than a busy loop.
+    //
+    // Nothing is lost by not re-arming: when the window opens, handleSack →
+    // transmitPending → refill runs this synchronously.
+    return built > 0;
   }
 
   /* Which jobs get to run this pass. Shortest REMAINING work first, not
@@ -3292,10 +3308,15 @@ function SctpAssociation(config) {
     // txJobs is FIFO, so a waiting message is promoted automatically the
     // moment an earlier one finishes and is spliced out — no separate queue,
     // no starvation.
-    fillTxQueue(TX_REFILL_BURST);
+    var _progressed = fillTxQueue(TX_REFILL_BURST);
 
     scheduleTransmit();   // see note above — required every round
-    scheduleTxPump();     // more jobs left? keep going
+    // Re-arm ONLY on progress. A round that built nothing — window full,
+    // queue full — would otherwise reschedule itself into the same blocked
+    // state on every check phase, starving the event loop while appearing to
+    // do work. The refill resumes from handleSack the moment the window
+    // opens, so there is nothing to wait for here.
+    if (_progressed) scheduleTxPump();
   }
 
   /* SCTP-14: drain every outstanding job into sendQueue synchronously.

@@ -642,7 +642,17 @@ function parseRemoteSdp(sdpString) {
     }
 
     var section = {
+      // A section with no a=mid still gets one here — its index — because 169
+      // call sites read section.mid and only a handful guard for null, and
+      // JSEP itself assigns mids by position when the peer omits them.
+      //
+      // But "the peer said 0" and "we decided 0 because it was first" are
+      // different facts, and callers that need to tell them apart had no way
+      // to: a BUNDLE group naming mids the peer never sent looked identical
+      // to a well-formed one. midDeclared records which it was, so validation
+      // can reject the first without breaking every reader of the second.
       mid: String(m.mid != null ? m.mid : i),
+      midDeclared: m.mid != null,
       type: m.type,          // 'audio' | 'video' | 'application'
       port: m.port,
       protocol: m.protocol,

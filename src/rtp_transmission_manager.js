@@ -108,6 +108,75 @@ function ensureSendSsrc(state, transceiver) {
 }
 
 
+// RFC 8852 3.1: a rid is at most 16 characters, and alphanumeric only —
+// '-' and '_' are rid SEPARATORS in SDP, so they cannot appear inside one.
+//
+// Both limits were written out at three sites across two files, each with its
+// own literal and its own message. That is the same shape of duplication that
+// let the codec pin be dropped three times, so the rule lives in one place and
+// the callers only choose the wording of the error.
+var RID_MAX_LENGTH = 16;
+var RID_SYNTAX     = /^[A-Za-z0-9]{1,32}$/;
+
+/**
+ * Why an encoding's numeric members are out of range, or null if they are fine.
+ *
+ * W3C 5.2: scaleResolutionDownBy is >= 1.0 (you can only scale DOWN), and
+ * maxFramerate is >= 0. Both are RangeErrors.
+ *
+ * One rule, because the pair was written out at four sites across two files —
+ * three of them in api.js alone, two of those identical down to the error
+ * text. Duplicated validation is what let the codec pin be dropped three
+ * times without anyone noticing.
+ *
+ * @returns {'scale'|'framerate'|null}
+ */
+function encodingRangeProblem(enc) {
+  if (!enc) return null;
+  if (typeof enc.scaleResolutionDownBy === 'number' && enc.scaleResolutionDownBy < 1) {
+    return 'scale';
+  }
+  if (typeof enc.maxFramerate === 'number' && enc.maxFramerate < 0) {
+    return 'framerate';
+  }
+  return null;
+}
+
+/**
+ * Why a rid is invalid, or null if it is fine.
+ * @returns {'length'|'syntax'|null}
+ */
+function ridProblem(rid) {
+  if (rid == null) return null;
+  if (String(rid).length > RID_MAX_LENGTH) return 'length';
+  if (!RID_SYNTAX.test(rid)) return 'syntax';
+  return null;
+}
+
+/**
+ * Collapse a caller's sendEncodings down to what AUDIO can carry.
+ *
+ * Audio has no rid, scaleResolutionDownBy or maxFramerate — those are
+ * simulcast/video concepts — so a single encoding is rebuilt from the members
+ * that do apply: `active`, `maxBitrate`, and the W3C 5.2 codec pin.
+ *
+ * THIS EXISTS BECAUSE THE REBUILD WAS WRITTEN THREE TIMES — once in api.js and
+ * twice here — and all three dropped `codec`. Fixing them one at a time
+ * changed nothing observable, since whichever copy ran last decided the
+ * outcome, and the defect took three rounds to close for that reason alone.
+ * A member added to the encoding model now has one place to be handled.
+ *
+ * @param {Array} encodings  caller-supplied sendEncodings (may be empty)
+ * @returns {Array}          exactly one normalised encoding
+ */
+function collapseAudioEncodings(encodings) {
+  var first = (encodings && encodings[0]) || {};
+  var out = { active: first.active !== false };
+  if (typeof first.maxBitrate === 'number') out.maxBitrate = first.maxBitrate;
+  if (first.codec) out.codec = first.codec;
+  return [out];
+}
+
 function getNextMid(state) {
   var usedMids = {};
   for (var i = 0; i < state.transceivers.length; i++) {
@@ -175,12 +244,7 @@ function createTransceiver(state, kind, init) {
   // none of the video validation below may run for audio (an invalid
   // scaleResolutionDownBy on audio is removed, never an error).
   if (kind === 'audio' && reqEncodings && reqEncodings.length) {
-    var _a0 = reqEncodings[0] || {};
-    // AUDIO keeps `active` AND `maxBitrate` — only rid,
-    // scaleResolutionDownBy and maxFramerate are video-only members.
-    reqEncodings = [typeof _a0.maxBitrate === 'number'
-      ? { active: _a0.active !== false, maxBitrate: _a0.maxBitrate }
-      : { active: _a0.active !== false }];
+    reqEncodings = collapseAudioEncodings(reqEncodings);
   }
 
   // Truncate to the implementation ceiling FIRST: a caller passing a
@@ -204,7 +268,7 @@ function createTransceiver(state, kind, init) {
       // RFC 8852 rid-syntax: alphanumerics ONLY (no '-' or '_' — those
       // are rid *separators* in SDP). Audio drops rid entirely later, so
       // validation applies where rid is meaningful.
-      if (enc.rid != null && !/^[A-Za-z0-9]{1,32}$/.test(enc.rid)) {
+      if (ridProblem(enc.rid) === 'syntax') {
         throw new TypeError('sendEncodings: invalid rid "' + enc.rid + '"');
       }
       if (isSimulcast) {
@@ -223,8 +287,9 @@ function createTransceiver(state, kind, init) {
   if (reqEncodings) {
     for (var _ri16 = 0; _ri16 < reqEncodings.length; _ri16++) {
       var _rid = reqEncodings[_ri16] && reqEncodings[_ri16].rid;
-      if (_rid != null && String(_rid).length > 16) {
-        throw new TypeError('sendEncodings: rid must be at most 16 characters');
+      if (ridProblem(_rid) === 'length') {
+        throw new TypeError('sendEncodings: rid must be at most ' +
+          RID_MAX_LENGTH + ' characters');
       }
     }
   }
@@ -238,11 +303,7 @@ function createTransceiver(state, kind, init) {
     //  3. VIDEO: when SOME encodings carry scaleResolutionDownBy, the
     //     others default to 1 — and a SINGLE encoding never keeps it.
     if (kind === 'audio') {
-      var _a1 = reqEncodings[0] || {};
-      // keeps active AND maxBitrate (see the collapse above)
-      reqEncodings = [typeof _a1.maxBitrate === 'number'
-        ? { active: _a1.active !== false, maxBitrate: _a1.maxBitrate }
-        : { active: _a1.active !== false }];
+      reqEncodings = collapseAudioEncodings(reqEncodings);
     } else {
       if (reqEncodings.length > MAX_SIMULCAST_ENCODINGS) {
         reqEncodings = reqEncodings.slice(0, MAX_SIMULCAST_ENCODINGS);
@@ -932,6 +993,13 @@ function checkIfNegotiationIsNeeded(state) {
 /* ========================= Exports ========================= */
 
 export {
+  // Encoding normalisation (shared with api.js — see the note on the
+  // function; it exists because this collapse was written three times)
+  collapseAudioEncodings,
+  ridProblem,
+  encodingRangeProblem,
+  RID_MAX_LENGTH,
+
   // Mid allocation
   getNextMid,
 
