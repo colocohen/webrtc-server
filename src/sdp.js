@@ -1069,8 +1069,7 @@ function buildAnswerMedia(offerMedia, config) {
   if (_prefs && _prefs.length) {
     var _ranked = [];
     for (var _pi = 0; _pi < _prefs.length; _pi++) {
-      var _want = String(_prefs[_pi] && _prefs[_pi].mimeType || '').toLowerCase();
-      var _wantName = _want.indexOf('/') >= 0 ? _want.split('/')[1] : _want;
+      var _wantName = codecName(_prefs[_pi]);
       for (var _li = 0; _li < localCodecs.length; _li++) {
         var _haveName = String(localCodecs[_li] && localCodecs[_li].name || '').toLowerCase();
         if (_haveName && _haveName === _wantName && _ranked.indexOf(localCodecs[_li]) === -1) {
@@ -1092,8 +1091,7 @@ function buildAnswerMedia(offerMedia, config) {
   if (_prefs && _prefs.length && negotiated && negotiated.length > 1) {
     var _rank = {};
     for (var _ri = 0; _ri < _prefs.length; _ri++) {
-      var _rm = String(_prefs[_ri] && _prefs[_ri].mimeType || '').toLowerCase();
-      _rank[_rm.indexOf('/') >= 0 ? _rm.split('/')[1] : _rm] = _ri;
+      _rank[codecName(_prefs[_ri])] = _ri;
     }
     negotiated = negotiated.slice().sort(function (a, b) {
       var ra = _rank[String(a.name || '').toLowerCase()];
@@ -2087,7 +2085,30 @@ function cloneParsedSdp(parsedSdp) {
 
 /* ========================= Exports ========================= */
 
+/**
+ * The codec NAME from either form of identifier.
+ *
+ * The IDL side speaks mimeType ("audio/opus"); SDP speaks the bare name
+ * ("opus"), and comparisons run between the two constantly. This was written
+ * out at three sites across three files — sdp.js, media_session_factory.js and
+ * api.js — each with its own indexOf/split, which is the duplication pattern
+ * that let the codec pin be dropped five times before fix 73 caught them all.
+ *
+ * Always lowercased: every caller compared case-insensitively anyway.
+ *
+ * @param {string|{mimeType?:string, name?:string}} v
+ * @returns {string} bare lowercase name, '' when there is nothing to read
+ */
+function codecName(v) {
+  if (v == null) return '';
+  var raw = (typeof v === 'string') ? v : (v.mimeType || v.name || '');
+  raw = String(raw).toLowerCase();
+  var slash = raw.indexOf('/');
+  return slash >= 0 ? raw.slice(slash + 1) : raw;
+}
+
 export {
+  codecName,
   CODEC_REGISTRY,
   // Parse
   parseOffer, parseAnswer, parseCandidate,

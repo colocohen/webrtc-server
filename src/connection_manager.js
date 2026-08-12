@@ -2973,6 +2973,14 @@ function ConnectionManager(config) {
           }
           if (newActive !== enc.active) {
             enc.active = newActive;
+            // AND the copy the application reads.
+            //
+            // RTCRtpSender keeps its own currentParams, which is what
+            // getParameters() returns verbatim; writing only the
+            // transceiver-level list here left an application believing it
+            // was still sending a layer the answerer had declined. Same
+            // two-copy problem fix 82 hit with the codec pin, and the sender
+            // already owns a method for reaching both.
             encodingsChanged = true;
           }
         }
@@ -2999,7 +3007,22 @@ function ConnectionManager(config) {
       // Handle that here, then skip as before.
       if (existing && existing.receiver.track) {
         var _stillSends = (m.direction === 'sendrecv' || m.direction === 'sendonly');
-        if (!_stillSends && m.port !== 0) {
+        // A TRACK LEAVES ITS STREAM WHEN THE MSID GOES, NOT ONLY WHEN THE
+        // DIRECTION DOES.
+        //
+        // a=msid is what puts a track in a stream (W3C 5.5). A renegotiation
+        // can keep sending — direction still sendonly, port still non-zero —
+        // and simply stop naming the stream, at which point the track is no
+        // longer a member of it and the stream owes a removetrack.
+        //
+        // Keying only on direction meant an application listening on the
+        // MediaStream went on rendering a track the peer had detached from it,
+        // with no event to say otherwise.
+        var _hasMsid = !!(m.msid || (m.msids && m.msids.length) ||
+                          (m.ssrcs && m.ssrcs.some(function (sg) {
+                            return sg && sg.attribute === 'msid';
+                          })));
+        if ((!_stillSends || !_hasMsid) && m.port !== 0) {
           var _rmTrack = existing.receiver.track;
           var _rms = state._remoteStreams || {};
           for (var _rmk in _rms) {

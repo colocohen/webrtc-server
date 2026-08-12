@@ -32,9 +32,22 @@ var _DBG = (typeof process !== 'undefined' &&
 // Derive the codec list for a mid/kind from an APPLIED description —
 // WPT requires receiver codecs to match the LOCAL SDP m-line exactly
 // (count, payloadTypes, fmtp), not a static default table.
-function _codecsFromSdp(manager, kind, mid) {
+function _codecsFromSdp(manager, kind, mid, preferRemote) {
   try {
-    var d = manager && manager.state && (manager.state.parsedLocalSdp || manager.state.parsedRemoteSdp);
+    // WHICH DESCRIPTION ANSWERS THE QUESTION DEPENDS ON THE DIRECTION.
+    //
+    // A RECEIVER's codecs are what WE are prepared to decode — the local
+    // description. A SENDER's are what the PEER can decode, so they come from
+    // the remote one: sending a codec the peer did not list is sending
+    // something it cannot play.
+    //
+    // Reading the local description for both meant a sender kept reporting
+    // our full offer after an answer narrowed the list — measured, four
+    // codecs reported against a remote description carrying three.
+    var _st = manager && manager.state;
+    var d = !_st ? null : (preferRemote
+      ? (_st.parsedRemoteSdp || _st.parsedLocalSdp)
+      : (_st.parsedLocalSdp || _st.parsedRemoteSdp));
     if (!d || !d.media) return null;
     var m = null;
     for (var i = 0; i < d.media.length; i++) {
@@ -49,7 +62,18 @@ function _codecsFromSdp(manager, kind, mid) {
       var fmtpStr;
       if (cc.fmtp && typeof cc.fmtp === 'object') {
         var kv = [];
-        for (var fk in cc.fmtp) kv.push(fk + '=' + cc.fmtp[fk]);
+        for (var fk in cc.fmtp) {
+          // NOT EVERY FMTP PARAMETER IS A key=value PAIR.
+          //
+          // RFC 4855: the format-specific parameters are whatever the codec's
+          // own RFC says. telephone-event (RFC 4733) carries a bare event
+          // list — `a=fmtp:114 0-15` — and the parser records that as the key
+          // with a boolean true. Re-joining it as `fk + '=' + value` produced
+          // `0-15=true`, so getParameters() reported an fmtp line that does
+          // not match the SDP it came from and would not survive a round trip
+          // back onto the wire.
+          kv.push(cc.fmtp[fk] === true ? fk : (fk + '=' + cc.fmtp[fk]));
+        }
         fmtpStr = kv.length ? kv.join(';') : undefined;
       } else if (typeof cc.fmtp === 'string' && cc.fmtp) {
         fmtpStr = cc.fmtp;
@@ -1570,7 +1594,21 @@ function RTCPeerConnection(config) {
       throw new TypeError('createDataChannel: protocol too long (max 65535 UTF-8 bytes)');
     }
     if (options.id != null) {
-      if (typeof options.id !== 'number' || options.id < 0 || options.id > 65534) {
+      // WebIDL `unsigned short` CONVERTS, it does not type-check. A member
+      // declared unsigned short accepts anything that converts to an integer
+      // in range — `id: '17'` is 17, and W3C's own transfer-datachannel test
+      // passes exactly that. Requiring typeof 'number' rejected a value the
+      // IDL calls valid, so an application reading an id out of JSON or a URL
+      // parameter got a TypeError for a number it had spelled correctly.
+      //
+      // Range is still enforced below, and anything that does not convert to
+      // a finite integer — '', true, 'abc' — still fails, as the IDL says.
+      if (typeof options.id === 'string' && options.id.trim() !== '' &&
+          isFinite(Number(options.id))) {
+        options = Object.assign({}, options, { id: Number(options.id) });
+      }
+      if (typeof options.id !== 'number' || Math.floor(options.id) !== options.id ||
+          options.id < 0 || options.id > 65534) {
         // W3C §6.2: id == 65535 is a TypeError (out of permitted range
         // even though it's a valid uint16). 0..65534 are accepted.
         throw new TypeError('createDataChannel: id must be in range 0..65534');
@@ -2278,6 +2316,34 @@ function RTCRtpSender(internal, track, manager) {
     codecs: [],
   };
 
+  // Published on the INTERNAL transceiver as well, so code that only ever
+  // sees internal state — the description-apply path in sdp_offer_answer —
+  // can invoke it without reaching for the public wrapper or duplicating the
+  // both-copies knowledge that lives here.
+  internal._dropPinsNotIn = function (keep) { return self._dropPinsNotIn(keep); };
+
+
+  this._dropPinsNotIn = function (keep) {
+    if (!keep) return false;
+    var lower = keep.map(function (n) { return String(n).toLowerCase(); });
+    var cleared = false;
+    var lists = [currentParams && currentParams.encodings, internal.sender && internal.sender.encodings];
+    for (var li = 0; li < lists.length; li++) {
+      var encs = lists[li];
+      if (!encs) continue;
+      for (var ei = 0; ei < encs.length; ei++) {
+        var pin = encs[ei] && encs[ei].codec;
+        if (!pin || !pin.mimeType) continue;
+        var want = SDP.codecName(pin);
+        if (lower.indexOf(want.toLowerCase()) === -1) {
+          delete encs[ei].codec;
+          cleared = true;
+        }
+      }
+    }
+    return cleared;
+  };
+
   function startPipeline() {
     // FIELD DIAG: the three reasons the send pipeline declines to start.
     // A silent bail here is indistinguishable from "never called", which
@@ -2632,6 +2698,18 @@ function RTCRtpSender(internal, track, manager) {
   // new active state to the live pipeline.
   var _encodingsUpdatedHandler = function (info) {
     if (!info || info.mid !== internal.mid) return;
+    // The PARAMETER sync is not conditional on a pipeline.
+    //
+    // This handler does two things: mirror the negotiated encoding state into
+    // currentParams (what getParameters returns), and push the new values at
+    // the encoder. Only the second needs a live pipeline — but the early
+    // return skipped both, so a sender with no track yet, or one whose track
+    // was replaced with null, kept reporting encodings the answer had already
+    // changed. A simulcast answer declining a layer is exactly that case.
+    var _encsSrc = internal.sender.encodings || [];
+    for (var _si = 0; _si < _encsSrc.length && _si < currentParams.encodings.length; _si++) {
+      currentParams.encodings[_si].active = _encsSrc[_si].active !== false;
+    }
     if (!pipeline) return;
     var encs = internal.sender.encodings || [];
     for (var i = 0; i < encs.length && i < currentParams.encodings.length; i++) {
@@ -2802,7 +2880,12 @@ function RTCRtpSender(internal, track, manager) {
     // negotiated -> expose the codec set; before that, spec says [].
     if ((!currentParams.codecs || !currentParams.codecs.length) &&
         manager && manager.state && manager.state.currentRemoteDescription) {
-      currentParams.codecs = (_codecsFromSdp(manager, internal.kind, internal.mid) || _defaultCodecs(internal.kind));
+      // isSender is the sender-side getParameters path — see the note in
+      // _codecsFromSdp on why the direction picks the description.
+      // This is inside RTCRtpSender, so the remote description is the right
+      // source — see the note in _codecsFromSdp.
+      currentParams.codecs = (_codecsFromSdp(manager, internal.kind, internal.mid, true) ||
+                              _defaultCodecs(internal.kind));
     }
     // HEADER EXTENSIONS FOLLOW THE SAME RULE as codecs: empty until the
     // negotiation settles, then the set the SDP actually agreed on. We
@@ -3792,6 +3875,26 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
     startPipelineIfReady();
   };
   this._tryStartPipeline = startPipelineIfReady;
+
+  /**
+   * Drop any codec pin whose codec is no longer in `keep` (W3C 5.2).
+   *
+   * encoding.codec means "send this encoding with exactly this codec". A
+   * negotiation that drops the codec makes that unhonourable, and reporting
+   * it anyway tells the application a constraint is in force that is not.
+   *
+   * THE SENDER OWNS BOTH COPIES, so it owns the sweep. `currentParams` is
+   * what getParameters() returns verbatim, and internal.sender.encodings is
+   * the transceiver-level state — writing only the second from outside looks
+   * like it works and changes nothing observable, which is exactly what an
+   * earlier attempt at this did. setParameters already writes the pair
+   * together (dst / tdst); this is the same discipline for the one case where
+   * the change originates in a description rather than in a caller.
+   *
+   * @param {string[]} keep  codec names present in the applied m-section
+   * @returns {boolean}      true if anything was cleared
+   */
+
   this._stop = function() {
     if (pipeline) { try { pipeline.stop(); } catch (e) {} pipeline = null; }
     try { manager.ev.off('ssrc:rid-learned', _ridLearnedHandler); } catch (e) {}
@@ -3937,7 +4040,12 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
         // spec's sdpFmtpLine string form.
         if (c.fmtp && typeof c.fmtp === 'object') {
           var _kv = [];
-          for (var _fk in c.fmtp) _kv.push(_fk + '=' + c.fmtp[_fk]);
+          // Same rule as the receiver-side rebuild above: a bare fmtp
+          // parameter (telephone-event's `0-15`) is stored as key -> true and
+          // must be emitted as the key alone, not `0-15=true`.
+          for (var _fk in c.fmtp) {
+            _kv.push(c.fmtp[_fk] === true ? _fk : (_fk + '=' + c.fmtp[_fk]));
+          }
           if (_kv.length) codecOut.sdpFmtpLine = _kv.join(';');
         } else if (typeof c.fmtp === 'string' && c.fmtp) {
           codecOut.sdpFmtpLine = c.fmtp;
@@ -6395,10 +6503,17 @@ function _candidatePairEntry(snapshot, snap, now) {
   // Aggregate media bytes from transport (for the "how much media crossed
   // this pair" view). STUN-level bytes are already on pair.bytesSent/Received.
   var mediaBytesSent = 0, mediaBytesReceived = 0;
+  var mediaPacketsSent = 0, mediaPacketsReceived = 0;
   var sk = Object.keys(snap.outbound);
-  for (var j = 0; j < sk.length; j++) mediaBytesSent += snap.outbound[sk[j]].bytes || 0;
+  for (var j = 0; j < sk.length; j++) {
+    mediaBytesSent   += snap.outbound[sk[j]].bytes   || 0;
+    mediaPacketsSent += snap.outbound[sk[j]].packets || 0;
+  }
   var rk = Object.keys(snap.inbound);
-  for (var k = 0; k < rk.length; k++) mediaBytesReceived += snap.inbound[rk[k]].bytes || 0;
+  for (var k = 0; k < rk.length; k++) {
+    mediaBytesReceived   += snap.inbound[rk[k]].bytes   || 0;
+    mediaPacketsReceived += snap.inbound[rk[k]].packets || 0;
+  }
 
   // Total bytes on this pair = STUN + media (matches browser behavior).
   var totalBytesSent     = (pair.bytesSent     || 0) + mediaBytesSent;
@@ -6459,8 +6574,15 @@ function _candidatePairEntry(snapshot, snap, now) {
     // Byte/packet counters (aggregate: STUN + media). Matches Chrome.
     bytesSent:                totalBytesSent,
     bytesReceived:            totalBytesReceived,
-    packetsSent:              pair.packetsSent     || 0,
-    packetsReceived:          pair.packetsReceived || 0,
+    // MEDIA COUNTS TOWARDS THE PAIR TOTALS, IN PACKETS AS WELL AS BYTES.
+    //
+    // The byte totals above already add the RTP that went over this pair to
+    // the STUN traffic — the packet counts did not, so a pair reported three
+    // packets carrying twenty kilobytes. Anything deriving a rate or an
+    // average packet size from candidate-pair stats got an absurd answer, and
+    // W3C 8.4 defines both members over the same traffic.
+    packetsSent:              (pair.packetsSent || 0) + mediaPacketsSent,
+    packetsReceived:          (pair.packetsReceived || 0) + mediaPacketsReceived,
     // RTT (seconds) — preferred from STUN, falls back to RTCP RR
     currentRoundTripTime:     rttSeconds,
     totalRoundTripTime:       totalRttSeconds,

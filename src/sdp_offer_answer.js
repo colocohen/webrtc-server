@@ -1194,6 +1194,36 @@ class SdpOfferAnswer extends EventEmitter {
       state.parsedLocalSdp = parsed;
     }
 
+    // A CODEC PIN CANNOT OUTLIVE ITS CODEC (W3C 5.2).
+    //
+    // encoding.codec means "send this encoding with exactly this codec". A
+    // negotiation that drops the codec makes that unhonourable, and reporting
+    // it anyway tells the application a constraint is in force that is not.
+    //
+    // Placed at the SHARED exit of _commitDescription because the narrowing
+    // usually arrives in the peer's answer — a sweep on the local-apply path
+    // alone never sees it. The sender owns the clearing itself
+    // (_dropPinsNotIn): it holds two copies of the encodings, currentParams
+    // and the transceiver-level list, and only one of them is what
+    // getParameters returns. Writing the other from here looks like it works
+    // and changes nothing observable.
+    try {
+      var _pinTcs = state.transceivers || [];
+      var _pinMedia = (parsed && parsed.media) || [];
+      for (var _pi = 0; _pi < _pinTcs.length; _pi++) {
+        var _pt = _pinTcs[_pi];
+        if (!_pt || _pt.mid == null || typeof _pt._dropPinsNotIn !== 'function') continue;
+        var _sec = null;
+        for (var _pm = 0; _pm < _pinMedia.length; _pm++) {
+          if (String(_pinMedia[_pm].mid) === String(_pt.mid)) { _sec = _pinMedia[_pm]; break; }
+        }
+        // No section for this mid in THIS description says nothing about the
+        // pin; only a section that no longer lists the codec does.
+        if (!_sec || !_sec.codecs) continue;
+        _pt._dropPinsNotIn(_sec.codecs.map(function (c) { return c.name; }));
+      }
+    } catch (_pinErr) { /* a pin sweep must never break an apply */ }
+
     return { parsed: parsed, nextState: nextState };
   }
 
@@ -1251,6 +1281,23 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       localIceUfrag:             state.localIceUfrag,
       localIcePwd:               state.localIcePwd,
       negotiationNeeded:         this._negotiationNeeded,
+      // WHICH REMOTE TRACKS WERE IN WHICH STREAMS.
+      //
+      // A description can take a track out of its stream — a direction change
+      // to recvonly does exactly that — and rolling that description back has
+      // to put it back. Removal was already handled; restoration needs to
+      // know the membership that stood before, which only a snapshot can say.
+      remoteStreamMembership: (function () {
+        var out = [];
+        var rs = state._remoteStreams || {};
+        for (var k in rs) {
+          if (!Object.prototype.hasOwnProperty.call(rs, k)) continue;
+          var st = rs[k];
+          if (!st || !st.getTracks) continue;
+          out.push({ stream: st, tracks: st.getTracks().slice() });
+        }
+        return out;
+      })(),
       needsIceRestart:           this._needsIceRestart,
       // SCTP attributes LEARNED FROM THE PEER's description. A rollback undoes
       // the description, so what it told us about the peer has to go with it.
@@ -1860,6 +1907,73 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
         // the reuse guards in connection_manager.
         _st._offerRolledBack = true;
       }
+
+      // A ROLLED-BACK DESCRIPTION TAKES ITS REMOTE TRACKS OUT OF THEIR STREAMS.
+      //
+      // The cleanup below runs inside the createdDuring loop, which only sees
+      // transceivers the SRD itself created. A transceiver the APPLICATION
+      // already owned — it called addTrack, then received an offer that
+      // matched it — survives the rollback, correctly, but the remote track
+      // that offer introduced still has to leave the stream: the negotiation
+      // that put it there no longer stands.
+      //
+      // Without this the application holds a track from a description that
+      // was undone, with no removetrack to say otherwise. In an SFU that is
+      // an active participant rendering video for a peer whose negotiation
+      // was rolled back by glare.
+      try {
+        var _rbAll = state.transceivers || [];
+        var _rbStreams = state._remoteStreams || {};
+        for (var _ri = 0; _ri < _rbAll.length; _ri++) {
+          var _rt = _rbAll[_ri];
+          // Only transceivers that survive here — the ones being removed are
+          // handled by the loop below, which also stops their tracks.
+          if (!_rt || snap.transceivers.indexOf(_rt) === -1) continue;
+          // Associated before this description means the stream membership
+          // predates it and must not be disturbed.
+          if (snap.associatedAtSnapshot &&
+              snap.associatedAtSnapshot.indexOf(_rt) !== -1) continue;
+          var _rtTrack = _rt.receiver && _rt.receiver.track;
+          if (!_rtTrack) continue;
+          for (var _rsk in _rbStreams) {
+            if (!Object.prototype.hasOwnProperty.call(_rbStreams, _rsk)) continue;
+            var _rsm = _rbStreams[_rsk];
+            if (!_rsm || typeof _rsm.removeTrack !== 'function') continue;
+            var _rsHas = _rsm.getTracks && _rsm.getTracks().some(function (x) {
+              return x === _rtTrack || (x && x.id === _rtTrack.id);
+            });
+            if (!_rsHas) continue;
+            try { _rsm.removeTrack(_rtTrack); } catch (eS) {}
+          }
+        }
+      } catch (eRbS) { /* stream cleanup must never break a rollback */ }
+
+      // AND PUT BACK WHAT THE ROLLED-BACK DESCRIPTION TOOK OUT.
+      //
+      // The pass above removes tracks the description ADDED. The mirror case
+      // is a description that REMOVED one — a direction change to recvonly
+      // detaches the remote track — and rolling it back has to restore the
+      // membership, or the application is left with an empty stream for a
+      // negotiation that no longer stands.
+      //
+      // Driven off the snapshot rather than re-derived: only the membership
+      // as it actually stood can say what belongs where.
+      try {
+        var _mem = snap.remoteStreamMembership || [];
+        for (var _mi = 0; _mi < _mem.length; _mi++) {
+          var _ms = _mem[_mi].stream, _mt = _mem[_mi].tracks || [];
+          if (!_ms || typeof _ms.addTrack !== 'function') continue;
+          for (var _mj = 0; _mj < _mt.length; _mj++) {
+            var _mtrack = _mt[_mj];
+            if (!_mtrack) continue;
+            var _present = _ms.getTracks && _ms.getTracks().some(function (x) {
+              return x === _mtrack || (x && x.id === _mtrack.id);
+            });
+            if (_present) continue;
+            try { _ms.addTrack(_mtrack); } catch (eA) {}
+          }
+        }
+      } catch (eRbR) { /* restoration must never break a rollback either */ }
 
       var createdDuring = state.transceivers.filter(function (t) {
         if (snap.transceivers.indexOf(t) !== -1) return false;

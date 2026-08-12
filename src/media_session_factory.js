@@ -187,7 +187,8 @@ function buildMediaForTransceiver(state, t) {
           // internal entries carry a bare `name` ("opus"); capabilities
           // use the IDL mimeType ("audio/opus") — compare on the name.
           var haveName = String(codecs[ci] && codecs[ci].name || '').toLowerCase();
-          var wantName = want.indexOf('/') >= 0 ? want.split('/')[1] : want;
+          // One rule, in sdp.js — see the note on codecName.
+          var wantName = SDP.codecName(want);
           if (haveName && haveName === wantName && !seen[ci]) {
             ranked.push(codecs[ci]); seen[ci] = true;
           }
