@@ -25,6 +25,37 @@ var _DBG = (typeof process !== 'undefined' &&
             (process.env.WEBRTC_DEBUG === '1' ||
              process.env.WEBRTC_DEBUG === 'true'));
 
+// ── An application's event handler that throws ──
+//
+// A browser reports an exception thrown by an event handler and goes on:
+// the other handlers still run, and whatever fired the event (a state
+// change, an incoming packet) is not affected. Here the handlers run
+// inside the library's own work — a statechange fires from the middle of
+// handling an SCTP packet — so a throw that got through ended that work
+// half done and, uncaught, the whole thread with every connection on it.
+// Every handler the application gives (on* properties, addEventListener)
+// is called through callHandler: the exception is reported, the event goes
+// on. (Several dispatchers already caught it, and dropped it silently —
+// they report it now, the way a browser's console would.)
+function reportHandlerError(err, where) {
+  try {
+    console.error('[webrtc-server] an event handler threw (' + where + ') — reported, the event went on:', err);
+  } catch (e) { /* nothing left to report with */ }
+}
+
+function callHandler(fn, thisArg, event, where) {
+  try {
+    return fn.call(thisArg, event);
+  } catch (err) {
+    reportHandlerError(err, where);
+  }
+}
+
+// fn wrapped for registration on an internal EventEmitter.
+function guardHandler(fn, thisArg, where) {
+  return function (event) { return callHandler(fn, thisArg, event, where); };
+}
+
 // ── Single source of truth for the default codec set (WPT/behavior:
 //    identical shape must appear in getCapabilities, sender post-
 //    negotiation params, and receiver mirrors — it was duplicated 4x). ──
@@ -343,6 +374,13 @@ function RTCPeerConnection(config) {
 
   function _filterUndelivered(desc) {
     if (!desc || !desc.sdp) return desc;
+    // Lite: the candidates are part of the description createOffer /
+    // createAnswer returned (baked in at build time) and are never surfaced
+    // through onicecandidate — so none is ever "delivered", and the filter
+    // hid them from localDescription for good: a lite server that signals
+    // pc.localDescription sent an answer with no candidate at all. Nothing
+    // is trickled in lite, so there is no undelivered window to hide.
+    if (manager.state.mode === 'lite') return desc;
     if (desc.sdp.indexOf('a=candidate:') < 0) return desc;
     if (_filterMemoSrc === desc && _filterMemoVer === _deliveredCount) {
       return _filterMemoOut;
@@ -422,6 +460,7 @@ function RTCPeerConnection(config) {
   // attach onstatechange listeners that observe the connecting →
   // connected transition.
   var _sctpTransport = null;
+  var _sctpDiagLogged = false;
   Object.defineProperty(this, 'sctp', {
     get: function() {
       var pL = manager.state.parsedLocalSdp, pR = manager.state.parsedRemoteSdp;
@@ -434,7 +473,29 @@ function RTCPeerConnection(config) {
         (manager.state.dataChannels && manager.state.dataChannels.length > 0) ||
         manager.state.remoteSctpPort != null ||
         manager.state.sctpAssociation != null;
-      if (!sctpNegotiated) return null;
+      if (!sctpNegotiated) {
+        // Once the transport exists it stays (W3C: pc.sctp is set when SCTP
+        // is negotiated and only a rollback to no m=application clears it —
+        // the check above). Before, this answered null whenever all three
+        // signals happened to be empty at the moment of the read, including
+        // inside the transport's own statechange: the handler read pc.sctp
+        // and got null. Which state got there is logged once, to find it.
+        if (_sctpTransport) {
+          if (!_sctpDiagLogged) {
+            _sctpDiagLogged = true;
+            try {
+              console.error('[webrtc-server] pc.sctp: transport exists but no negotiation signal is set' +
+                ' (dataChannels=' + (manager.state.dataChannels ? manager.state.dataChannels.length : 'none') +
+                ' remoteSctpPort=' + manager.state.remoteSctpPort +
+                ' sctpAssociation=' + (manager.state.sctpAssociation != null ? 'set' : manager.state.sctpAssociation) +
+                ' sctpState=' + manager.state.sctpState +
+                ' signalingState=' + manager.state.signalingState + ') — returning the transport');
+            } catch (eD) {}
+          }
+          return _sctpTransport;
+        }
+        return null;
+      }
       if (!_sctpTransport) {
         _sctpTransport = new RTCSctpTransport(manager);
         _sctpTransport.transport = _getDtlsTransport();
@@ -468,6 +529,7 @@ function RTCPeerConnection(config) {
   // ── Event handler properties (browser-style: pc.ontrack = fn) ──
 
   var _handlers = {};
+  var _wrappedOn = {};
   var _evNames = [
     'connectionstatechange', 'iceconnectionstatechange', 'icegatheringstatechange',
     'signalingstatechange', 'negotiationneeded',
@@ -478,18 +540,23 @@ function RTCPeerConnection(config) {
       Object.defineProperty(self, 'on' + name, {
         get: function() { return _handlers[name] || null; },
         set: function(fn) {
-          if (_handlers[name]) ev.removeListener(name, _handlers[name]._wrapped || _handlers[name]);
+          // The registered wrapper is kept here, per connection. It was kept
+          // on fn itself (fn._wrapped), so one function set on two
+          // connections lost the first one's wrapper, and replacing the
+          // handler there left the old one registered.
+          if (_wrappedOn[name]) ev.removeListener(name, _wrappedOn[name]);
+          _wrappedOn[name] = null;
           _handlers[name] = fn;
           if (fn) {
             // Same Event-shape guarantee as addEventListener: on-handlers
             // must receive an object with .type (apps and WPT both read
             // it) even though the internal channel carries no payload.
             var wrapped = function (payload) {
-              if (payload && typeof payload === 'object' && payload.type) return fn.call(self, payload);
-              fn.call(self, { type: name, target: self, currentTarget: self,
-                              bubbles: false, cancelable: false, isTrusted: true });
+              if (payload && typeof payload === 'object' && payload.type) return callHandler(fn, self, payload, 'pc.on' + name);
+              callHandler(fn, self, { type: name, target: self, currentTarget: self,
+                                      bubbles: false, cancelable: false, isTrusted: true }, 'pc.on' + name);
             };
-            fn._wrapped = wrapped;
+            _wrappedOn[name] = wrapped;
             ev.on(name, wrapped);
           }
         },
@@ -526,7 +593,7 @@ function RTCPeerConnection(config) {
         sdpMLineIndex: payload.sdpMLineIndex,
       });
     }
-    self._handlers.onicecandidate(new RTCPeerConnectionIceEvent({ candidate: candidate }));
+    callHandler(self._handlers.onicecandidate, self, new RTCPeerConnectionIceEvent({ candidate: candidate }), 'pc.onicecandidate');
   }
 
   ev.on('icecandidateerror', function (payload) {
@@ -540,8 +607,8 @@ function RTCPeerConnection(config) {
     // so an application configuring several STUN/TURN servers got one event
     // per failure carrying none of the information the event exists to
     // deliver: which server failed, and why.
-    self._handlers.onicecandidateerror(
-      new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}));
+    callHandler(self._handlers.onicecandidateerror, self,
+      new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}), 'pc.onicecandidateerror');
   });
 
   // ondatachannel — wraps internal channel → RTCDataChannel.
@@ -558,7 +625,7 @@ function RTCPeerConnection(config) {
                 ' channel=' + (internal && internal.channel && internal.channel.label));
     var wrapped = new RTCDataChannel(internal.channel, manager);
     var dcEvent = new RTCDataChannelEvent('datachannel', { channel: wrapped });
-    if (self._handlers.ondatachannel) self._handlers.ondatachannel(dcEvent);
+    if (self._handlers.ondatachannel) callHandler(self._handlers.ondatachannel, self, dcEvent, 'pc.ondatachannel');
     ev.emit('datachannel:wrapped', dcEvent);
   });
 
@@ -604,7 +671,7 @@ function RTCPeerConnection(config) {
       streams:     trackStreams,
     });
 
-    if (self._handlers.ontrack) self._handlers.ontrack(trackEvent);
+    if (self._handlers.ontrack) callHandler(self._handlers.ontrack, self, trackEvent, 'pc.ontrack');
     // addEventListener('track', fn) listeners — same event object,
     // browser parity: both styles fire, each exactly once.
     ev.emit('track', trackEvent);
@@ -1577,6 +1644,10 @@ function RTCPeerConnection(config) {
       negotiated:        _o.negotiated === undefined ? false : !!_o.negotiated,
       id:                _o.id,
       priority:          _o.priority,
+      // Non-standard: the send-buffer cap (data_channel_controller.js,
+      // default 16 MB). Rebuilding options here dropped it, so the
+      // documented override never reached the channel.
+      maxBufferedAmount: _o.maxBufferedAmount,
     };
 
     // W3C §6.2 validation:
@@ -1894,19 +1965,19 @@ function RTCPeerConnection(config) {
             sdpMLineIndex: payload.sdpMLineIndex,
           });
         }
-        fn(new RTCPeerConnectionIceEvent({ candidate: candidate }));
+        callHandler(fn, undefined, new RTCPeerConnectionIceEvent({ candidate: candidate }), 'pc icecandidate listener');
       };
     } else if (name === 'icecandidateerror') {
       wrapped = function (payload) {
         // (type, init) — see the note on the on-handler path.
-        fn(new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}));
+        callHandler(fn, undefined, new RTCPeerConnectionIceErrorEvent('icecandidateerror', payload || {}), 'pc icecandidateerror listener');
       };
     } else if (name === 'datachannel') {
       // Subscribe to the WRAPPED channel; the wrapped event arrives
       // ready-made from the internal listener above. We keep fn's
       // signature (receives the RTCDataChannelEvent) and only redirect
       // the subscription target below.
-      wrapped = function (dcEvent) { fn(dcEvent); };
+      wrapped = function (dcEvent) { callHandler(fn, undefined, dcEvent, 'pc datachannel listener'); };
     } else {
       // EVERY other pc event (signalingstatechange, connectionstatechange,
       // iceconnectionstatechange, icegatheringstatechange, negotiationneeded,
@@ -1915,9 +1986,9 @@ function RTCPeerConnection(config) {
       // shared handler) saw undefined. Hand them a minimal Event-shaped
       // object, passing through anything the internal layer already built.
       wrapped = function (payload) {
-        if (payload && typeof payload === 'object' && payload.type) return fn(payload);
-        fn({ type: name, target: self, currentTarget: self,
-             bubbles: false, cancelable: false, isTrusted: true });
+        if (payload && typeof payload === 'object' && payload.type) return callHandler(fn, undefined, payload, 'pc ' + name + ' listener');
+        callHandler(fn, undefined, { type: name, target: self, currentTarget: self,
+                                     bubbles: false, cancelable: false, isTrusted: true }, 'pc ' + name + ' listener');
       };
     }
     // removeEventListener contract: it receives the ORIGINAL fn, so keep
@@ -4087,8 +4158,11 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
     //     (RFC 6465 csrc-audio-level extension; not wired yet).
     //
     // Returned objects are fresh — caller mutations don't bleed into our cache.
-    var entries = (internalTransceiver && internalTransceiver.receiver &&
-                   internalTransceiver.receiver._csrcEntries) || [];
+    // newest sighting per source (media_transport keeps one per source)
+    var csrcCache = internalTransceiver && internalTransceiver.receiver &&
+                    internalTransceiver.receiver._csrcEntries;
+    if (!csrcCache) return [];
+    var entries = Array.isArray(csrcCache) ? csrcCache : Object.values(csrcCache);
     if (!entries.length) return [];
 
     // Absolute clock, matching how media_transport stamps the entries — see
@@ -4146,8 +4220,11 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
                    internalTransceiver.receiver._ssrcEntries) || null;
     if (!entries) return [];
 
+    // Absolute clock, the one media_transport stamps the entries with
+    // (performance.now() alone is process-relative, so the 10 s window
+    // never excluded anything and stopped SSRCs were reported forever).
     var nowWall = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
+                  ? ((performance.timeOrigin || 0) + performance.now())
                   : Date.now();
     var cutoff = nowWall - 10000;
 
@@ -4682,7 +4759,7 @@ function RTCDataChannel(internal, manager) {
   this.binaryType = 'arraybuffer';
 
   // bufferedAmountLowThreshold: proxy to the internal channel object
-  // so cm.js's chunkAcked handler (which fires the bufferedamountlow
+  // so the controller's drain handler (which fires the bufferedamountlow
   // event) sees the user's chosen threshold. Pre-fix the wrapper held
   // its own copy that the firing path never read — `dc.bufferedAmountLowThreshold = 5000`
   // silently no-op'd from the user's perspective.
@@ -4700,6 +4777,45 @@ function RTCDataChannel(internal, manager) {
 
   // Methods
   impl._sendQ = Promise.resolve();
+  // bufferedAmount: raised here, synchronously, by the message's byte
+  // length (W3C §6.2); lowered by the controller as the bytes reach the
+  // wire. A message that never got to SCTP must give its bytes back — it
+  // used to keep them: one send refused (over maxMessageSize, send buffer
+  // full, no association) left bufferedAmount that much higher for good,
+  // so 'bufferedamountlow' never fired again and a sender pacing on it
+  // stalled.
+  function _unbuffer(bytes) {
+    internal.bufferedAmount = Math.max(0, (internal.bufferedAmount || 0) - bytes);
+  }
+  // internal.send, its bytes given back when the message did not go out
+  // (it returns false for a channel or association that is gone, throws for
+  // a full buffer or an SCTP error).
+  function _sendCounted(payload, bytes) {
+    var sent;
+    try { sent = internal.send(payload); }
+    catch (e) { _unbuffer(bytes); throw e; }
+    if (sent === false) _unbuffer(bytes);
+  }
+  // The same, for a send that runs later from the queue: nobody is there to
+  // catch a throw — it rejected the queue, so every send queued after it was
+  // dropped, and surfaced as an unhandled rejection. Reported instead; the
+  // channel's 'error' event has already fired for it.
+  // internal._sendQBytes: bytes counted in bufferedAmount that still wait in
+  // the queue. Taken off as each one reaches internal.send, so the
+  // controller's send-buffer cap sees what is ahead of the message, not the
+  // messages queued after it (those were counted first, synchronously, and
+  // made a Blob at the head of the queue look over the cap).
+  function _sendQueued(payload, bytes, what) {
+    internal._sendQBytes = Math.max(0, (internal._sendQBytes || 0) - bytes);
+    try { _sendCounted(payload, bytes); }
+    catch (e) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[RTCDataChannel] ' + what + ' send failed:', e && e.message || e);
+      }
+    }
+  }
+
+  impl._sendQ = Promise.resolve();
   impl.send = function(data) {
     // W3C §6.2: must throw InvalidStateError unless readyState === 'open'.
     // 'connecting' → not yet negotiated; 'closing'/'closed' → gone.
@@ -4715,68 +4831,52 @@ function RTCDataChannel(internal, manager) {
     var isBlob = (data != null && typeof data === 'object' &&
                   typeof data.arrayBuffer === 'function' &&
                   typeof data.size === 'number');
-    // W3C: bufferedAmount increases SYNCHRONOUSLY in send() by the
-    // message's byte length (utf-8 for strings, size for Blobs). The
-    // drain side stays ack-driven in the SCTP layer.
-    var _sendBytes = 0;
-    if (typeof data === 'string') _sendBytes = Buffer.byteLength(data, 'utf8');
-    else if (isBlob)             _sendBytes = data.size;
-    else if (data && typeof data.byteLength === 'number') _sendBytes = data.byteLength;
-    internal.bufferedAmount = (internal.bufferedAmount || 0) + _sendBytes;
+
+    // Byte length, once (a string's UTF-8 length is a pass over it; it was
+    // computed twice).
+    var byteLen = 0;
+    if (typeof data === 'string') byteLen = Buffer.byteLength(data, 'utf8');
+    else if (isBlob) byteLen = data.size;
+    else if (data && data.byteLength != null) byteLen = data.byteLength;
+    else if (data && data.length != null) byteLen = data.length;
+
+    // W3C §6.2.4 step 5: if byteLen > sctp.maxMessageSize, throw TypeError —
+    // before bufferedAmount counts the message.
+    var actualMax = (manager && manager.state && manager.state.maxMessageSize)
+      ? manager.state.maxMessageSize
+      : 262144;   // RFC 8831 default
+    if (byteLen > actualMax) {
+      throw new TypeError('RTCDataChannel.send: ' + (isBlob ? 'Blob size ' : 'message length ') + byteLen +
+        ' exceeds sctp.maxMessageSize (' + actualMax + ')');
+    }
+
+    internal.bufferedAmount = (internal.bufferedAmount || 0) + byteLen;
+
     if (isBlob) {
-      // Sync size check against maxMessageSize (W3C §6.2.4).
-      var blobSize = data.size;
-      var actualMaxBlob = (manager && manager.state && manager.state.maxMessageSize)
-        ? manager.state.maxMessageSize
-        : 262144;
-      if (blobSize > actualMaxBlob) {
-        throw new TypeError('RTCDataChannel.send: Blob size ' + blobSize +
-          ' exceeds sctp.maxMessageSize (' + actualMaxBlob + ')');
-      }
-      // Read async, then route through internal.send so cm.js's chunkSent
-      // owns bufferedAmount accounting (no double-count). NOTE: spec says
-      // bufferedAmount should bump synchronously here even before the
-      // Blob is read; we accept the "looks zero until Blob resolves" gap
-      // because the async read is unavoidable and stays inside the same
-      // task.
+      // Read async, then route through internal.send.
       // ORDER-PRESERVING (real-bug fix): later sends must NOT overtake a
       // pending Blob conversion — the conversion rides the channel queue.
+      // _sendQBusy comes down however the read ends: it stayed up when the
+      // read failed, and every later send on the channel went through the
+      // queue (deferred, and copied) for no reason.
       impl._sendQBusy = (impl._sendQBusy || 0) + 1;
+      internal._sendQBytes = (internal._sendQBytes || 0) + byteLen;
       impl._sendQ = impl._sendQ.then(function () { return data.arrayBuffer(); }).then(function (ab) {
-        if (internal.readyState !== 'open') return;
         impl._sendQBusy = Math.max(0, (impl._sendQBusy || 1) - 1);
-        try { internal.send(Buffer.from(ab)); }
-        catch (e) {
-          if (typeof console !== 'undefined' && console.error) {
-            console.error('[RTCDataChannel] Blob send failed:', e && e.message || e);
-          }
+        if (internal.readyState !== 'open') {
+          internal._sendQBytes = Math.max(0, (internal._sendQBytes || 0) - byteLen);
+          return;
         }
-      }).catch(function (e) {
+        _sendQueued(Buffer.from(ab), byteLen, 'Blob');
+      }, function (e) {
+        impl._sendQBusy = Math.max(0, (impl._sendQBusy || 1) - 1);
+        internal._sendQBytes = Math.max(0, (internal._sendQBytes || 0) - byteLen);
+        _unbuffer(byteLen);
         if (typeof console !== 'undefined' && console.error) {
           console.error('[RTCDataChannel] Blob.arrayBuffer() failed:', e && e.message || e);
         }
       });
       return;
-    }
-
-    // Compute byte length BEFORE send. cm.js bumps bufferedAmount via
-    // its own chunkSent listener (fires synchronously inside sctp.send),
-    // and decrements via chunkAcked when peer SACKs. Pre-fix the wrapper
-    // ALSO bumped + scheduled-decrement, double-counting bufferedAmount
-    // until the SACK arrived. The single-source-of-truth is cm.js; we
-    // just use byteLen here for the maxMessageSize check.
-    var byteLen = 0;
-    if (typeof data === 'string') byteLen = Buffer.byteLength(data, 'utf8');
-    else if (data && data.byteLength != null) byteLen = data.byteLength;
-    else if (data && data.length != null) byteLen = data.length;
-
-    // W3C §6.2.4 step 5: if byteLen > sctp.maxMessageSize, throw TypeError.
-    var actualMax = (manager && manager.state && manager.state.maxMessageSize)
-      ? manager.state.maxMessageSize
-      : 262144;   // RFC 8831 default
-    if (byteLen > actualMax) {
-      throw new TypeError('RTCDataChannel.send: message length ' + byteLen +
-        ' exceeds sctp.maxMessageSize (' + actualMax + ')');
     }
 
     // SYNCHRONOUS unless we are behind a Blob conversion.
@@ -4790,13 +4890,22 @@ function RTCDataChannel(internal, manager) {
     // behind them must stay in order, so the queue is used only while it
     // is actually busy.
     if (impl._sendQBusy) {
+      // Queued behind a Blob: send() returns before these bytes are taken,
+      // so take a copy now — the caller may reuse its buffer at once.
+      var queued = data;
+      if (data instanceof ArrayBuffer) queued = data.slice(0);
+      else if (ArrayBuffer.isView(data)) queued = Buffer.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      internal._sendQBytes = (internal._sendQBytes || 0) + byteLen;
       impl._sendQ = impl._sendQ.then(function () {
-        if (internal.readyState !== 'open' && internal.readyState !== 'closing') return;
-        internal.send(data);
-    });
+        if (internal.readyState !== 'open' && internal.readyState !== 'closing') {
+          internal._sendQBytes = Math.max(0, (internal._sendQBytes || 0) - byteLen);
+          return;
+        }
+        _sendQueued(queued, byteLen, 'queued');
+      });
     } else {
       if (internal.readyState === 'open' || internal.readyState === 'closing') {
-        internal.send(data);
+        _sendCounted(data, byteLen);
       }
     }
   };
@@ -4856,11 +4965,18 @@ function RTCDataChannel(internal, manager) {
       } else {
         // Default + 'arraybuffer': hand back an ArrayBuffer. Buffer.buffer
         // is the underlying ArrayBuffer but may include unrelated bytes
-        // when Buffer is a slice — slice it down explicitly.
-        data = rawData.buffer.slice(
-          rawData.byteOffset,
-          rawData.byteOffset + rawData.byteLength
-        );
+        // when Buffer is a slice — slice it down explicitly. A Buffer that
+        // spans its whole ArrayBuffer (a reassembled message of 4KB or more —
+        // Node allocates those outside the shared pool) is already exactly
+        // the message and nothing else holds it: hand that over, no copy.
+        if (rawData.byteOffset === 0 && rawData.byteLength === rawData.buffer.byteLength) {
+          data = rawData.buffer;
+        } else {
+          data = rawData.buffer.slice(
+            rawData.byteOffset,
+            rawData.byteOffset + rawData.byteLength
+          );
+        }
       }
     }
     var event = {
@@ -4875,11 +4991,13 @@ function RTCDataChannel(internal, manager) {
       source: null,
       ports:  [],
     };
-    if (_onmessage) {
-      try { _onmessage(event); } catch (e) {}
-    }
-    for (var li = 0; li < _msgListeners.length; li++) {
-      try { _msgListeners[li](event); } catch (e) {}
+    if (_onmessage) callHandler(_onmessage, self, event, 'dc.onmessage');
+    // A once-listener removes itself from _msgListeners while this loop
+    // runs, which shifted the next listener into its slot and skipped it.
+    // More than one listener: walk a snapshot.
+    var ml = _msgListeners.length > 1 ? _msgListeners.slice() : _msgListeners;
+    for (var li = 0; li < ml.length; li++) {
+      callHandler(ml[li], self, event, 'dc message listener');
     }
   });
   Object.defineProperty(self, 'onmessage', {
@@ -4897,12 +5015,14 @@ function RTCDataChannel(internal, manager) {
   // EventEmitter so swapping handlers cleans up.
   function _bindDCHandler(name) {
     var current = null;
+    var guarded = null;   // what is registered: current, its exception reported
     Object.defineProperty(self, 'on' + name, {
       get: function() { return current; },
       set: function(fn) {
-        if (current) internal._ev.off(name, current);
+        if (guarded) internal._ev.off(name, guarded);
         current = (typeof fn === 'function') ? fn : null;
-        if (current) internal._ev.on(name, current);
+        guarded = current ? guardHandler(current, self, 'dc.on' + name) : null;
+        if (guarded) internal._ev.on(name, guarded);
       },
     });
   }
@@ -4931,9 +5051,32 @@ function RTCDataChannel(internal, manager) {
       }
       return;
     }
-    if (once) internal._ev.once(name, fn);
-    else      internal._ev.on(name, fn);
+    // Registered guarded; removeEventListener gets the original fn, so keep
+    // fn → its guarded registrations (a list: the same fn may be added twice,
+    // and runs twice).
+    var g = guardHandler(fn, self, 'dc ' + name + ' listener');
+    if (!_guardedListeners.has(name)) _guardedListeners.set(name, new Map());
+    var perName = _guardedListeners.get(name);
+    var list = perName.get(fn);
+    if (!list) { list = []; perName.set(fn, list); }
+    list.push(g);
+    if (once) {
+      var g1 = function (e) { _forgetGuarded(name, fn, g1); return g(e); };
+      list[list.length - 1] = g1;
+      internal._ev.once(name, g1);
+    } else {
+      internal._ev.on(name, g);
+    }
   };
+  var _guardedListeners = new Map();   // name → Map(fn → [registered])
+  function _forgetGuarded(name, fn, reg) {
+    var perName = _guardedListeners.get(name);
+    var list = perName && perName.get(fn);
+    if (!list) return;
+    var k = list.indexOf(reg);
+    if (k >= 0) list.splice(k, 1);
+    if (list.length === 0) perName.delete(fn);
+  }
   impl.removeEventListener = function(name, fn) {
     if (typeof fn !== 'function') return;
     if (name === 'message') {
@@ -4946,7 +5089,12 @@ function RTCDataChannel(internal, manager) {
       }
       return;
     }
-    internal._ev.off(name, fn);
+    var perName = _guardedListeners.get(name);
+    var list = perName && perName.get(fn);
+    if (!list || list.length === 0) return;
+    var reg = list[list.length - 1];
+    _forgetGuarded(name, fn, reg);
+    internal._ev.off(name, reg);
   };
   // dispatchEvent — see comment on RTCPeerConnection.dispatchEvent.
   impl.dispatchEvent = function(event) {
@@ -4955,7 +5103,7 @@ function RTCDataChannel(internal, manager) {
     }
     if (event.type === 'message') {
       var copy = _msgListeners.slice();
-      for (var i = 0; i < copy.length; i++) copy[i](event);
+      for (var i = 0; i < copy.length; i++) callHandler(copy[i], self, event, 'dc message listener');
     } else {
       internal._ev.emit(event.type, event);
     }
@@ -5198,7 +5346,7 @@ RTCSctpTransport.prototype.removeEventListener = function (t, fn) {
 };
 RTCSctpTransport.prototype.dispatchEvent = function (ev) {
   var a = this._etListeners && this._etListeners[ev && ev.type];
-  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  if (a) { var self = this; a.slice().forEach(function (fn) { callHandler(fn, self, ev, (ev.type || 'event') + ' listener'); }); }
   return true;
 };
 function RTCSctpTransport(manager) {
@@ -5208,8 +5356,8 @@ function RTCSctpTransport(manager) {
   try {
     manager.ev.on('sctp:statechange', function () {
       var evO = { type: 'statechange', target: _selfET };
-      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
-      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+      if (typeof _selfET.onstatechange === 'function') callHandler(_selfET.onstatechange, _selfET, evO, 'onstatechange');
+      _selfET.dispatchEvent(evO);
     });
   } catch (eW) {}
   // transport is set by the RTCPeerConnection singleton factory (see
@@ -5264,14 +5412,13 @@ function RTCSctpTransport(manager) {
     },
   });
 
+  // Stored only: the dispatcher at the top of the constructor calls it
+  // (with the event, guarded). Registering it on manager.ev as well ran it
+  // twice per change — the second time unguarded, with the raw state.
   var _stateHandler = null;
   Object.defineProperty(this, 'onstatechange', {
     get: function() { return _stateHandler; },
-    set: function(fn) {
-      if (_stateHandler) manager.ev.removeListener('sctp:statechange', _stateHandler);
-      _stateHandler = fn;
-      if (fn) manager.ev.on('sctp:statechange', fn);
-    },
+    set: function(fn) { _stateHandler = (typeof fn === 'function') ? fn : null; },
   });
 }
 
@@ -5289,7 +5436,7 @@ RTCDtlsTransport.prototype.removeEventListener = function (t, fn) {
 };
 RTCDtlsTransport.prototype.dispatchEvent = function (ev) {
   var a = this._etListeners && this._etListeners[ev && ev.type];
-  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  if (a) { var self = this; a.slice().forEach(function (fn) { callHandler(fn, self, ev, (ev.type || 'event') + ' listener'); }); }
   return true;
 };
 function RTCDtlsTransport(manager) {
@@ -5303,20 +5450,24 @@ function RTCDtlsTransport(manager) {
         errV = new RTCError({ errorDetail: (info && info.fingerprint) ? 'fingerprint-failure' : 'dtls-failure' },
                             (info && info.message) || 'DTLS failure');
       } catch (eMk) { errV = { name: 'OperationError', errorDetail: 'dtls-failure' }; }
-      var evE = { type: 'error', error: errV, target: _selfET };
-      try { if (typeof _selfET.onerror === 'function') _selfET.onerror(evE); } catch (e1) {}
-      try { _selfET.dispatchEvent(evE); } catch (e2) {}
+      // An RTCErrorEvent, as WPT's RTCDtlsTransport-onerror checks
+      // (instanceof RTCErrorEvent); it was a plain object.
+      var evE = new RTCErrorEvent('error', { error: errV });
+      try { evE.target = _selfET; } catch (eT) {}
+      if (typeof _selfET.onerror === 'function') callHandler(_selfET.onerror, _selfET, evE, 'onerror');
+      _selfET.dispatchEvent(evE);
     });
     manager.ev.on('dtls:statechange', function () {
       // W3C: transitioning to 'closed' via pc.close() is SILENT — no
       // statechange event is observable on the transport. The closed
-      // flag can lag the event, so also gate on the transport's OWN
-      // current state.
-      if (manager.state.closed) return;
-      try { if (_selfET.state === 'closed') return; } catch (eSt) {}
+      // flag can lag the event, so also gate on close() having begun
+      // (_pcClosing). Not on the transport's own state being 'closed':
+      // that also silenced the peer's close_notify, the one 'closed' that
+      // IS evented (WPT RTCDtlsTransport-state waits for it).
+      if (manager.state.closed || manager.state._pcClosing) return;
       var evO = { type: 'statechange', target: _selfET };
-      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
-      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+      if (typeof _selfET.onstatechange === 'function') callHandler(_selfET.onstatechange, _selfET, evO, 'onstatechange');
+      _selfET.dispatchEvent(evO);
     });
   } catch (eW) {}
   // WebIDL prototype surface (WPT): methods live on the prototype;
@@ -5362,11 +5513,9 @@ function RTCDtlsTransport(manager) {
   function _bindHandler(name, upstream) {
     Object.defineProperty(self, 'on' + name, {
       get: function() { return _handlers[name] || null; },
-      set: function(fn) {
-        if (_handlers[name]) manager.ev.off(upstream, _handlers[name]);
-        _handlers[name] = fn;
-        if (fn) manager.ev.on(upstream, fn);
-      },
+      // Stored only — the dispatchers at the top of the constructor call
+      // it (see RTCSctpTransport's onstatechange).
+      set: function(fn) { _handlers[name] = (typeof fn === 'function') ? fn : null; },
     });
   }
   _bindHandler('statechange', 'dtls:statechange');
@@ -5391,7 +5540,7 @@ RTCIceTransport.prototype.removeEventListener = function (t, fn) {
 };
 RTCIceTransport.prototype.dispatchEvent = function (ev) {
   var a = this._etListeners && this._etListeners[ev && ev.type];
-  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  if (a) { var self = this; a.slice().forEach(function (fn) { callHandler(fn, self, ev, (ev.type || 'event') + ' listener'); }); }
   return true;
 };
 function RTCIceTransport(manager) {
@@ -5401,8 +5550,13 @@ function RTCIceTransport(manager) {
   try {
     manager.ev.on('icegatheringstatechange', function () {
       var evG = { type: 'gatheringstatechange', target: _selfET };
-      try { if (typeof _selfET.ongatheringstatechange === 'function') _selfET.ongatheringstatechange(evG); } catch (eG1) {}
-      try { _selfET.dispatchEvent(evG); } catch (eG2) {}
+      if (typeof _selfET.ongatheringstatechange === 'function') callHandler(_selfET.ongatheringstatechange, _selfET, evG, 'ongatheringstatechange');
+      _selfET.dispatchEvent(evG);
+    });
+    manager.ev.on('selectedcandidatepairchange', function () {
+      var evP = { type: 'selectedcandidatepairchange', target: _selfET };
+      if (typeof _selfET.onselectedcandidatepairchange === 'function') callHandler(_selfET.onselectedcandidatepairchange, _selfET, evP, 'onselectedcandidatepairchange');
+      _selfET.dispatchEvent(evP);
     });
   } catch (eWG) {}
   try {
@@ -5420,8 +5574,8 @@ function RTCIceTransport(manager) {
       // OWN current state — the same double guard the DTLS forwarder uses.
       try { if (_selfET.state === 'closed') return; } catch (eSt) {}
       var evO = { type: 'statechange', target: _selfET };
-      try { if (typeof _selfET.onstatechange === 'function') _selfET.onstatechange(evO); } catch (e1) {}
-      try { _selfET.dispatchEvent(evO); } catch (e2) {}
+      if (typeof _selfET.onstatechange === 'function') callHandler(_selfET.onstatechange, _selfET, evO, 'onstatechange');
+      _selfET.dispatchEvent(evO);
     });
   } catch (eW) {}
   // WebIDL prototype surface (WPT): methods live on the prototype;
@@ -5623,11 +5777,9 @@ function RTCIceTransport(manager) {
   function _bindHandler(name, upstreamName) {
     Object.defineProperty(self, 'on' + name, {
       get: function() { return _handlers[name] || null; },
-      set: function(fn) {
-        if (_handlers[name]) manager.ev.off(upstreamName, _handlers[name]);
-        _handlers[name] = fn;
-        if (fn) manager.ev.on(upstreamName, fn);
-      },
+      // Stored only — the dispatchers at the top of the constructor call
+      // it (see RTCSctpTransport's onstatechange).
+      set: function(fn) { _handlers[name] = (typeof fn === 'function') ? fn : null; },
     });
   }
   _bindHandler('statechange',                 'iceconnectionstatechange');
@@ -5664,7 +5816,7 @@ RTCDTMFSender.prototype.removeEventListener = function (t, fn) {
 };
 RTCDTMFSender.prototype.dispatchEvent = function (ev) {
   var a = this._etL && this._etL[ev && ev.type];
-  if (a) a.slice().forEach(function (fn) { try { fn(ev); } catch (e) {} });
+  if (a) { var self = this; a.slice().forEach(function (fn) { callHandler(fn, self, ev, (ev.type || 'event') + ' listener'); }); }
   return true;
 };
 function RTCDTMFSender(getPipeline, getClosed, getTxState) {
@@ -5702,9 +5854,7 @@ function RTCDTMFSender(getPipeline, getClosed, getTxState) {
   function _fireToneChange(tone) {
     var evT = new RTCDTMFToneChangeEvent({ tone: tone });
     try { evT.type = 'tonechange'; } catch (eT) {}
-    if (typeof self.ontonechange === 'function') {
-      try { self.ontonechange(evT); } catch (e) {}
-    }
+    if (typeof self.ontonechange === 'function') callHandler(self.ontonechange, self, evT, 'ontonechange');
     // addEventListener('tonechange') subscribers too (WPT uses both styles)
     try { if (self.dispatchEvent) self.dispatchEvent(evT); } catch (e2) {}
   }
@@ -5806,10 +5956,9 @@ function RTCDataChannelEvent(type, init) {
   if (init == null || init.channel == null) {
     throw new TypeError('RTCDataChannelEvent: channel is required');
   }
-  if (typeof type === 'object' && type && init === undefined) { init = type; }
-  this.type = typeof type === 'string' ? type : (init.type || 'datachannel');
   init = init || {};
-  this.type       = 'datachannel';
+  // The type given, as every Event's (it was overwritten with 'datachannel').
+  this.type       = String(type);
   // Standard Event flags default to FALSE, not undefined — WPT asserts
   // both directly on the delivered event.
   this.bubbles    = !!init.bubbles;
@@ -5906,10 +6055,27 @@ function RTCError(init, message) {
 RTCError.prototype = Object.create(Error.prototype);
 RTCError.prototype.constructor = RTCError;
 
-function RTCErrorEvent(init) {
+// W3C: constructor(DOMString type, RTCErrorEventInit eventInitDict), the
+// dictionary's `error` required — as WPT's idlharness builds one:
+// new RTCErrorEvent('whoops', { error }). It took (init) alone: the browser's
+// form gave error null and type 'error'. The one-argument form, an object,
+// is still taken as before (type 'error') for code written against it.
+function RTCErrorEvent(type, init) {
+  if (typeof type === 'object' && type !== null && init === undefined) {
+    init = type; type = 'error';
+  } else {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to construct 'RTCErrorEvent': 2 arguments required");
+    }
+    if (init == null || init.error == null) {
+      throw new TypeError("Failed to construct 'RTCErrorEvent': required member error is undefined");
+    }
+  }
   init = init || {};
-  this.type  = 'error';
-  this.error = init.error != null ? init.error : null;
+  this.type       = String(type);
+  this.bubbles    = !!init.bubbles;
+  this.cancelable = !!init.cancelable;
+  this.error      = init.error != null ? init.error : null;
 }
 
 function RTCDTMFToneChangeEvent(type, init) {
@@ -5948,7 +6114,8 @@ function RTCDTMFToneChangeEvent(type, init) {
  *   peer-connection     — RTCPeerConnection-level counters (DC open/close)
  *   data-channel        — per RTCDataChannel
  *   transport           — per DTLS/ICE transport
- *   candidate-pair      — per nominated ICE candidate pair
+ *   candidate-pair      — per ICE candidate pair (the selected one, and every
+ *                         pair the agent is checking — full report only)
  *   local-candidate     — per local ICE candidate
  *   remote-candidate    — per remote ICE candidate
  *   certificate         — DTLS fingerprint + cert material
@@ -5972,9 +6139,20 @@ function _idRemoteOutbound(ssrc)   { return 'ROB-' + ssrc; }
 function _idMediaSource(trackId)   { return 'MS-'  + trackId; }
 function _idCodec(pt, dir)         { return 'C-'   + dir + '-' + pt; }
 function _idDataChannel(id)        { return 'DC-'  + id; }
-function _idLocalCandidate (foundation, component)  { return 'LC-' + foundation + '-' + component; }
-function _idRemoteCandidate(foundation, component)  { return 'RC-' + foundation + '-' + component; }
-function _idCandidatePair(local, remote)            { return 'CP-' + local + '-' + remote; }
+// Candidates and pairs: one id per agent object, kept as long as the object
+// lives. Not from the foundation — two candidates can share one (local prflx
+// from the same base; any two pairs over them), and a remote prflx that is
+// later learned from signaling keeps its object but changes its foundation.
+var _iceStatIds = new WeakMap();
+var _iceStatNext = 0;
+function _iceObjId(prefix, o) {
+  var id = _iceStatIds.get(o);
+  if (id === undefined) { id = prefix + (++_iceStatNext).toString(36); _iceStatIds.set(o, id); }
+  return id;
+}
+function _idLocalCandidate (cand) { return _iceObjId('LC-', cand); }
+function _idRemoteCandidate(cand) { return _iceObjId('RC-', cand); }
+function _idCandidatePair(pair)   { return _iceObjId('CP-', pair); }
 function _idCertificate(fingerprint) { return 'CERT-' + (fingerprint || 'unknown').substring(0, 16); }
 function _idMediaPlayout(kind)       { return 'MP-' + kind; }
 
@@ -6445,9 +6623,7 @@ function _transportEntry(snapshot, snap, now) {
     // pair is nominated, incremented by the agent's selectedpair events.
     selectedCandidatePairChanges: snapshot.selectedPairChanges || 0,
     selectedCandidatePairId: snapshot.selectedPair
-      ? _idCandidatePair(
-          (snapshot.selectedPair.local  && snapshot.selectedPair.local.foundation)  || '0',
-          (snapshot.selectedPair.remote && snapshot.selectedPair.remote.foundation) || '0')
+      ? _idCandidatePair(snapshot.selectedPair)
       : undefined,
     // Optional — these depend on the DTLS lib exposing the info.
     srtpCipher:              'AES_CM_128_HMAC_SHA1_80',
@@ -6475,8 +6651,7 @@ function _candidateEntry(cand, kind, now) {
   if (!cand) return null;
   // kind: 'local' | 'remote'
   var entry = {
-    id:            (kind === 'local' ? _idLocalCandidate : _idRemoteCandidate)(
-                      cand.foundation || '0', cand.component || 1),
+    id:            (kind === 'local' ? _idLocalCandidate : _idRemoteCandidate)(cand),
     type:          (kind === 'local') ? 'local-candidate' : 'remote-candidate',
     timestamp:     now,
     transportId:   TRANSPORT_ID,
@@ -6497,8 +6672,6 @@ function _candidateEntry(cand, kind, now) {
 function _candidatePairEntry(snapshot, snap, now) {
   if (!snapshot.selectedPair) return null;
   var pair = snapshot.selectedPair;
-  var localFoundation  = (pair.local  && pair.local.foundation)  || '0';
-  var remoteFoundation = (pair.remote && pair.remote.foundation) || '0';
 
   // Aggregate media bytes from transport (for the "how much media crossed
   // this pair" view). STUN-level bytes are already on pair.bytesSent/Received.
@@ -6549,15 +6722,14 @@ function _candidatePairEntry(snapshot, snap, now) {
   }
 
   return {
-    id:                       _idCandidatePair(localFoundation, remoteFoundation),
+    id:                       _idCandidatePair(pair),
     type:                     'candidate-pair',
     timestamp:                now,
     transportId:              TRANSPORT_ID,
-    localCandidateId:         _idLocalCandidate (localFoundation,
-                                                 (pair.local  && pair.local.component)  || 1),
-    remoteCandidateId:        _idRemoteCandidate(remoteFoundation,
-                                                 (pair.remote && pair.remote.component) || 1),
-    state:                    'succeeded',
+    localCandidateId:         pair.local  ? _idLocalCandidate(pair.local)   : undefined,
+    remoteCandidateId:        pair.remote ? _idRemoteCandidate(pair.remote) : undefined,
+    // The agent's own state for it (W3C RTCStatsIceCandidatePairState).
+    state:                    pair.state || 'succeeded',
     nominated:                pair.nominated !== false,
     // Per ICE priority formula (RFC 8445 §6.1.2.3):
     //   priority = 2^32 * MIN(G,D) + 2 * MAX(G,D) + (G>D ? 1 : 0)
@@ -6619,6 +6791,42 @@ function _computePairPriority(G, D, controlling) {
   // stable-webrtc only uses this for comparison (not arithmetic), small
   // precision loss for very-high-priority pairs is acceptable.
   return (min * 4294967296) + (2 * max) + (G > D && controlling ? 1 : 0);
+}
+
+// A pair of the agent's checklist that is not the selected one: its check
+// state and STUN counters only (no media goes over it). The selected pair
+// is _candidatePairEntry's.
+function _checkPairEntry(pair, now) {
+  var e = {
+    id:                         _idCandidatePair(pair),
+    type:                       'candidate-pair',
+    timestamp:                  now,
+    transportId:                TRANSPORT_ID,
+    localCandidateId:           _idLocalCandidate(pair.local),
+    remoteCandidateId:          _idRemoteCandidate(pair.remote),
+    state:                      pair.state || 'frozen',
+    nominated:                  !!pair.nominated,
+    priority:                   _computePairPriority(
+                                  (pair.local  && pair.local.priority)  || 0,
+                                  (pair.remote && pair.remote.priority) || 0,
+                                  pair.controlling !== false),
+    bytesSent:                  pair.bytesSent         || 0,
+    bytesReceived:              pair.bytesReceived     || 0,
+    packetsSent:                pair.packetsSent       || 0,
+    packetsReceived:            pair.packetsReceived   || 0,
+    totalRoundTripTime:         pair.totalRoundTripTime || 0,
+    roundTripTimeMeasurements:  pair.rttMeasurements   || 0,
+    requestsSent:               pair.requestsSent      || 0,
+    requestsReceived:           pair.requestsReceived  || 0,
+    responsesSent:              pair.responsesSent     || 0,
+    responsesReceived:          pair.responsesReceived || 0,
+    consentRequestsSent:        pair.consentRequestsSent || 0,
+    lastPacketSentTimestamp:     pair.lastPacketSentTimestamp     || 0,
+    lastPacketReceivedTimestamp: pair.lastPacketReceivedTimestamp || 0,
+  };
+  // W3C: currentRoundTripTime only once a response has been measured.
+  if (pair.rttMeasurements > 0) e.currentRoundTripTime = pair.roundTripTime || 0;
+  return e;
 }
 
 
@@ -6828,6 +7036,37 @@ function _buildStatsReport(manager, filter) {
     if (remoteCandEntry) report.set(remoteCandEntry.id, remoteCandEntry);
     var cpEntry = _candidatePairEntry(snapshot, snap, now);
     if (cpEntry) report.set(cpEntry.id, cpEntry);
+  }
+
+  // The full report (not a sender's / receiver's): every candidate on both
+  // sides and every pair the agent is checking, each in its own state — as
+  // a browser reports them, so the checks can be followed while ICE is
+  // checking, and after (other pairs, a restart). The selected one is above.
+  if (!filterSet) {
+    var _lc = snap.iceLocalCandidates, _rc = snap.iceRemoteCandidates, _cl = snap.iceCheckList;
+    var _ci, _ce;
+    if (_lc) for (_ci = 0; _ci < _lc.length; _ci++) {
+      if (!_lc[_ci]) continue;
+      _ce = _candidateEntry(_lc[_ci], 'local', now);
+      if (_ce && !report.has(_ce.id)) report.set(_ce.id, _ce);
+    }
+    if (_rc) for (_ci = 0; _ci < _rc.length; _ci++) {
+      if (!_rc[_ci]) continue;
+      _ce = _candidateEntry(_rc[_ci], 'remote', now);
+      if (_ce && !report.has(_ce.id)) report.set(_ce.id, _ce);
+    }
+    if (_cl) for (_ci = 0; _ci < _cl.length; _ci++) {
+      var _p = _cl[_ci];
+      if (!_p || !_p.local || !_p.remote || _p === snapshot.selectedPair) continue;
+      // A pair's candidates are in the report even when the lists no longer
+      // hold them (a local prflx, a remote cleared by a restart).
+      _ce = _candidateEntry(_p.local, 'local', now);
+      if (_ce && !report.has(_ce.id)) report.set(_ce.id, _ce);
+      _ce = _candidateEntry(_p.remote, 'remote', now);
+      if (_ce && !report.has(_ce.id)) report.set(_ce.id, _ce);
+      _ce = _checkPairEntry(_p, now);
+      report.set(_ce.id, _ce);
+    }
   }
 
   // Track which codec PTs we need to emit after RTP streams are collected.

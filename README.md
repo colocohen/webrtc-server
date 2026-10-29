@@ -252,6 +252,14 @@ dc.onmessage = (e) => console.log(e.data);
 
 Backed by a full SCTP implementation: ordered/unordered delivery, reliable/partial-reliable, configurable max message size up to 256 KiB by default.
 
+A peer that restarts its SCTP association over the same DTLS connection (RFC 4960 §5.2.2 / §5.2.4) is followed: every channel of the old association ends with an `error` (`errorDetail: 'sctp-failure'`) and `close`, as after a remote ABORT, while the connection itself stays up and new channels open on the new association.
+
+- **`bufferedAmount`** counts bytes queued by `send()` that have not yet gone out on the network (W3C §6.2): it falls as chunks are first transmitted (or dropped before that), so pacing on `bufferedamountlow` really waits for the transport. Lower-level: `sctp.on('chunkUnbuffered', { streamId, ppid, bytes })`.
+- **`send()`** accepts a string, `ArrayBuffer`, `Buffer` or any `ArrayBufferView` (a typed array or `DataView` sends its own bytes). The data is copied before `send()` returns — the caller may reuse its buffer at once.
+- **Received binary messages** each own their `ArrayBuffer` (safe to transfer to a worker).
+- **Flow control** covers messages waiting to be delivered to the application too: a sender outrunning the `message` handler is slowed down by the receive window instead of growing a queue.
+- A channel that finished closing releases its stream id: the peer can open a new channel on it, and local ids are reused once the id space runs out.
+
 ### DTMF
 
 `sender.dtmf` returns a live `RTCDTMFSender` on audio senders once `telephone-event` is negotiated (it's in the default audio codec set, so any standards-following peer will accept it):
@@ -345,19 +353,62 @@ router.hasSession(rinfo);    // is this 5-tuple a known peer?
 router.close();              // closes router-owned sockets only
 ```
 
+**ICE over TCP (RFC 6544, passive)** — for peers whose UDP is blocked. The router binds no TCP port; whoever accepts TCP connections asks once for a handler and passes it every connection that carries ICE (RFC 4571 framing — a 2-byte length before each packet):
+
+```js
+import net from 'node:net';
+
+const iceTcp = router.tcp();          // { port } — default: the UDP socket's port
+net.createServer(iceTcp).listen(443);
+```
+
+From that call on, every new peer connection also announces a `tcp … typ host tcptype passive` candidate per address, below its UDP candidate in priority, so a peer that can reach UDP still picks UDP. A connection is tied to the peer connection whose ufrag its first STUN check names; one that sends anything else first, or nothing within 5 seconds, is closed. On a port shared with TLS or TURN over TCP, tell them apart by the first bytes: TLS opens with `0x16`, TURN with STUN (magic cookie at bytes 4–7), ICE-TCP with a length and then STUN (cookie at bytes 6–9).
+
+**A TURN server on the same process** — when a browser can only reach this server through TURN, and that TURN server is [`turn-server`](https://npmjs.com/package/turn-server) in the same process, give it to the router:
+
+```js
+import { createServer } from 'turn-server';
+
+const turn = createServer({ socket, relay: { externalIp: '203.0.113.5' } });
+const router = new WebRTCRouter({ socket, announcedAddresses: ['203.0.113.5'], turn });
+```
+
+A relay whose peer is this router (one of `announcedAddresses`, on the router's UDP port) then hands its datagrams to the router in memory, and the router's answers go back into the relay the same way — instead of leaving for the network and coming back in on the shared port, which a home router often does not turn around. Nothing else changes: TURN's permissions, hooks and counters apply as before, and a relay to any other peer goes out to the network. `router.close()` detaches it. Without `turn`, the router behaves exactly as before.
+
 ### SDP utilities
 
-For advanced cases — modifying SDP between negotiation steps (codec munging, header extension filtering, simulcast config) — the SDP module is available:
+The SDP layer the connection negotiates with is exported for inspection — what a remote description offers, as this library reads it:
 
 ```js
 import { SDP } from 'webrtc-server';
 
-const parsed = SDP.parse(offerSdp);
-parsed.media[0].rtp = parsed.media[0].rtp.filter((c) => c.codec !== 'PCMU');
-const modified = SDP.write(parsed);
+const offer = SDP.parseOffer(sdpString);       // SDP.parseAnswer for an answer
+offer.bundleMids;                              // ['0', '1']
+for (const m of offer.media) {
+  console.log(m.mid, m.type, m.direction, m.codecs.map((c) => c.name));
+}
 ```
 
-This is an advanced API and isn't required for normal usage.
+Besides `parseOffer` / `parseAnswer`: `parseCandidate` / `buildCandidateString`, `extractCodecs`, `negotiateCodecs`, `getSimulcastStructure`, the default codec and header-extension tables (`DEFAULT_AUDIO_CODECS`, `DEFAULT_VIDEO_CODECS`, `CODEC_REGISTRY`, …). This is an advanced API and isn't required for normal usage.
+
+**Changing SDP between negotiation steps** (codec munging, header-extension filtering) is done on the text, with [`sdp-transform`](https://npmjs.com/package/sdp-transform) — the parser this library is built on — and the result passed to `setRemoteDescription` / `setLocalDescription` as usual:
+
+```js
+import sdpTransform from 'sdp-transform';
+
+const parsed = sdpTransform.parse(offer.sdp);
+for (const m of parsed.media) {
+  // Drop PCMU: its rtpmap, fmtp and rtcp-fb lines, and its payload type.
+  const drop = new Set(m.rtp.filter((c) => c.codec === 'PCMU').map((c) => c.payload));
+  m.rtp = m.rtp.filter((c) => !drop.has(c.payload));
+  m.fmtp = (m.fmtp || []).filter((f) => !drop.has(f.payload));
+  m.rtcpFb = (m.rtcpFb || []).filter((f) => !drop.has(Number(f.payload)));
+  m.payloads = m.rtp.map((c) => c.payload).join(' ');
+}
+await pc.setRemoteDescription({ type: 'offer', sdp: sdpTransform.write(parsed) });
+```
+
+For codec order alone, `transceiver.setCodecPreferences()` does it without touching SDP.
 
 ## Architecture
 

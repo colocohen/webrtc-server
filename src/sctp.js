@@ -70,6 +70,15 @@ var DATA_FLAG_UNORDERED = 0x04;  // U bit
 //   • Application calling close() while peer's SHUTDOWN is in flight.
 // SCTP-12 introduces the four sub-states so each transition's
 // preconditions and exit conditions are checkable.
+// State Cookie: data bytes (see makeCookie), then a 32-byte HMAC-SHA256.
+var COOKIE_DATA_LEN           = 44;
+var COOKIE_MAC_LEN            = 32;
+
+// The peer's extensions, as the State Cookie records them.
+var EXT_FORWARD_TSN           = 1;
+var EXT_RECONFIG              = 2;
+var EXT_I_DATA                = 4;
+
 var STATE_CLOSED              = 0;
 var STATE_COOKIE_WAIT         = 1;
 var STATE_COOKIE_ECHOED       = 2;
@@ -177,29 +186,61 @@ var DEFAULT_MAX_RECEIVE_BUFFER = 1024 * 1024;
 
 /* ========================= CRC32c ========================= */
 
-var CRC32C_TABLE = null;
-
-function initCrc32cTable() {
-  CRC32C_TABLE = new Uint32Array(256);
+// CRC32c (Castagnoli, reflected), slice-by-8: eight 256-entry tables in one
+// Uint32Array, 8 input bytes per step. Same result as the byte-at-a-time
+// table, about 3x faster in V8.
+var CRC32C_T = (function () {
+  var t = new Uint32Array(8 * 256);
   for (var i = 0; i < 256; i++) {
-    var crc = i;
-    for (var j = 0; j < 8; j++) {
-      if (crc & 1) crc = (crc >>> 1) ^ 0x82F63B78;
-      else crc = crc >>> 1;
-    }
-    CRC32C_TABLE[i] = crc;
+    var c = i;
+    for (var j = 0; j < 8; j++) c = (c & 1) ? ((c >>> 1) ^ 0x82F63B78) : (c >>> 1);
+    t[i] = c >>> 0;
   }
+  for (var k = 1; k < 8; k++) {
+    for (var n = 0; n < 256; n++) {
+      var p = t[(k - 1) * 256 + n];
+      t[k * 256 + n] = ((p >>> 8) ^ t[p & 0xFF]) >>> 0;
+    }
+  }
+  return t;
+})();
+
+// Running CRC over buf[start, end). `crc` is the internal (pre-inverted) state.
+function crc32cUpdate(crc, buf, start, end) {
+  var T = CRC32C_T;
+  var i = start;
+  for (; i + 8 <= end; i += 8) {
+    crc ^= (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24));
+    crc = T[1792 + (crc & 0xFF)] ^ T[1536 + ((crc >>> 8) & 0xFF)] ^
+          T[1280 + ((crc >>> 16) & 0xFF)] ^ T[1024 + (crc >>> 24)] ^
+          T[768 + buf[i + 4]] ^ T[512 + buf[i + 5]] ^
+          T[256 + buf[i + 6]] ^ T[buf[i + 7]];
+  }
+  for (; i < end; i++) crc = (crc >>> 8) ^ T[(crc ^ buf[i]) & 0xFF];
+  return crc;
 }
 
 function crc32c(buf) {
-  if (!CRC32C_TABLE) initCrc32cTable();
-  var crc = 0xFFFFFFFF;
-  for (var i = 0; i < buf.length; i++) {
-    crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ buf[i]) & 0xFF];
-  }
+  return (crc32cUpdate(0xFFFFFFFF, buf, 0, buf.length) ^ 0xFFFFFFFF) >>> 0;
+}
+
+// CRC32c of an SCTP packet as if its checksum field (bytes 8..11) were zero —
+// what the receiver must verify — without copying or modifying the packet.
+function crc32cPacket(buf) {
+  var T = CRC32C_T;
+  var crc = crc32cUpdate(0xFFFFFFFF, buf, 0, 8);
+  crc = (crc >>> 8) ^ T[crc & 0xFF];   // four zero bytes
+  crc = (crc >>> 8) ^ T[crc & 0xFF];
+  crc = (crc >>> 8) ^ T[crc & 0xFF];
+  crc = (crc >>> 8) ^ T[crc & 0xFF];
+  crc = crc32cUpdate(crc, buf, 12, buf.length);
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
+
+// Packet-level diagnostics (LEMON_DEBUG / WEBRTC_DEBUG), read once at load.
+var _SCTP_PKT_DEBUG = typeof process !== 'undefined' && !!process.env &&
+  (process.env.LEMON_DEBUG === '1' || process.env.WEBRTC_DEBUG === '1');
 
 /* ========================= SctpAssociation ========================= */
 
@@ -239,6 +280,7 @@ function SctpAssociation(config) {
   var rtoInitialMs            = config.rtoInitialMs            || RTO_INITIAL_MS;
   var rtoMinMs                = config.rtoMinMs                || RTO_MIN_MS;
   var rtoMaxMs                = config.rtoMaxMs                || RTO_MAX_MS;
+  var maxInitRetransmits      = config.maxInitRetransmits      || 8;
   var assocMaxRetrans         = config.assocMaxRetrans         || ASSOC_MAX_RETRANS;
   var fastRetransmitThreshold = config.fastRetransmitThreshold || FAST_RETRANSMIT_THRESHOLD;
   var heartbeatIntervalMs     = config.heartbeatIntervalMs     || HEARTBEAT_INTERVAL_MS;
@@ -315,7 +357,11 @@ function SctpAssociation(config) {
   var localTsn = crypto.randomBytes(4).readUInt32BE(0);   // our next TSN to send
   var remoteTsn = 0;                                       // expected next TSN from peer
   var remoteRwnd = DEFAULT_A_RWND;
-  var cookieSecret = crypto.randomBytes(16);
+  // The key that signs our State Cookies. config.cookieSecret lets an
+  // association verify cookies another one issued — the owner replacing an
+  // association after a peer restart hands the new one the old one's key,
+  // since the restart's COOKIE ECHO was signed by the old (see 'restart').
+  var cookieSecret = config.cookieSecret ? Buffer.from(config.cookieSecret) : crypto.randomBytes(16);
 
   // Stream state
   var sendSSN = {};      // streamId → next SSN (sequence number within stream)
@@ -353,6 +399,14 @@ function SctpAssociation(config) {
   // SSN, PPID, and U-bit all match (RFC 4960 §6.5/§6.6 require that).
   // Fragments are removed from the store once assembled.
   var fragStore = {};
+  // I-DATA completion hint, per stream: key (mid, plus 2^32 when unordered)
+  // -> { have: Map fsn -> fragments stored, end: END's fsn or -1 }. Lets an arriving
+  // fragment tell in O(1) whether its message can be complete, instead of
+  // scanning the whole store on every arrival. Only a hint: assembly itself
+  // re-reads fragStore with the full rules. It is a superset of what
+  // fragStore holds (entries leave with the store's, or are pruned with it),
+  // so it never hides a complete message.
+  var iDataHint = {};
 
   // Per-stream ordered-delivery hold buffer. Maps streamId → Map<ssn, msg>
   // where msg is { ppid, payload }. When a complete message assembles with
@@ -465,6 +519,10 @@ function SctpAssociation(config) {
    */
   var outstandingBytes = 0;
   var inFlightCount    = 0;
+  // Whether any message of this association was ever sent with a maxLifetime.
+  // Until one is, no queued chunk can carry one, and handleSack's lifetime
+  // sweep (a walk of the whole sendQueue on every SACK) has nothing to find.
+  var lifetimeEverUsed = false;
 
   /* SCTP-9: congestion control state (RFC 4960 §7.2.1).
    *
@@ -692,6 +750,7 @@ function SctpAssociation(config) {
   var peerSupportsIData = false;
   var nextMessageSeq         = 0;
   var lastForwardTsnSent;     // undefined until first FORWARD-TSN sent
+  var lastForwardTsnSentAt = 0;   // when it was sent — see handleSack's re-send
   // SCTP-6: highest abandoned SSN per ordered stream since last FORWARD-TSN.
   // Cleared after each emit. Pairs added to FORWARD-TSN body so peer can
   // advance recvSSN past abandoned ordered messages without waiting.
@@ -772,6 +831,14 @@ function SctpAssociation(config) {
   // Flags
   var closed = false;
 
+  // The packet being handled: its Verification Tag (a COOKIE ECHO is checked
+  // against the tag in its own cookie, RFC 4960 §5.1.5 step 2), and — when its
+  // COOKIE ECHO turns out to be the peer restarting — the packet itself, which
+  // goes to the owner whole (see 'restart').
+  var pktVtag = 0;
+  var curPacket = null;
+  var restartPacket = null;
+
 
   /* ========================= Packet parsing ========================= */
 
@@ -791,22 +858,34 @@ function SctpAssociation(config) {
     var vtag     = (buf[4] << 24 | buf[5] << 16 | buf[6] << 8 | buf[7]) >>> 0;
     var checksum = (buf[11] << 24 | buf[10] << 16 | buf[9] << 8 | buf[8]) >>> 0;
 
-    // Verify checksum (CRC32c)
-    var copy = Buffer.from(buf);
-    copy[8] = copy[9] = copy[10] = copy[11] = 0;
-    var computed = crc32c(copy);
+    // Verify checksum (CRC32c) — computed with the checksum field taken as
+    // zero, without copying the packet.
+    var computed = crc32cPacket(buf);
     if (computed !== checksum) {
       try { ev.emit('protocolViolation', { code: 'crc-mismatch', expected: checksum, computed: computed }); } catch (e) {}
       return;
     }
 
     // Verify tag (INIT has tag=0)
+    //
+    // Except for a COOKIE ECHO, which carries the tag of the cookie it holds
+    // (RFC 4960 §5.1.5 step 2) — after a peer restart that is the NEW tag of
+    // our INIT ACK to its unexpected INIT (§5.2.2), not ours. handleCookieEcho
+    // checks it against the cookie; nothing else in the packet is looked at
+    // under that tag (see the loop).
+    var foreignCookie = false;
     if (vtag !== 0 && vtag !== localVerificationTag) {
       if (state !== STATE_CLOSED && state !== STATE_COOKIE_WAIT) {
-        try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
-        return;
+        if (buf.length >= 16 && buf[12] === CHUNK_COOKIE_ECHO) {
+          foreignCookie = true;
+        } else {
+          try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
+          return;
+        }
       }
     }
+    pktVtag = vtag;
+    curPacket = buf;
 
     remotePort = srcPort;
 
@@ -815,6 +894,10 @@ function SctpAssociation(config) {
     // immediately. Flushed at end so all reactive replies (SACK, HB-ACK,
     // FORWARD-TSN, etc.) ride on a single outgoing UDP datagram.
     packetDepth++;
+    // SCTP-1 heartbeat: any incoming chunk counts as path-active. Reset
+    // the idle counter so the heartbeat timer doesn't fire on a busy
+    // connection — once per packet rather than once per chunk.
+    hbLastActivityAt = Date.now();
     try {
       var offset = 12;
       while (offset + 4 <= buf.length) {
@@ -828,6 +911,12 @@ function SctpAssociation(config) {
         var chunkData = buf.subarray(offset + 4, offset + chunkLen);
 
         handleChunk(chunkType, chunkFlags, chunkData);
+
+        // A COOKIE ECHO under a tag that is not ours: it either restarted the
+        // association — and what is bundled after it belongs to the new one,
+        // which gets the whole packet — or it was refused. Either way the rest
+        // is not this association's to read.
+        if (foreignCookie || restartPacket) break;
 
         // Pad to 4-byte boundary
         offset += chunkLen;
@@ -856,6 +945,19 @@ function SctpAssociation(config) {
         }
         flushOutChunks();
       }
+      curPacket = null;
+    }
+
+    // The peer restarted (§5.2.4 action A). Reported, not performed: a new
+    // association has to take over, and that is the owner's to create —
+    // passing it this packet (the COOKIE ECHO establishes it, anything bundled
+    // after is its own) and this association's cookie key, which signed it.
+    // An owner that does not listen keeps today's behaviour: the restart is
+    // ignored and the running association stays.
+    if (restartPacket && packetDepth === 0) {
+      var rp = restartPacket;
+      restartPacket = null;
+      ev.emit('restart', { packet: rp, cookieSecret: Buffer.from(cookieSecret) });
     }
   }
 
@@ -899,7 +1001,7 @@ function SctpAssociation(config) {
     // connection. (Also covers the case where peer initiates HBs and
     // we're the responder — their HEARTBEAT chunk itself proves the path
     // is up, no need for us to also probe.)
-    hbLastActivityAt = Date.now();
+    // (hbLastActivityAt is stamped once per packet, in handlePacket.)
 
     if (type === CHUNK_INIT) {
       handleInit(data);
@@ -968,38 +1070,37 @@ function SctpAssociation(config) {
       return;
     }
 
-    // SCTP-11 N10: INIT collision handling per RFC 4960 §5.2.1 / 5.2.2.
+    var extMask = supportedExtensionsMask(data.subarray(16));
+
+    // An INIT for an association that is up (RFC 4960 §5.2.2): the peer may
+    // have restarted — lost its state and begun again — or the INIT is stale
+    // or forged. Nothing here changes: the answer is an INIT ACK with a NEW
+    // Initiate Tag whose cookie also records the tags in force now (the
+    // Tie-Tags). Only a COOKIE ECHO of that cookie, proving the peer got the
+    // answer, decides it was a restart (handleCookieEcho, action A); anything
+    // else leaves the running association as it was. It used to be dropped,
+    // which left a restarted peer no way back short of an ABORT.
     //
-    // If we receive INIT in a state other than CLOSED, several things
-    // could be happening:
-    //
-    //   • Peer crashed and restarted, didn't see our existing association
-    //     and is trying to re-establish (RFC 4960 §5.2.4 case).
-    //   • Both sides simultaneously sent INIT (rare but valid).
-    //   • Replay attack — captured INIT replayed.
-    //   • Bug in peer.
-    //
-    // The full RFC procedure includes "Tie-breaker per Tag" comparison
-    // logic (§5.2.4) which is intricate. The pragmatic action that
-    // matches libwebrtc: treat ANY INIT as a re-establishment request
-    // when we're in COOKIE_WAIT/COOKIE_ECHOED (handshake hasn't
-    // completed; peer can legitimately retry). If we're already
-    // ESTABLISHED, keep the existing association — the new INIT is
-    // either a stale dup (ignore) or peer restarted (we'd see it via
-    // path failure / heartbeat anyway).
+    // SHUTDOWN-ACK-SENT is the exception the RFC makes (§9.2): the association
+    // is all but gone, and a restart is not set up over it.
     if (state === STATE_ESTABLISHED ||
         state === STATE_SHUTDOWN_PENDING ||
         state === STATE_SHUTDOWN_SENT ||
-        state === STATE_SHUTDOWN_RECEIVED ||
-        state === STATE_SHUTDOWN_ACK_SENT) {
+        state === STATE_SHUTDOWN_RECEIVED) {
+      var newTag = randomTag();
+      var newTsn = crypto.randomBytes(4).readUInt32BE(0);
+      sendInitAck(initiateTag, newTag, newTsn,
+                  makeCookie(initiateTag, newTag, newTsn, initialTsn, aRwnd, numOutbound, numInbound,
+                             remoteVerificationTag, localVerificationTag, extMask));
+      return;
+    }
+    if (state === STATE_SHUTDOWN_ACK_SENT) {
       try { ev.emit('protocolViolation', { code: 'init-in-established', state: state }); } catch (e) {}
-      // Per §5.2.2 we should reply with INIT-ACK reflecting our existing
-      // verification tags. For now we drop — peer's likely confused or
-      // malicious; let our heartbeat / RTO machinery surface a real
-      // path failure if peer actually restarted.
       return;
     }
 
+    // CLOSED, or a handshake of our own under way (both sides initiate, RFC
+    // 8841): answer with our tag, as before.
     remoteVerificationTag = initiateTag;
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
@@ -1007,36 +1108,61 @@ function SctpAssociation(config) {
 
     // SCTP-6: detect PR-SCTP support. Params start after the fixed 16-byte
     // INIT prefix.
-    detectSupportedExtensions(data.subarray(16));
+    applyExtensionsMask(extMask);
 
-    // Build cookie — contains association state, signed.
-    //
-    // SCTP-11: layout includes an embedded timestamp (epoch seconds) at
-    // bytes 28-31, used by handleCookieEcho to enforce cookie lifetime
-    // per RFC 4960 §5.1.5. Without this, a captured COOKIE-ECHO can be
-    // replayed indefinitely. The timestamp is inside the HMAC, so an
-    // attacker can't forward-date a captured cookie.
-    var cookieData = Buffer.alloc(32);
-    cookieData.writeUInt32BE(initiateTag, 0);
-    cookieData.writeUInt32BE(localVerificationTag, 4);
-    cookieData.writeUInt32BE(localTsn, 8);
-    cookieData.writeUInt32BE(initialTsn, 12);
+    sendInitAck(initiateTag, localVerificationTag, localTsn,
+                makeCookie(initiateTag, localVerificationTag, localTsn, initialTsn, aRwnd, numOutbound, numInbound,
+                           0, 0, extMask));
+  }
+
+  // A Verification Tag: random, never zero (RFC 4960 §5.3.1).
+  function randomTag() {
+    var t;
+    do { t = crypto.randomBytes(4).readUInt32BE(0); } while (t === 0);
+    return t;
+  }
+
+  // State Cookie — everything the association needs, signed, so that it
+  // keeps no state for an INIT until the COOKIE ECHO proves the peer is real.
+  //
+  //   0 peer's tag      4 our tag         8 our first TSN   12 peer's first TSN
+  //  16 peer's a_rwnd  20 streams out/in  24 local port     28 time (epoch s)
+  //  32 Peer's-Tie-Tag 36 Local-Tie-Tag   40 peer's extensions (bit mask), 3 pad
+  //  44 HMAC-SHA256 of bytes 0-43
+  //
+  // The timestamp is inside the HMAC (SCTP-11: lifetime check against replay).
+  // The Tie-Tags are the tags in force when an INIT arrived for a running
+  // association (§5.2.2), zero otherwise. The extensions are carried because
+  // the association that accepts the cookie may not be the one that saw the
+  // INIT — after a restart it is a new one (see 'restart').
+  function makeCookie(peerTag, myTag, myTsn, peerTsn, aRwnd, numOutbound, numInbound,
+                      peerTieTag, localTieTag, extMask) {
+    var cookieData = Buffer.alloc(COOKIE_DATA_LEN);
+    cookieData.writeUInt32BE(peerTag, 0);
+    cookieData.writeUInt32BE(myTag, 4);
+    cookieData.writeUInt32BE(myTsn, 8);
+    cookieData.writeUInt32BE(peerTsn, 12);
     cookieData.writeUInt32BE(aRwnd, 16);
     cookieData.writeUInt16BE(numOutbound, 20);
     cookieData.writeUInt16BE(numInbound, 22);
     cookieData.writeUInt32BE(localPort, 24);
     cookieData.writeUInt32BE(Math.floor(Date.now() / 1000), 28);
+    cookieData.writeUInt32BE(peerTieTag >>> 0, 32);
+    cookieData.writeUInt32BE(localTieTag >>> 0, 36);
+    cookieData[40] = extMask & 0xFF;
 
     var mac = crypto.createHmac('sha256', cookieSecret).update(cookieData).digest();
-    var cookie = Buffer.concat([cookieData, mac]);
+    return Buffer.concat([cookieData, mac]);
+  }
 
+  function sendInitAck(peerTag, myTag, myTsn, cookie) {
     // Send INIT-ACK
     var initAckBody = Buffer.alloc(20 + 4 + cookie.length);
-    initAckBody.writeUInt32BE(localVerificationTag, 0);
+    initAckBody.writeUInt32BE(myTag, 0);
     initAckBody.writeUInt32BE(maxReceiveBufferSize, 4);
     initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
     initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
-    initAckBody.writeUInt32BE(localTsn, 12);
+    initAckBody.writeUInt32BE(myTsn, 12);
 
     // Supported Extensions parameter (RFC 5061 §4.2.7).
     // Format: type(2) + length(2) + chunk-type-bytes(N).
@@ -1060,7 +1186,7 @@ function SctpAssociation(config) {
     padded.writeUInt16BE(4 + cookie.length, cookieParamOff + 2);
     cookie.copy(padded, cookieParamOff + 4);
 
-    sendChunk(CHUNK_INIT_ACK, 0, padded, initiateTag);
+    sendChunk(CHUNK_INIT_ACK, 0, padded, peerTag);
   }
 
 
@@ -1085,7 +1211,14 @@ function SctpAssociation(config) {
     var cookie = extractParam(data.subarray(16), PARAM_STATE_COOKIE);
     if (cookie) {
       state = STATE_COOKIE_ECHOED;
-      sendChunk(CHUNK_COOKIE_ECHO, 0, Buffer.from(cookie), remoteVerificationTag);
+      var cookieCopy = Buffer.from(cookie);
+      sendChunk(CHUNK_COOKIE_ECHO, 0, cookieCopy, remoteVerificationTag);
+      // T1-cookie (RFC 4960 §5.1 C): resend until the COOKIE-ACK arrives.
+      armT1(function () {
+        if (state !== STATE_COOKIE_ECHOED) return false;
+        sendChunk(CHUNK_COOKIE_ECHO, 0, cookieCopy, remoteVerificationTag);
+        return true;
+      });
     }
   }
 
@@ -1093,13 +1226,13 @@ function SctpAssociation(config) {
   /* ── COOKIE-ECHO ── */
 
   function handleCookieEcho(data) {
-    if (data.length < 64) {                                  // 32 cookie + 32 mac
+    if (data.length < COOKIE_DATA_LEN + COOKIE_MAC_LEN) {
       try { ev.emit('protocolViolation', { code: 'cookie-too-short', length: data.length }); } catch (e) {}
       return;
     }
 
-    var cookieData = data.subarray(0, 32);
-    var cookieMac  = data.subarray(32, 64);
+    var cookieData = data.subarray(0, COOKIE_DATA_LEN);
+    var cookieMac  = data.subarray(COOKIE_DATA_LEN, COOKIE_DATA_LEN + COOKIE_MAC_LEN);
 
     // Verify MAC. timingSafeEqual prevents timing-based key recovery.
     var expectedMac = crypto.createHmac('sha256', cookieSecret).update(cookieData).digest();
@@ -1119,6 +1252,54 @@ function SctpAssociation(config) {
       return;
     }
 
+    // RFC 4960 §5.1.5 step 2: the packet's Verification Tag must be the tag
+    // the cookie gave the peer to use (our Initiate Tag in that INIT ACK).
+    if (cookieData.readUInt32BE(4) !== pktVtag) {
+      try { ev.emit('protocolViolation', { code: 'cookie-vtag-mismatch' }); } catch (e) {}
+      return;
+    }
+
+    // Already past the handshake (RFC 4960 §5.2.4): a COOKIE-ECHO now is a
+    // duplicate or a late one — both sides initiate (RFC 8841), and a
+    // delayed or reordered COOKIE-ECHO routinely lands after the
+    // association came up through the other path. If it belongs to THIS
+    // association (same tags, case D), the peer just needs its COOKIE-ACK
+    // again. Restoring state from it, as before, rewound localTsn to the
+    // value frozen in the cookie: everything sent next reused TSNs the peer
+    // already had, was discarded as duplicate, acknowledged — and lost.
+    //
+    // The tags decide (§5.2.4, the table there):
+    //   D  both match                       — a duplicate: COOKIE ACK again.
+    //   A  neither matches, the Tie-Tags do — the peer restarted: a new
+    //      association takes over (see handlePacket and 'restart'). Not in
+    //      SHUTDOWN-ACK-SENT (§9.2): no restart over an association ending.
+    //   B  ours matches, the peer's not     — the peer's tag is updated, the
+    //      association stays (an INIT collision settled late).
+    //   C  and the rest                     — silently discarded.
+    if (state !== STATE_CLOSED && state !== STATE_COOKIE_WAIT && state !== STATE_COOKIE_ECHOED) {
+      var cPeerTag  = cookieData.readUInt32BE(0);
+      var cLocalTag = cookieData.readUInt32BE(4);
+      var cPeerTie  = cookieData.readUInt32BE(32);
+      var cLocalTie = cookieData.readUInt32BE(36);
+      if (cPeerTag === remoteVerificationTag && cLocalTag === localVerificationTag) {
+        sendChunk(CHUNK_COOKIE_ACK, 0, Buffer.alloc(0), remoteVerificationTag);
+      } else if (cPeerTag !== remoteVerificationTag && cLocalTag !== localVerificationTag &&
+                 cPeerTie === remoteVerificationTag && cLocalTie === localVerificationTag) {
+        if (state === STATE_SHUTDOWN_ACK_SENT) {
+          try { ev.emit('protocolViolation', { code: 'cookie-echo-while-shutting-down' }); } catch (e) {}
+        } else {
+          restartPacket = Buffer.from(curPacket);
+        }
+      } else if (cLocalTag === localVerificationTag) {
+        remoteVerificationTag = cPeerTag;
+        clearT1Timer();
+        sendChunk(CHUNK_COOKIE_ACK, 0, Buffer.alloc(0), remoteVerificationTag);
+      } else {
+        try { ev.emit('protocolViolation', { code: 'cookie-echo-in-established', state: STATE_NAMES[state] }); } catch (e) {}
+      }
+      return;
+    }
+
     // Restore state from cookie
     remoteVerificationTag = cookieData.readUInt32BE(0);
     localVerificationTag  = cookieData.readUInt32BE(4);
@@ -1126,11 +1307,16 @@ function SctpAssociation(config) {
     remoteTsn             = cookieData.readUInt32BE(12);
     lastCumulativeTsn     = (remoteTsn - 1) >>> 0;
     remoteRwnd = cookieData.readUInt32BE(16); ssthresh = remoteRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
+    // The peer's extensions, from the cookie: the association taking over a
+    // restart never saw the INIT they came in (for the one that did, this
+    // repeats what handleInit recorded).
+    applyExtensionsMask(cookieData[40]);
 
     // Send COOKIE-ACK
     sendChunk(CHUNK_COOKIE_ACK, 0, Buffer.alloc(0), remoteVerificationTag);
 
-    // Association established
+    // Association established (our own INIT / COOKIE-ECHO, if any, is done)
+    clearT1Timer();
     state = STATE_ESTABLISHED;
     onEstablished();
     ev.emit('open');
@@ -1141,6 +1327,7 @@ function SctpAssociation(config) {
 
   function handleCookieAck() {
     if (state !== STATE_COOKIE_ECHOED) return;
+    clearT1Timer();
     state = STATE_ESTABLISHED;
     onEstablished();
     ev.emit('open');
@@ -1270,8 +1457,8 @@ function SctpAssociation(config) {
     // Stash this fragment in the per-stream fragment store. We don't try
     // to assemble in arrival order any more — fragments may arrive
     // reordered, and assembling-on-arrival was bug N3 (it produced
-    // mangled bytes when MIDDLE arrived before BEGIN). tryAssemble walks
-    // the store in TSN order looking for a complete BEGIN→END chain.
+    // mangled bytes when MIDDLE arrived before BEGIN). assembleClassic /
+    // assembleInterleaved look for the complete BEGIN→END chain.
     //
     // SCTP-11 N4: per-stream fragment-store cap. Without it a malicious
     // peer could open a stream and send unlimited BEGIN-only fragments
@@ -1281,12 +1468,28 @@ function SctpAssociation(config) {
     // hits. We cap each stream at MAX_FRAGS_PER_STREAM entries; once
     // exceeded we drop the OLDEST entry (lowest TSN) and the now-orphaned
     // fragment becomes unrecoverable, but the association keeps running.
+    // A whole message in one chunk (BEGIN+END) — the common case for
+    // messaging. It completes nothing else (a chain cannot run through a
+    // BEGIN), so it goes straight to delivery instead of through the store.
+    // Its bytes are still copied: the message handed up must own its memory
+    // (applications transfer msg.buffer to other threads).
+    if (isBegin && isEnd) {
+      deliverAssembled(streamId, {
+        ssn: ssn, ppid: ppid, unordered: isUnordered,
+        payload: Buffer.from(payload),
+        wide: (typeof iMid === 'number'),
+      });
+      return;
+    }
+
     if (!fragStore[streamId]) fragStore[streamId] = new Map();
     var streamFrags = fragStore[streamId];
     if (streamFrags.size >= MAX_FRAGS_PER_STREAM) {
       // Drop oldest. Map preserves insertion order; first key is oldest.
       var oldestKey = streamFrags.keys().next().value;
+      var oldestFrag = streamFrags.get(oldestKey);
       streamFrags.delete(oldestKey);
+      if (oldestFrag && oldestFrag.mid != null) hintForget(streamId, oldestFrag.mid, oldestFrag.isUnordered, oldestFrag.fsn);
       try { ev.emit('protocolViolation', { code: 'fragstore-overflow', streamId: streamId }); } catch (e) {}
     }
     streamFrags.set(tsn, {
@@ -1301,15 +1504,38 @@ function SctpAssociation(config) {
       fsn: (typeof iFsn === 'number') ? iFsn : null,
     });
 
-    // Try to extract any complete messages that are now assemblable.
-    // One DATA chunk's arrival can complete one or more messages
-    // (e.g., the long-awaited BEGIN of one message + a previously
-    // already-assembled-but-pending one). Loop until exhausted.
-    while (true) {
-      var msg = tryAssemble(streamId);
-      if (!msg) break;
-      deliverAssembled(streamId, msg);
+    // Only the message this fragment belongs to can have become complete:
+    // every other complete chain was assembled when its own last fragment
+    // arrived.
+    var msg;
+    if (typeof iMid === 'number') {
+      var hk = isUnordered ? iMid + 4294967296 : iMid;
+      var hints = iDataHint[streamId] || (iDataHint[streamId] = new Map());
+      var h = hints.get(hk);
+      if (!h) { h = { have: new Map(), end: -1 }; hints.set(hk, h); }
+      h.have.set(iFsn, (h.have.get(iFsn) || 0) + 1);   // count: a peer may repeat an fsn
+      if (isEnd) h.end = iFsn;
+      if (h.end < 0 || h.have.size < h.end + 1) return;   // cannot be complete yet
+      msg = assembleInterleaved(streamId, iMid, isUnordered);
+      if (msg) { hints.delete(hk); if (hints.size === 0) delete iDataHint[streamId]; }
+    } else {
+      msg = assembleClassic(streamId, tsn);
     }
+    if (msg) deliverAssembled(streamId, msg);
+  }
+
+  // Remove one fragment from the I-DATA hint (it left fragStore).
+  function hintForget(streamId, mid, unordered, fsn) {
+    var hints = iDataHint[streamId];
+    if (!hints) return;
+    var hk = unordered ? mid + 4294967296 : mid;
+    var h = hints.get(hk);
+    if (!h) return;
+    var n = h.have.get(fsn);
+    if (n > 1) h.have.set(fsn, n - 1);
+    else h.have.delete(fsn);
+    if (h.have.size === 0) hints.delete(hk);
+    if (hints.size === 0) delete iDataHint[streamId];
   }
 
 
@@ -1332,6 +1558,153 @@ function SctpAssociation(config) {
    *      transition to SHUTDOWN_SENT. (The drain-before-shutdown step
    *      that SCTP-12 deferred until SCTP-1's queue existed.)
    */
+  /* ── Gap-acked chunks leave the flight ──
+   *
+   * A chunk the peer reports in a gap block has arrived; it stays queued
+   * (the peer may still renege, and only the cumulative ack releases it),
+   * but it no longer occupies the window. Counting it — as this code did —
+   * froze the window behind any lost chunk: everything sent after the hole
+   * was received and gap-acked, yet still "outstanding", so nothing new
+   * could go out; with nothing new going out the peer sent no more SACKs,
+   * the hole never collected the three missing reports that fast
+   * retransmit (or, with maxRetransmits:0, abandonment) needs, and the
+   * association waited for T3. Measured on an unreliable channel at 2%
+   * loss: a third of all losses waited out a full RTO. Linux and FreeBSD
+   * take gap-acked bytes off the flight the same way.
+   *
+   * Done by difference, not by walking the window each SACK: gapCoverage
+   * keeps the blocks of the previous SACK (absolute TSNs, merged, above its
+   * cumTsn); a SACK visits only the TSNs that became covered (mark) or
+   * stopped being covered (a renege: back into the flight). Only chunks in
+   * flight are marked — a chunk sent again later is unmarked when sent.
+   */
+  var gapCoverage = [];   // [[startTsn, endTsn], ...] covered by the last SACK's gap blocks
+
+  function updateGapCoverage(cumTsn, gaps) {
+    // This SACK's coverage, as offsets from cumTsn: valid blocks only,
+    // merged. A block that cannot be read that way (reversed, or below
+    // cumTsn) covers nothing here.
+    var cov = [];
+    for (var i = 0; i < gaps.length; i++) {
+      var so = ((gaps[i].start - cumTsn) >>> 0), eo = ((gaps[i].end - cumTsn) >>> 0);
+      if (so === 0 || so >= 0x80000000 || eo >= 0x80000000 || so > eo) continue;
+      cov.push([so, eo]);
+    }
+    if (cov.length > 1) cov.sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    for (var m = 0; m < cov.length; m++) {
+      var last = merged[merged.length - 1];
+      if (last && cov[m][0] <= last[1] + 1) { if (cov[m][1] > last[1]) last[1] = cov[m][1]; }
+      else merged.push([cov[m][0], cov[m][1]]);
+    }
+    // The previous coverage in the same offsets; what is at or below cumTsn
+    // now has been cum-acked and left the queue.
+    var prev = [];
+    for (var p = 0; p < gapCoverage.length; p++) {
+      var ps = ((gapCoverage[p][0] - cumTsn) >>> 0), pe = ((gapCoverage[p][1] - cumTsn) >>> 0);
+      if (pe >= 0x80000000 || pe === 0) continue;          // wholly at/below cumTsn
+      if (ps >= 0x80000000 || ps === 0) ps = 1;            // straddles it
+      prev.push([ps, pe]);
+    }
+    eachDifference(merged, prev, function (lo, hi) { markGapAcked(lo, hi, cumTsn, true); });
+    eachDifference(prev, merged, function (lo, hi) { markGapAcked(lo, hi, cumTsn, false); });
+    gapCoverage = [];
+    for (var g = 0; g < merged.length; g++) {
+      gapCoverage.push([(cumTsn + merged[g][0]) >>> 0, (cumTsn + merged[g][1]) >>> 0]);
+    }
+  }
+
+  // fn(lo, hi) for every run of offsets in a but not in b (both sorted,
+  // merged lists of inclusive [lo, hi]).
+  function eachDifference(a, b, fn) {
+    var j = 0;
+    for (var i = 0; i < a.length; i++) {
+      var lo = a[i][0], hi = a[i][1];
+      while (j < b.length && b[j][1] < lo) j++;
+      var k = j;
+      while (lo <= hi) {
+        if (k >= b.length || b[k][0] > hi) { fn(lo, hi); break; }
+        if (b[k][0] > lo) fn(lo, b[k][0] - 1);
+        lo = b[k][1] + 1;
+        k++;
+      }
+    }
+  }
+
+  // Mark (or unmark, on a renege) the in-flight chunks at offsets [lo, hi].
+  function markGapAcked(lo, hi, cumTsn, acked) {
+    var a = 0, b = sendQueue.length;
+    while (a < b) {
+      var mid = (a + b) >> 1;
+      if (((sendQueue[mid].tsn - cumTsn) >>> 0) < lo) a = mid + 1; else b = mid;
+    }
+    for (var k = a; k < sendQueue.length; k++) {
+      var e = sendQueue[k];
+      if (((e.tsn - cumTsn) >>> 0) > hi) break;
+      if (!e.inFlight || !!e.gapAcked === acked) continue;
+      e.gapAcked = acked;
+      outstandingBytes += acked ? -e.payloadLen : e.payloadLen;
+    }
+  }
+
+  // A chunk the peer reported missing: count the report; the LOWEST chunk
+  // to reach the threshold in this SACK is the one fast-retransmitted.
+  // Only a chunk actually in flight can be reported missing. One released
+  // by T3 is already waiting to be resent by transmitPending; fast-
+  // retransmitting it as well sent it twice and counted two retransmissions
+  // (and cut cwnd) for one.
+  //
+  // A chunk at the threshold that may not be resent (PR-SCTP budget spent —
+  // with maxRetransmits:0, every chunk) is not a retransmission: its message
+  // is abandoned. All of those in this SACK go together (sackAbandon), not
+  // only the lowest — abandoning costs no bandwidth and does not touch cwnd,
+  // and one per SACK left the rest waiting for later SACKs, which after a
+  // burst never come (then T3, an RTO per message).
+  var sackAbandon = null;   // messageSeqs to abandon after this SACK's walk; null outside one
+  var sackNow = 0;
+  function markMissing(k, fastIdx) {
+    var entry = sendQueue[k];
+    if (!entry.inFlight) return fastIdx;
+    entry.missingReports++;
+    if (entry.missingReports >= fastRetransmitThreshold) {
+      if (sackAbandon !== null && shouldAbandon(entry, sackNow)) {
+        sackAbandon.add(entry.messageSeq);
+        return fastIdx;
+      }
+      if (fastIdx === -1) return k;
+    }
+    return fastIdx;
+  }
+
+  // Every queued chunk whose offset from cumTsn is in [lo, hi] — found by
+  // binary search (the queue is in ascending TSN order), then walked.
+  function markMissingRange(lo, hi, cumTsn, fastIdx) {
+    if (lo > hi) return fastIdx;
+    var a = 0, b = sendQueue.length;
+    while (a < b) {
+      var mid = (a + b) >> 1;
+      if (((sendQueue[mid].tsn - cumTsn) >>> 0) < lo) a = mid + 1; else b = mid;
+    }
+    for (var k = a; k < sendQueue.length && ((sendQueue[k].tsn - cumTsn) >>> 0) <= hi; k++) {
+      fastIdx = markMissing(k, fastIdx);
+    }
+    return fastIdx;
+  }
+
+  // The walk of the whole queue against the gap blocks (sorted by start).
+  function markMissingScan(gaps, highestAckedTsn) {
+    var fastIdx = -1;
+    var gp = 0;
+    for (var k = 0; k < sendQueue.length; k++) {
+      var entry = sendQueue[k];
+      if (!tsnLeq(entry.tsn, highestAckedTsn)) break;
+      while (gp < gaps.length && tsnLt(gaps[gp].end, entry.tsn)) gp++;
+      var inGap = gp < gaps.length && tsnLeq(gaps[gp].start, entry.tsn);
+      if (!inGap) fastIdx = markMissing(k, fastIdx);
+    }
+    return fastIdx;
+  }
+
   function handleSack(data) {
     if (data.length < 12) return;
     var cumTsn       = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
@@ -1379,6 +1752,9 @@ function SctpAssociation(config) {
      * measured against the highest TSN the peer has reported receiving by
      * ANY means, cumulative or gap-acked.
      */
+    // What the peer had reported receiving before this SACK — see the RTT
+    // sample below.
+    var peerHighestBefore = peerHighestSeen;
     var peerHighestThisSack = cumTsn;
     for (var pg = 0; pg < gaps.length; pg++) {
       if (tsnGt(gaps[pg].end, peerHighestThisSack)) peerHighestThisSack = gaps[pg].end;
@@ -1408,7 +1784,16 @@ function SctpAssociation(config) {
     while (dropCount < sendQueue.length && tsnLeq(sendQueue[dropCount].tsn, cumTsn)) {
       var acked = sendQueue[dropCount];
       ackedSomething = true;
-      if (acked.retransmits === 0) {
+      // Karn's algorithm skips retransmitted chunks. A chunk the peer had
+      // already reported in an earlier SACK is skipped too: it was received
+      // back then (gap-acked behind a hole) and is only cum-acked now that
+      // the hole closed — `now - sentAt` would be the time it sat behind the
+      // hole, not a round trip. Sampled, those inflated the RTO to tens of
+      // seconds under loss, and every following tail loss waited out that
+      // RTO. Only chunks the peer reports for the first time in THIS SACK
+      // (above the highest it had reported before) give a real sample.
+      if (acked.retransmits === 0 &&
+          (peerHighestBefore === null || tsnGt(acked.tsn, peerHighestBefore))) {
         updateRtt(now - acked.sentAt);
       }
       // SCTP-9: track bytesAcked BEFORE chunkRemoved decrements outstandingBytes,
@@ -1419,6 +1804,10 @@ function SctpAssociation(config) {
       dropCount++;
     }
     if (dropCount > 0) sendQueue.splice(0, dropCount);
+
+    // Chunks the peer reports in a gap block leave the flight (see
+    // updateGapCoverage) — so a hole does not freeze the window.
+    updateGapCoverage(cumTsn, gaps);
 
     // SCTP-9: cum-ack progressed → loss event recovered. Allow another
     // fast-retransmit halving on the next loss.
@@ -1457,10 +1846,10 @@ function SctpAssociation(config) {
     // entries after this drain — the only reason they're sitting there
     // is the cwnd/rwnd budget. If the queue is empty (or all inFlight),
     // the user isn't pushing — don't reward them with extra cwnd.
-    var hasPending = false;
-    for (var pi = 0; pi < sendQueue.length; pi++) {
-      if (!sendQueue[pi].inFlight) { hasPending = true; break; }
-    }
+    // Some chunk not in flight ⇔ fewer in flight than queued — the count
+    // transmitPending keeps and tests the same way ("nothing pending" is
+    // inFlightCount === sendQueue.length). It walked the queue to find one.
+    var hasPending = inFlightCount < sendQueue.length;
     if (bytesAcked > 0 && hasPending) {
       var mtu = pmtu;
       if (cwnd < ssthresh) {
@@ -1484,7 +1873,7 @@ function SctpAssociation(config) {
     // multiple fragments of one message all share the same messageSeq.
     // Mutating during iteration is unsafe — collect first, abandon after.
     var toAbandon = null;
-    for (var lk = 0; lk < sendQueue.length; lk++) {
+    for (var lk = 0; lifetimeEverUsed && lk < sendQueue.length; lk++) {
       var le = sendQueue[lk];
       if (le.maxLifetime != null && (now - le.firstSentAt) >= le.maxLifetime &&
           peerSupportsForwardTsn) {
@@ -1493,7 +1882,7 @@ function SctpAssociation(config) {
       }
     }
     if (toAbandon !== null) {
-      toAbandon.forEach(abandonMessage);
+      abandonMessages(toAbandon);
     }
 
     // Gap-ack handling: mark chunks below the highest-acked TSN that
@@ -1502,50 +1891,89 @@ function SctpAssociation(config) {
     if (sendQueue.length > 0 && gaps.length > 0) {
       var highestAckedTsn = gaps[gaps.length - 1].end;
       var fastRetransmitIdx = -1;
+      sackAbandon = new Set();
+      sackNow = now;
 
-      for (var k = 0; k < sendQueue.length; k++) {
-        var entry = sendQueue[k];
-        // Only chunks below the last gap-acked TSN are "passed over" —
-        // chunks above it haven't been seen-as-missing by the peer yet,
-        // so they don't count as gap-reported.
-        if (!tsnLeq(entry.tsn, highestAckedTsn)) break;
-
-        // Is this TSN inside any gap block (i.e., the peer DID receive it)?
-        var inGap = false;
-        for (var gi = 0; gi < gaps.length; gi++) {
-          if (tsnLeq(gaps[gi].start, entry.tsn) &&
-              tsnLeq(entry.tsn, gaps[gi].end)) {
-            inGap = true;
-            break;
+      // sendQueue and the gap blocks are both in ascending TSN order, so one
+      // pointer into the gaps suffices (was a scan of every gap per chunk).
+      // Gap blocks come off the wire; peers send them sorted, but the single
+      // pointer below needs that, so make sure (cheap: usually already so).
+      for (var gs = 1; gs < gaps.length; gs++) {
+        if (tsnLt(gaps[gs].start, gaps[gs - 1].start)) {
+          gaps = gaps.slice().sort(function (x, y) { return tsnLt(x.start, y.start) ? -1 : (x.start === y.start ? 0 : 1); });
+          for (var gh = 0; gh < gaps.length; gh++) {
+            if (tsnGt(gaps[gh].end, highestAckedTsn)) highestAckedTsn = gaps[gh].end;
           }
+          break;
         }
-
-        if (!inGap) {
-          // Peer is missing this TSN despite acking higher ones.
-          entry.missingReports++;
-          if (entry.missingReports >= fastRetransmitThreshold &&
-              fastRetransmitIdx === -1) {
-            fastRetransmitIdx = k;
+      }
+      // Only chunks below the last gap-acked TSN are "passed over" —
+      // chunks above it haven't been seen-as-missing by the peer yet, so
+      // they don't count as gap-reported. Of those, only the ones in the
+      // HOLES between the gap blocks are missing; the ones inside a block
+      // were received.
+      //
+      // Walk the holes, not the queue. Visiting every queued chunk below
+      // the highest acked TSN and testing it against the blocks made each
+      // SACK cost the whole outstanding window — under loss with a large
+      // cwnd that is thousands of chunks per SACK, a SACK every packet or
+      // two (tsnGt/tsnLeq were 11% of the thread). The holes are usually a
+      // few TSNs: each is found in the queue by binary search, so a SACK
+      // costs the chunks actually missing, not the window.
+      //
+      // Positions are offsets from cumTsn — every queued TSN is above it
+      // (the cum-acked prefix was just dropped) and within 2^31 of it, so
+      // plain integer order is TSN order. Same chunks counted, in the same
+      // order, as the walk of the queue; markMissingScan below is that walk,
+      // kept for a queue whose head is not above cumTsn.
+      // A block that cannot be compared by offset — reversed, or reaching
+      // below cumTsn — is never sent by a sane peer; then (and for a queue
+      // whose head is not above cumTsn) take the walk, which handles anything.
+      var byHoles = true;
+      var qHeadOff = ((sendQueue[0].tsn - cumTsn) >>> 0);
+      var hOff = ((highestAckedTsn - cumTsn) >>> 0);
+      if (qHeadOff === 0 || qHeadOff >= 0x80000000 || hOff >= 0x80000000) byHoles = false;
+      for (var gc = 0; byHoles && gc < gaps.length; gc++) {
+        var cs = ((gaps[gc].start - cumTsn) >>> 0), ce = ((gaps[gc].end - cumTsn) >>> 0);
+        if (cs >= 0x80000000 || ce >= 0x80000000 || cs > ce) byHoles = false;
+      }
+      if (!byHoles) {
+        fastRetransmitIdx = markMissingScan(gaps, highestAckedTsn);
+      } else {
+        var pos = 1;                                // first offset not yet known covered
+        for (var gi = 0; gi < gaps.length && pos <= hOff; gi++) {
+          var gsOff = ((gaps[gi].start - cumTsn) >>> 0);
+          var geOff = ((gaps[gi].end - cumTsn) >>> 0);
+          if (gsOff > pos) {
+            fastRetransmitIdx = markMissingRange(pos, Math.min(gsOff - 1, hOff), cumTsn, fastRetransmitIdx);
           }
+          if (geOff + 1 > pos) pos = geOff + 1;
+        }
+        if (pos <= hOff) {
+          fastRetransmitIdx = markMissingRange(pos, hOff, cumTsn, fastRetransmitIdx);
         }
       }
 
-      if (fastRetransmitIdx !== -1) {
-        var fr = sendQueue[fastRetransmitIdx];
-        // SCTP-6: abandon-before-retransmit. The retransmit budget check
-        // is `>=` evaluated BEFORE the increment, so retransmits=N with
-        // maxRetransmits=N means "next retransmit would be N+1 = over
-        // budget". Abandon instead.
-        if (shouldAbandon(fr, now)) {
-          abandonMessage(fr.messageSeq);
-        } else {
+      var toDrop = sackAbandon;
+      sackAbandon = null;
+      var fr = fastRetransmitIdx !== -1 ? sendQueue[fastRetransmitIdx] : null;
+      // SCTP-6: abandon-before-retransmit — see markMissing. The budget
+      // check is `>=` evaluated BEFORE the increment, so retransmits=N with
+      // maxRetransmits=N means "next retransmit would be N+1 = over budget".
+      if (toDrop.size > 0) abandonMessages(toDrop);
+      // The chunk picked for retransmit may belong to a message just
+      // abandoned (another fragment of it ran out of budget).
+      if (fr !== null && fr.abandoned) fr = null;
+
+      if (fr !== null) {
+        {
           fr.retransmits++;
           fr.missingReports = 0;
           fr.sentAt = now;
           // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
           // no CRC recomputation. Packet bytes are byte-identical to the
           // original send (vtag, ports, TSN, payload all unchanged).
-          _sctpDiagPacket(fr.packet, 'retransmit');
+          _sctpDiagPacket(soloPacket(fr), 'retransmit');
           ev.emit('packet', fr.packet);
           sctpStats.fastRetransmits++;
           sctpStats.chunksRetransmitted++;
@@ -1600,18 +2028,32 @@ function SctpAssociation(config) {
     // is free for fully-reliable workloads.
     if (peerSupportsForwardTsn && sctpStats.chunksAbandoned > 0) {
       // Peer's cumTsn from this SACK is the snapshot we want to compare against.
-      var advPt;
-      if (sendQueue.length === 0) {
-        advPt = (localTsn - 1) >>> 0;
-      } else {
-        advPt = (sendQueue[0].tsn - 1) >>> 0;
-      }
-      if (tsnGt(advPt, cumTsn)) {
+      var advPt = advancedPeerAckPoint();
+      // Only when the peer's cumulative TSN sits at an abandoned TSN (the
+      // next one is in neither the queue nor its ack): if it is a chunk
+      // still queued, the peer simply has not reported it yet, and ordinary
+      // SACKs will — a FORWARD-TSN there (and the SACK it draws) is waste.
+      var peerAtHole = sendQueue.length === 0 || sendQueue[0].tsn !== ((cumTsn + 1) >>> 0);
+      if (peerAtHole && tsnGt(advPt, cumTsn)) {
         // Peer is behind. Force a re-send by clearing the dedup cache;
         // sendForwardTsn updates lastForwardTsnSent.
+        //
+        // Not on every SACK: only once the last FORWARD-TSN has reached the
+        // peer — this SACK acks its point — or has had time to (a round
+        // trip; two for the same point again — then it was lost). Every SACK the peer sent before the FORWARD-TSN
+        // reached it is "behind" too — a whole window's worth — and
+        // answering each sent one FORWARD-TSN per SACK; the peer answers a
+        // FORWARD-TSN with a SACK (RFC 3758 §3.6), so it fed itself.
+        // Measured on an unreliable channel at 2% loss: 161,090
+        // I-FORWARD-TSN packets for 20,000 messages. A newer point found
+        // meanwhile goes in the next one; abandoning a message sends one
+        // at once anyway (maybeFwdTsn).
+        var fwdRtt = srtt !== null ? srtt : rto;
         if (lastForwardTsnSent === undefined ||
-            tsnGt(advPt, lastForwardTsnSent) ||
-            advPt === lastForwardTsnSent /* identical: peer didn't get prior */) {
+            (tsnGt(advPt, lastForwardTsnSent) &&
+             (!tsnLt(cumTsn, lastForwardTsnSent) || now - lastForwardTsnSentAt >= fwdRtt)) ||
+            (advPt === lastForwardTsnSent /* identical: peer didn't get prior */ &&
+             now - lastForwardTsnSentAt >= 2 * fwdRtt)) {
           sendForwardTsn(advPt);
         }
       }
@@ -1949,9 +2391,8 @@ function SctpAssociation(config) {
   // a brand-new association (pre-handshake). Using the state would
   // cause the "close before handshake" path to silently skip the
   // 'close' event, which broke a test in the first run.
-  function finalizeClose() {
-    if (closed) return;   // idempotent
-    closed = true;
+  // Stop: nothing sent, no timer left. Shared by finalizeClose and destroy.
+  function stopAll() {
     // SCTP-14: drop any half-enqueued messages. The pump is unref'd and
     // guards on state, but clearing here means no work is even attempted.
     txJobs.length = 0;
@@ -1961,6 +2402,7 @@ function SctpAssociation(config) {
     // ev.emit('packet', ...) with stale verification tags or trying to
     // run logic on a torn-down state.
     clearT3Timer();
+    clearT1Timer();
     clearHeartbeatTimer();
     // SCTP-2: cancel any in-flight delayed SACK — peer won't get one,
     // but we're closing anyway. Without this, the timer fires post-close
@@ -1970,10 +2412,29 @@ function SctpAssociation(config) {
       delayedSackTimer = null;
     }
     state = STATE_CLOSED;
+  }
+
+  function finalizeClose() {
+    if (closed) return;   // idempotent
+    closed = true;
+    stopAll();
     ev.emit('close');
     // Defer removeAllListeners so synchronous 'close' listeners
     // attached after construction can run. (ev.emit is synchronous;
     // listeners fire before this line.)
+    ev.removeAllListeners();
+  }
+
+  // Gone without a word: no SHUTDOWN, no ABORT, no 'close'. For an owner
+  // that has already replaced this association — after the peer restarted
+  // ('restart') the peer no longer knows it, and anything it sent would be
+  // addressed to an association that does not exist.
+  function destroy() {
+    if (closed) return;
+    closed = true;
+    stopAll();
+    pendingOutChunks.length = 0;
+    restartPacket = null;
     ev.removeAllListeners();
   }
 
@@ -2008,7 +2469,7 @@ function SctpAssociation(config) {
   function handleIForwardTsn(data) {
     if (data.length < 4) return;
     var newCumTsn = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
-    if (!tsnGt(newCumTsn, lastCumulativeTsn)) return;
+    if (!tsnGt(newCumTsn, lastCumulativeTsn)) { sackForForwardTsn(true); return; }
     /* CRITICAL DIFFERENCE from handleForwardTsn: NO blanket sweep of the
      * (oldCum, newCum] TSN window. Under classic DATA a message occupies one
      * contiguous TSN run, so every fragment inside an abandoned window
@@ -2041,6 +2502,21 @@ function SctpAssociation(config) {
     // Mirror handleForwardTsn: the rebase may have exposed a contiguous
     // prefix (a TSN above the old cum-ack we had already received).
     drainPrefix();
+    sackForForwardTsn(false);
+  }
+
+  /* A FORWARD-TSN is answered with a SACK, like DATA (RFC 3758 §3.6: "for
+   * the purposes of sending a SACK, the receiver MUST follow the same rules
+   * as if a DATA chunk had been received"; one that is out of date "SHOULD"
+   * get a SACK — it suggests ours was lost). Without it the sender never
+   * learns the new cumulative TSN unless more DATA follows: after a burst,
+   * its whole window — already received — stayed queued until T3, which
+   * then abandoned one message per RTO. Measured with 64 KB messages at 2%
+   * loss: 3355 chunks still queued seconds after the last delivery. */
+  function sackForForwardTsn(stale) {
+    sackPendingThisPacket = true;
+    if (stale || receivedRanges.length > 0) sackImmediateRequired = true;
+    if (packetDepth === 0) sendSackAndReset();
   }
 
   // Identity-based orphan cleanup: drop stored fragments of the named
@@ -2060,6 +2536,18 @@ function SctpAssociation(config) {
     if (toDel) {
       for (var i = 0; i < toDel.length; i++) store.delete(toDel[i]);
       if (store.size === 0) delete fragStore[streamId];
+    }
+    // The hint for those messages goes with them.
+    var hints = iDataHint[streamId];
+    if (hints) {
+      var hDel = [];
+      hints.forEach(function (_h, hk) {
+        var hu = hk >= 4294967296;
+        var hm = hu ? hk - 4294967296 : hk;
+        if (hu === unordered && (hm === abandonedMid || tsnLt(hm, abandonedMid))) hDel.push(hk);
+      });
+      for (var hd = 0; hd < hDel.length; hd++) hints.delete(hDel[hd]);
+      if (hints.size === 0) delete iDataHint[streamId];
     }
   }
 
@@ -2103,18 +2591,49 @@ function SctpAssociation(config) {
 
     rebaseBy(delta);
 
-    // Two-pass sweep: Map iteration is safe but mutation during it isn't.
+    /* Which stored fragments go: those of every partly assembled message
+     * that is missing a TSN at or below the new cumulative TSN (RFC 3758
+     * §3.6) — that TSN will never come. Not "the fragments inside
+     * (oldCum, newCum]", which is what this did, and which misses the usual
+     * case: a message whose first fragments arrived in order — so the
+     * cumulative TSN had already passed them — and whose LAST fragment was
+     * lost and abandoned. Its earlier fragments sit below oldCum, outside
+     * the window, and stayed in the store for good. They count against the
+     * receive window, so the window shrank with every such message until it
+     * stayed at zero: measured, 16 KB messages at 2% loss from a
+     * partially-reliable sender, the window was down to a few hundred bytes
+     * within a second and the association moved one probe chunk at a time.
+     * It also kept a fragment of a live message that sits inside the window
+     * while its remaining fragments are above it — the old sweep deleted
+     * that one.
+     *
+     * Classic DATA: a message is a run of consecutive TSNs from BEGIN to
+     * END. Split what is stored into such runs; a run that does not start
+     * with BEGIN misses the TSN before it, one that does not end with END
+     * misses the TSN after it. Drop the run if the TSN it misses is at or
+     * below the new cumulative TSN. (I-DATA fragments are matched by
+     * identity in handleIForwardTsn and are left alone here.) */
     for (var sidStr in fragStore) {
       var store = fragStore[sidStr];
+      var tsns = [];
+      store.forEach(function (fr, t) { if (fr.mid == null) tsns.push(t); });
+      if (tsns.length === 0) continue;
+      tsns.sort(function (a, b) { return a === b ? 0 : (tsnLt(a, b) ? -1 : 1); });
       var toDel = null;
-      var iter = store.keys();
-      var step;
-      while (!(step = iter.next()).done) {
-        var fragTsn = step.value;
-        if (tsnGt(fragTsn, oldCumTsn) && tsnLeq(fragTsn, newCumTsn)) {
+      var runStart = 0;
+      for (var i = 0; i < tsns.length; i++) {
+        var f = store.get(tsns[i]);
+        var last = (i + 1 === tsns.length) || f.isEnd ||
+                   tsns[i + 1] !== ((tsns[i] + 1) >>> 0) || store.get(tsns[i + 1]).isBegin;
+        if (!last) continue;
+        var first = store.get(tsns[runStart]);
+        var missesBelow = !first.isBegin && tsnLeq((tsns[runStart] - 1) >>> 0, newCumTsn);
+        var missesAbove = !f.isEnd && tsnLeq((tsns[i] + 1) >>> 0, newCumTsn);
+        if (missesBelow || missesAbove) {
           if (toDel === null) toDel = [];
-          toDel.push(fragTsn);
+          for (var r = runStart; r <= i; r++) toDel.push(tsns[r]);
         }
+        runStart = i + 1;
       }
       if (toDel !== null) {
         for (var di = 0; di < toDel.length; di++) store.delete(toDel[di]);
@@ -2133,7 +2652,7 @@ function SctpAssociation(config) {
   function handleForwardTsn(data) {
     if (data.length < 4) return;
     var newCumTsn = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
-    if (!tsnGt(newCumTsn, lastCumulativeTsn)) return;
+    if (!tsnGt(newCumTsn, lastCumulativeTsn)) { sackForForwardTsn(true); return; }
     advanceCumTsnForAbandon(newCumTsn);
 
     // Parse optional Stream/SSN pairs (RFC 3758 §3.2). Each pair tells us
@@ -2152,6 +2671,7 @@ function SctpAssociation(config) {
     // After the rebase, offset 1 may now be filled (e.g., if we'd already
     // received TSN newCumTsn+1 before this FORWARD-TSN). Try to drain.
     drainPrefix();
+    sackForForwardTsn(false);
   }
 
   // SCTP-6: advance recvSSN past an abandoned ordered SSN reported by
@@ -2301,6 +2821,7 @@ function SctpAssociation(config) {
       delete recvSSN[sid];
       if (pendingMsgs[sid]) delete pendingMsgs[sid];
       if (fragStore[sid])   delete fragStore[sid];
+      if (iDataHint[sid])   delete iDataHint[sid];
     }
 
     lastReconfigPeerReqSeen     = reqSeq;
@@ -2655,24 +3176,83 @@ function SctpAssociation(config) {
 
   // Queue of reassembled messages awaiting delivery, and the drain that hands
   // them up ONE PER TASK. See processMessage.
+  //
+  // Read from a head index, not with shift(). shift() moves every item still
+  // waiting — O(n) per message — and the queue is exactly what grows under
+  // load, so draining got slower the longer it got: 10,000 waiting cost
+  // 6.7ms to drain, 50,000 cost 3.1s (vs 0.4ms here). In a profile under
+  // load that showed as this four-line function taking 15% of the thread.
+  // Same order, same one message per task; only the cost of taking one out
+  // changed. Same idea as sendQueue's dropCount above.
+  //
+  // A delivered slot is cleared at once, so the message can be collected
+  // before the rest of the queue is. The array is cut down once the read
+  // part is over half of it (and at least DELIVER_COMPACT_MIN), and reset
+  // when it empties.
   var _deliverQueue = [];
+  var _deliverHead = 0;
+  // Bytes of messages assembled but not yet handed up. They are held here
+  // exactly like fragStore/pendingMsgs, so they count against the receive
+  // window: a sender that outruns the application is told to slow down
+  // instead of growing this queue without bound.
+  var _deliverBytes = 0;
+  // a_rwnd in our last SACK, to know when a draining queue should reopen
+  // the window to the peer (see _drainDeliveries).
+  var _lastAdvertisedRwnd = null;
   var _deliverScheduled = false;
+  var DELIVER_COMPACT_MIN = 1024;
 
   function _drainDeliveries() {
     _deliverScheduled = false;
-    if (closed) { _deliverQueue.length = 0; return; }
-    var item = _deliverQueue.shift();
-    if (item) {
-      try { ev.emit('data', item[0], item[1], item[2]); } catch (e) { /* a handler must not stall the queue */ }
+    if (closed) { _deliverQueue = []; _deliverHead = 0; _deliverBytes = 0; return; }
+    var item = null;
+    if (_deliverHead < _deliverQueue.length) {
+      item = _deliverQueue[_deliverHead];
+      _deliverQueue[_deliverHead++] = undefined;
+      if (_deliverHead === _deliverQueue.length) {
+        _deliverQueue = [];
+        _deliverHead = 0;
+      } else if (_deliverHead >= DELIVER_COMPACT_MIN && _deliverHead * 2 >= _deliverQueue.length) {
+        _deliverQueue = _deliverQueue.slice(_deliverHead);
+        _deliverHead = 0;
+      }
     }
-    if (_deliverQueue.length > 0) _scheduleDelivery();
+    if (item) {
+      _deliverBytes -= item[2].length;
+      try { ev.emit('data', item[0], item[1], item[2]); } catch (e) { /* a handler must not stall the queue */ }
+      // Window update (RFC 4960 §6.2): if our last SACK told the peer the
+      // window was nearly closed and draining has opened it up again, say
+      // so now rather than waiting for the peer's next window probe.
+      if (_lastAdvertisedRwnd !== null && _lastAdvertisedRwnd < (maxReceiveBufferSize >>> 2) &&
+          state === STATE_ESTABLISHED && myReceiverWindowCredit() >= (maxReceiveBufferSize >>> 1)) {
+        sendSackAndReset();
+      }
+    }
+    if (_deliverHead < _deliverQueue.length) _scheduleDelivery();
   }
 
+  // setImmediate, not setTimeout(0): same reason as scheduleTxPump. Each
+  // message waits for the previous one's task, so setTimeout's >=1ms clamp
+  // capped delivery at ~1000 messages/second per association (measured: 888)
+  // and the queue grew without bound under any heavier load. setImmediate is
+  // still one macrotask per message — microtasks (promise continuations, a
+  // handler reattached after an await) run between two deliveries, exactly
+  // as processMessage requires.
   function _scheduleDelivery() {
     if (_deliverScheduled) return;
     _deliverScheduled = true;
-    var t = setTimeout(_drainDeliveries, 0);
-    if (t.unref) t.unref();
+    // NOT unref'd. Node runs an unref'd immediate only when something else
+    // wakes the event loop: with nothing ref'd pending, the poll phase
+    // blocks until the next I/O or timer, and the immediate waits with it.
+    // A chain of them — one message per task — then advanced one message per
+    // wake-up. Measured: 5 chained unref'd immediates took 500 ms in a
+    // process whose only other activity was a 100 ms interval; and under
+    // loss, where fewer packets arrive to wake the loop, the receiver held
+    // ~1000 delivered-but-not-handed-up messages, which closed the receive
+    // window (they count against it) and throttled the sender to ~1100
+    // messages/s. A ref'd immediate keeps the process alive only until it
+    // runs, and the chain ends when the queue is empty.
+    setImmediate(_drainDeliveries);
   }
 
   /**
@@ -2697,6 +3277,7 @@ function SctpAssociation(config) {
    */
   function processMessage(streamId, ppid, payload) {
     _deliverQueue.push([streamId, ppid, payload]);
+    _deliverBytes += payload.length;
     _scheduleDelivery();
     return;
   }
@@ -2784,6 +3365,7 @@ function SctpAssociation(config) {
       maxRetransmits = null;
       maxLifetime    = null;
     }
+    if (maxLifetime !== null) lifetimeEverUsed = true;
 
     // SSN is allocated ONCE per message (all fragments share it).
     var ssn;
@@ -2869,6 +3451,11 @@ function SctpAssociation(config) {
       scheduleTransmit();
       return;
     }
+
+    // The job outlives this call, so it must own its bytes: the caller may
+    // reuse or change its buffer as soon as send() returns. (The synchronous
+    // path above copies every fragment into its packet before returning.)
+    job.payload = Buffer.from(payload);
 
     // Long message: register the job. If the active set has room, push its
     // first quantum right now so the head of the message leaves in this same
@@ -2983,8 +3570,10 @@ function SctpAssociation(config) {
       fragPayload.copy(pkt, 28);
     }
 
-    // CRC32c — checksum field is currently zeros from Buffer.alloc.
-    pkt.writeUInt32LE(crc32c(pkt), 8);
+    // CRC32c: computed when this packet first goes out ON ITS OWN (see
+    // soloPacket). A fragment that leaves bundled with others never needs its
+    // standalone checksum — the bundle gets one CRC over the whole datagram —
+    // so computing it here was a full pass over the payload for nothing.
 
     var nowTs = Date.now();
     sendQueue.push({
@@ -2995,6 +3584,7 @@ function SctpAssociation(config) {
       payloadLen:     fragPayload.length,
       flags:          flags,
       packet:         pkt,            // full pre-built wire packet, reused on retransmit
+      crcDone:        false,          // standalone CRC written yet (soloPacket)
       firstSentAt:    job.createdAt,  // PR-SCTP deadline runs from send(), not from enqueue
       sentAt:         nowTs,
       retransmits:    0,
@@ -3016,7 +3606,7 @@ function SctpAssociation(config) {
     // fires from handleSack on cum-ack OR from abandonMessage on PR-SCTP
     // drop OR from incoming-reset cleanup.
     try {
-      ev.emit('chunkSent', {
+      if (ev.listenerCount('chunkSent') > 0) ev.emit('chunkSent', {
         streamId: job.streamId,
         ppid:     job.ppid,
         bytes:    fragPayload.length,
@@ -3059,8 +3649,10 @@ function SctpAssociation(config) {
   function scheduleTxPump() {
     if (_txPumpScheduled || txJobs.length === 0) return;
     _txPumpScheduled = true;
-    var t = setImmediate(runTxPump);
-    if (t && typeof t.unref === 'function') t.unref();
+    // Not unref'd — see _scheduleDelivery: an unref'd one waits for some
+    // other event to wake the loop, so a large message went out one quantum
+    // per wake-up.
+    setImmediate(runTxPump);
   }
 
   /* ── SCTP-14: window-driven refill ─────────────────────────────────
@@ -3337,8 +3929,25 @@ function SctpAssociation(config) {
    * paths; this is only about the tail that never made it there. */
   function dropTxJobs(pred) {
     for (var i = txJobs.length - 1; i >= 0; i--) {
-      if (pred(txJobs[i])) txJobs.splice(i, 1);
+      if (pred(txJobs[i])) {
+        var dj = txJobs.splice(i, 1)[0];
+        // The part of the message never turned into fragments is dropped
+        // with the job: it is no longer buffered either.
+        var made = Math.min(dj.cursor * dj.maxPerChunk, dj.payload.length);
+        if (dj.payload.length > made) emitUnbuffered(dj.streamId, dj.ppid, dj.payload.length - made);
+      }
     }
+  }
+
+  // 'chunkUnbuffered' { streamId, ppid, bytes }: bytes that send() queued are
+  // no longer waiting to be transmitted — they went on the wire for the
+  // first time, or were dropped before that. This is what bufferedAmount
+  // (W3C §6.2) counts down on. 'chunkSent' fires earlier, when a fragment is
+  // merely queued; 'chunkAcked' later, when the peer acknowledged it.
+  function emitUnbuffered(streamId, ppid, bytes) {
+    try {
+      ev.emit('chunkUnbuffered', { streamId: streamId, ppid: ppid, bytes: bytes });
+    } catch (e) { /* listener errors don't break protocol processing */ }
   }
 
   // SCTP-13: microtask-coalesced transmit trigger. Collapses a same-tick
@@ -3479,7 +4088,7 @@ function SctpAssociation(config) {
       if (bundle.length === 1) {
         // Single chunk — emit its standalone packet untouched (byte-for-
         // byte identical to the non-bundled path; no concat, no CRC redo).
-        _sctpDiagPacket(bundle[0].packet, 'bundle');
+        _sctpDiagPacket(soloPacket(bundle[0]), 'bundle');
         ev.emit('packet', bundle[0].packet);
       } else {
         var parts = new Array(bundle.length + 1);
@@ -3524,7 +4133,15 @@ function SctpAssociation(config) {
         sctpStats.chunksRetransmitted++;
       }
       entry.inFlight    = true;
+      entry.gapAcked    = false;   // sent (again): in the flight until the peer reports it
       entry.sentAt      = now;     // first-transmit timestamp (RTT via Karn)
+      if (!entry.transmitted) {
+        // First time on the wire: these bytes are no longer "buffered" in
+        // the W3C sense (bufferedAmount counts what send() queued and was
+        // not yet transmitted to the network).
+        entry.transmitted = true;
+        emitUnbuffered(entry.streamId, entry.ppid, entry.payloadLen);
+      }
       outstandingBytes += entry.payloadLen;
       pendingBytes     -= entry.payloadLen;
       inFlightCount++;
@@ -3534,7 +4151,7 @@ function SctpAssociation(config) {
       // current bundle, then emit it solo (its own standalone packet).
       if (chunkLen > maxChunksBytes) {
         flushBundle();
-        ev.emit('packet', entry.packet);
+        ev.emit('packet', soloPacket(entry));
         continue;
       }
       // Won't fit alongside the current bundle → flush and start fresh.
@@ -3561,11 +4178,12 @@ function SctpAssociation(config) {
    * structurally impossible: if the buffers are empty, the window is full,
    * period.
    *
-   * Because this stack delivers messages synchronously (the 'data' event),
-   * assembled messages don't linger — held bytes are normally ~0, so the
-   * window sits near maxReceiveBufferSize and throughput is unconstrained.
-   * It only shrinks during active fragmentation or SSN-reordering, which is
-   * exactly when flow control should engage. A useful side effect: the
+   * Assembled messages wait in the delivery queue (one handed up per task)
+   * and count too (_deliverBytes, kept exactly in step with the queue). With
+   * an application that keeps up, held bytes stay near 0 and the window sits
+   * near maxReceiveBufferSize. It shrinks during active fragmentation,
+   * SSN-reordering, or when the application falls behind — exactly when flow
+   * control should engage. A useful side effect: the
    * pendingMsgs / fragStore overflow paths become effectively unreachable
    * with a compliant peer, because the advertised window closes before the
    * reorder buffer can fill (fixing the silent-drop-on-overflow hazard).
@@ -3575,14 +4193,14 @@ function SctpAssociation(config) {
    * Called once per SACK (delayed-ACK batched), not per chunk.
    */
   function myReceiverWindowCredit() {
-    var held = 0;
+    var held = _deliverBytes;
     var fk = Object.keys(fragStore);
     for (var i = 0; i < fk.length; i++) {
-      fragStore[fk[i]].forEach(function (f) { held += f.payload.length; });
+      for (var f of fragStore[fk[i]].values()) held += f.payload.length;
     }
     var pk = Object.keys(pendingMsgs);
     for (var j = 0; j < pk.length; j++) {
-      pendingMsgs[pk[j]].forEach(function (m) { held += m.payload.length; });
+      for (var m of pendingMsgs[pk[j]].values()) held += m.payload.length;
     }
     if (held >= maxReceiveBufferSize) return 0;
     return maxReceiveBufferSize - held;
@@ -3635,7 +4253,8 @@ function SctpAssociation(config) {
     // currently holding un-delivered (pion getMyReceiverWindowCredit).
     // Dynamic, so it shrinks under reassembly/reorder pressure and the
     // peer applies real flow control. Was a fixed DEFAULT_A_RWND (64 KB).
-    body.writeUInt32BE(myReceiverWindowCredit(), 4);
+    _lastAdvertisedRwnd = myReceiverWindowCredit();
+    body.writeUInt32BE(_lastAdvertisedRwnd, 4);
     body.writeUInt16BE(gaps.length, 8);
     body.writeUInt16BE(dups.length, 10);
 
@@ -3747,10 +4366,19 @@ function SctpAssociation(config) {
    * type, its length, and for DATA the stream, sequence and PPID, which is
    * what identifies a DCEP control message versus user data.
    */
+  // A queued fragment's packet, sent on its own: write its CRC32c the first
+  // time (the checksum field is zero until then; bytes never change after).
+  function soloPacket(entry) {
+    if (!entry.crcDone) {
+      entry.packet.writeUInt32LE(crc32c(entry.packet), 8);
+      entry.crcDone = true;
+    }
+    return entry.packet;
+  }
+
   function _sctpDiagPacket(pkt, where) {
     try {
-      if (typeof process === 'undefined' || !process.env ||
-          (process.env.LEMON_DEBUG !== '1' && process.env.WEBRTC_DEBUG !== '1')) return;
+      if (!_SCTP_PKT_DEBUG) return;
       var NAMES = { 0:'DATA', 1:'INIT', 2:'INIT_ACK', 3:'SACK', 4:'HEARTBEAT',
                     5:'HEARTBEAT_ACK', 6:'ABORT', 7:'SHUTDOWN', 8:'SHUTDOWN_ACK',
                     9:'ERROR', 10:'COOKIE_ECHO', 11:'COOKIE_ACK', 14:'SHUTDOWN_COMPLETE',
@@ -3883,11 +4511,28 @@ function SctpAssociation(config) {
    * crosses FAST_RETRANSMIT_THRESHOLD.
    */
 
+  // Restarted on nearly every SACK. Instead of clearing and creating a timer
+  // each time, keep one and move a deadline: a timer that fires before the
+  // deadline just waits out the rest. (A new timer is made only when the
+  // deadline moves EARLIER than the running one.)
+  var t3Deadline = 0;
+  var t3FireAt = 0;
   function startT3Timer() {
+    if (sendQueue.length === 0) { clearT3Timer(); return; }
+    t3Deadline = Date.now() + rto;
+    if (t3Timer && t3FireAt <= t3Deadline) return;
     clearT3Timer();
-    if (sendQueue.length === 0) return;
-    t3Timer = setTimeout(onT3Expire, rto);
+    armT3(rto);
+  }
+  function armT3(ms) {
+    t3FireAt = Date.now() + ms;
+    t3Timer = setTimeout(t3Fire, ms);
     if (t3Timer && typeof t3Timer.unref === 'function') t3Timer.unref();
+  }
+  function t3Fire() {
+    var left = t3Deadline - Date.now();
+    if (left > 0) { armT3(left); return; }
+    onT3Expire();
   }
 
   function clearT3Timer() {
@@ -3924,8 +4569,26 @@ function SctpAssociation(config) {
     // message instead of retransmitting. RFC 3758 §3.4.4 says we SHOULD
     // NOT increase RTO on abandon (path isn't necessarily slow — we just
     // chose to give up on this chunk).
+    //
+    // Not only the oldest: every in-flight chunk that is lost by now and may
+    // not be resent goes with it (RFC 3758 §3.5 A3 — at T3 all outstanding
+    // data is up for retransmission, and each chunk is checked for
+    // abandonment). Lost = not gap-acked, and either passed over by the
+    // peer (below the highest TSN it reported) or out a full RTO. Abandoning
+    // just the oldest drained a burst's tail at one message per RTO: after
+    // the sender goes quiet no SACKs come to report the other holes.
     if (shouldAbandon(oldest, now)) {
-      abandonMessage(oldest.messageSeq);
+      var lost = new Set();
+      lost.add(oldest.messageSeq);
+      for (var li = 1; li < inFlightCount; li++) {
+        var le = sendQueue[li];
+        if (le.gapAcked || lost.has(le.messageSeq) || !shouldAbandon(le, now)) continue;
+        if ((peerHighestSeen !== null && tsnLt(le.tsn, peerHighestSeen)) ||
+            now - le.sentAt >= rto) {
+          lost.add(le.messageSeq);
+        }
+      }
+      abandonMessages(lost);
       if (inFlightCount > 0) startT3Timer();   // current rto, no doubling
       return;
     }
@@ -3984,10 +4647,13 @@ function SctpAssociation(config) {
       var re = sendQueue[ri];
       re.inFlight  = false;
       re.needsRetx = true;
+      re.gapAcked  = false;
+      re.missingReports = 0;   // reports from before the timeout are void (RFC 4960 §6.3.3)
       pendingBytes += re.payloadLen;   // SCTP-14: moved in-flight -> pending
     }
     outstandingBytes = 0;
     inFlightCount    = 0;
+    gapCoverage      = [];   // nothing is in flight now; the next SACK marks afresh
 
     oldest.sentAt = now;
     oldest.missingReports = 0;   // expiry supersedes any in-flight gap reporting
@@ -3999,7 +4665,7 @@ function SctpAssociation(config) {
     pendingBytes    -= oldest.payloadLen;
     inFlightCount    = 1;
     // P2: re-emit pre-built packet (zero-alloc retransmit path).
-    ev.emit('packet', oldest.packet);
+    ev.emit('packet', soloPacket(oldest));
     sctpStats.chunksRetransmitted++;
 
     // SCTP-9: T3 expiry signals heavy congestion. Per RFC 4960 §7.2.3:
@@ -4067,13 +4733,19 @@ function SctpAssociation(config) {
    */
   function chunkRemoved(entry) {
     if (entry.inFlight) {
-      outstandingBytes -= entry.payloadLen;
+      if (!entry.gapAcked) outstandingBytes -= entry.payloadLen;   // a gap-acked one left the flight already
       inFlightCount--;
     } else {
       pendingBytes -= entry.payloadLen;   // SCTP-14
     }
+    // Leaving the queue without ever being sent (abandoned, stream reset):
+    // its bytes stop being buffered too.
+    if (!entry.transmitted) {
+      entry.transmitted = true;
+      emitUnbuffered(entry.streamId, entry.ppid, entry.payloadLen);
+    }
     try {
-      ev.emit('chunkAcked', {
+      if (ev.listenerCount('chunkAcked') > 0) ev.emit('chunkAcked', {
         streamId: entry.streamId,
         ppid:     entry.ppid,
         bytes:    entry.payloadLen,
@@ -4082,14 +4754,40 @@ function SctpAssociation(config) {
   }
 
   function abandonMessage(messageSeq) {
+    var one = new Set();
+    one.add(messageSeq);
+    abandonMessages(one);
+  }
+
+  // Several messages in ONE pass over the queue (compacted in place). Was a
+  // splice per fragment and a walk of the whole queue per message — with a
+  // window of thousands of chunks and many messages lost at once, that is
+  // quadratic.
+  function abandonMessages(seqs) {
+    if (seqs.size === 0) return;
     var anyAbandoned = false;
     // SCTP-14: a message can be abandoned while the pump is still feeding
     // it. Kill the job first, or the fragments it goes on to enqueue would
     // re-open a hole we just told the peer to skip past with FORWARD-TSN.
-    dropTxJobs(function (j) { return j.messageSeq === messageSeq; });
-    for (var i = sendQueue.length - 1; i >= 0; i--) {
-      if (sendQueue[i].messageSeq === messageSeq) {
-        var entry = sendQueue.splice(i, 1)[0];
+    dropTxJobs(function (j) { return seqs.has(j.messageSeq); });
+    // Take them out first, then account for them: chunkRemoved fires
+    // listeners, and the queue must already be whole again if one sends.
+    var removed = [];
+    var w = 0;
+    for (var i = 0; i < sendQueue.length; i++) {
+      var qe = sendQueue[i];
+      if (!seqs.has(qe.messageSeq)) {
+        if (w !== i) sendQueue[w] = qe;
+        w++;
+      } else {
+        removed.push(qe);
+      }
+    }
+    sendQueue.length = w;
+    for (var ri = 0; ri < removed.length; ri++) {
+      var entry = removed[ri];
+      {
+        entry.abandoned = true;
         sctpStats.chunksAbandoned++;
 
         // SCTP-6 (Stream/SSN pairs): for ordered abandoned messages,
@@ -4168,16 +4866,55 @@ function SctpAssociation(config) {
     if (!peerSupportsForwardTsn) return;
     if (sctpStats.chunksAbandoned === 0) return;
 
-    var advPt;
-    if (sendQueue.length === 0) {
-      advPt = (localTsn - 1) >>> 0;
-    } else {
-      advPt = (sendQueue[0].tsn - 1) >>> 0;
-    }
+    var advPt = advancedPeerAckPoint();
 
     if (lastForwardTsnSent !== undefined && !tsnGt(advPt, lastForwardTsnSent)) return;
 
     sendForwardTsn(advPt);
+  }
+
+  /* The point FORWARD-TSN may move the peer's cumulative TSN to: just below
+   * the first queued chunk the peer still needs — everything below it was
+   * acked or abandoned (RFC 3758 Advanced.Peer.Ack.Point).
+   *
+   * Also over leading chunks the peer is known to hold as WHOLE messages:
+   * gap-acked, unordered, every fragment from B to E (see below), partially
+   * reliable. Without that, the cumulative TSN crossed one hole per round
+   * trip: holes of abandoned messages alternate with chunks the peer got,
+   * and each FORWARD-TSN could only reach the next received chunk, then wait
+   * for the SACK to say the peer had passed it — one lost SACK in that chain
+   * cost an RTO. Measured at 5% loss: 125 holes after a burst, crossed at one
+   * per round trip, with T3 stalls between. Skipping such a chunk takes
+   * nothing from the peer: the message is complete there and already handed
+   * up (a complete unordered message is not held in reassembly or for
+   * ordering), so the peer only learns it may stop tracking those TSNs. A
+   * message not wholly received, an ordered message, or a reliable one stops
+   * the walk — the last so that a renege can never cost reliable data.
+   */
+  //
+  // A fragmented message counts as whole when ALL its fragments sit next to
+  // each other at this point of the queue, from B to E, every one gap-acked
+  // (classic DATA always queues a message as one run; under I-DATA one that
+  // is interleaved with another simply stops the walk).
+  function advancedPeerAckPoint() {
+    var k = 0;
+    while (k < sendQueue.length) {
+      var e = sendQueue[k];
+      if (!e.gapAcked || !e.unordered || !(e.flags & DATA_FLAG_BEGIN) ||
+          (e.maxRetransmits == null && e.maxLifetime == null)) {
+        return (e.tsn - 1) >>> 0;
+      }
+      var j = k;
+      while (!(sendQueue[j].flags & DATA_FLAG_END)) {
+        j++;
+        if (j >= sendQueue.length || !sendQueue[j].gapAcked ||
+            sendQueue[j].messageSeq !== e.messageSeq) {
+          return (e.tsn - 1) >>> 0;
+        }
+      }
+      k = j + 1;
+    }
+    return (localTsn - 1) >>> 0;
   }
 
   function sendForwardTsn(newCumTsn) {
@@ -4211,6 +4948,7 @@ function SctpAssociation(config) {
       }
       sendChunk(CHUNK_I_FORWARD_TSN, 0, iBody, remoteVerificationTag);
       lastForwardTsnSent = newCumTsn;
+      lastForwardTsnSentAt = Date.now();
       /* The tracker is NOT cleared here. Two ways a one-shot tracker loses
        * skip entries for good, both observed:
        *   1. maybeFwdTsn's dedup can decline to send at all when the advance
@@ -4238,6 +4976,7 @@ function SctpAssociation(config) {
     }
     sendChunk(CHUNK_FORWARD_TSN, 0, body, remoteVerificationTag);
     lastForwardTsnSent = newCumTsn;
+    lastForwardTsnSentAt = Date.now();
     // Clear the per-stream tracker — peer's been told. New abandons
     // beyond this point will accumulate fresh entries.
     abandonedSSNPerStream = {};
@@ -4395,7 +5134,42 @@ function SctpAssociation(config) {
     // (Mid-handshake calls just attach the callback.)
     if (state === STATE_CLOSED) {
       sendInit();
+      // T1-init (RFC 4960 §5.1 A): resend the INIT until an INIT-ACK moves
+      // us on. It was sent once: a lost INIT left only the peer's own INIT
+      // to complete the handshake, and a lost COOKIE-ECHO or COOKIE-ACK
+      // nothing at all — the association stayed half-open for good.
+      armT1(function () {
+        if (state !== STATE_COOKIE_WAIT) return false;
+        sendInit();
+        return true;
+      });
     }
+  }
+
+  // T1 (RFC 4960 §5.1, §6.3): one timer for whichever handshake chunk we
+  // are waiting on. `resend` sends it again and returns false when it is no
+  // longer needed. Backs off from rtoInitialMs, doubling up to rtoMaxMs,
+  // and gives up after maxInitRetransmits (Max.Init.Retransmits, RFC 4960
+  // §15: 8).
+  var t1Timer = null;
+  function armT1(resend) {
+    clearT1Timer();
+    var attempts = 0;
+    var timeout = rtoInitialMs;
+    var fire = function () {
+      t1Timer = null;
+      if (closed || attempts >= maxInitRetransmits) return;
+      if (!resend()) return;
+      attempts++;
+      timeout = Math.min(timeout * 2, rtoMaxMs);
+      t1Timer = setTimeout(fire, timeout);
+      if (t1Timer.unref) t1Timer.unref();
+    };
+    t1Timer = setTimeout(fire, timeout);
+    if (t1Timer.unref) t1Timer.unref();
+  }
+  function clearT1Timer() {
+    if (t1Timer) { clearTimeout(t1Timer); t1Timer = null; }
   }
 
   // Internal: emit the INIT chunk that starts the 4-way handshake from
@@ -4599,25 +5373,63 @@ function SctpAssociation(config) {
 
   /* ========================= Fragment store ========================= */
 
-  // Try to extract a complete user message from this stream's fragment store.
-  // Returns { ssn, ppid, payload, unordered } if a complete BEGIN→END chain
-  // is found with consistent SSN/PPID/U-bit, otherwise null. On success,
-  // the consumed fragments are removed from the store.
-  //
-  // We iterate over the store's TSNs in tsn-arithmetic order (so wraparound
-  // works), looking for a BEGIN, then walking forward while the next TSN
-  // is contiguous AND the SSN/PPID/U-bit match the BEGIN's. A complete
-  // chain is BEGIN..(MIDDLE..)END.
-  //
-  // tryAssemble may need to be called repeatedly — after one message comes
-  // out, another might also be ready. handleData's caller loops.
-  function tryAssemble(streamId) {
+  // Assembly runs for the arriving fragment's own message only (see the end
+  // of _acceptDataFields). On success the consumed fragments leave the store
+  // and the message is returned as { ssn, ppid, payload, unordered[, wide] }.
+  // Classic DATA: a message is a contiguous TSN run BEGIN..END with no other
+  // BEGIN inside and the same SSN / PPID / U-bit throughout. Find the run
+  // around the arriving TSN — forward to END, back to BEGIN — and assemble
+  // it with exactly those rules. O(1) for a fragment that does not complete
+  // its message (the usual in-order case: nothing stored after it yet).
+  function assembleClassic(streamId, tsn) {
     var store = fragStore[streamId];
-    if (!store || store.size === 0) return null;
+    if (!store) return null;
+    var endTsn = tsn, f = store.get(endTsn);
+    while (!f.isEnd) {
+      endTsn = (endTsn + 1) >>> 0;
+      f = store.get(endTsn);
+      if (!f || f.isBegin) return null;              // gap, or the next message
+    }
+    var beginTsn = tsn, g = store.get(beginTsn);
+    while (!g.isBegin) {
+      beginTsn = (beginTsn - 1) >>> 0;
+      g = store.get(beginTsn);
+      if (!g || g.isEnd) return null;                // gap, or a previous message's END
+    }
 
-    // Sort keys in tsn-arithmetic order. This is rare-path; O(n log n) on
-    // a small store is fine.
-    var tsns = Array.from(store.keys());
+    var head = g;
+    var parts = [head.payload];
+    var consumed = [beginTsn];
+    var ssn = head.ssn, ppid = head.ppid, unordered = head.isUnordered;
+    var t = beginTsn;
+    while (t !== endTsn) {
+      t = (t + 1) >>> 0;
+      var fr = store.get(t);
+      if (fr.isBegin) return null;                   // unexpected BEGIN — abort
+      if (fr.ssn !== ssn) return null;               // N1: SSN mismatch
+      if (fr.ppid !== ppid) return null;             // N2: PPID mismatch
+      if (fr.isUnordered !== unordered) return null; // N15: U-bit mismatch
+      parts.push(fr.payload);
+      consumed.push(t);
+    }
+    for (var k = 0; k < consumed.length; k++) store.delete(consumed[k]);
+    if (store.size === 0) delete fragStore[streamId];
+    return {
+      ssn: ssn, ppid: ppid, unordered: unordered,
+      payload: Buffer.concat(parts),
+    };
+  }
+
+  // I-DATA (RFC 8260): a message's fragments are found by MID and ordered by
+  // FSN wherever they sit in TSN space. Same rules as before, applied only
+  // to the fragments of this one message (heads tried in TSN order).
+  function assembleInterleaved(streamId, mid, unordered) {
+    var store = fragStore[streamId];
+    if (!store) return null;
+    var tsns = [];
+    store.forEach(function (fr, t) {
+      if (fr.mid === mid && fr.isUnordered === unordered) tsns.push(t);
+    });
     tsns.sort(function (a, b) {
       if (a === b) return 0;
       return tsnLt(a, b) ? -1 : 1;
@@ -4627,102 +5439,37 @@ function SctpAssociation(config) {
       var head = store.get(tsns[i]);
       if (!head.isBegin) continue;
 
-      // Single-fragment message — BEGIN+END together is the common path
-      // and we want it fast.
-      if (head.isEnd) {
-        store.delete(tsns[i]);
+      var byFsn = new Map();
+      for (var ik = 0; ik < tsns.length; ik++) {
+        var cand = store.get(tsns[ik]);
+        // Same consistency rules the contiguous path enforces: a fragment
+        // claiming this message must agree about what the message is.
+        if (cand.ppid !== head.ppid && cand.ppid !== 0) continue;   // N2
+        if (!byFsn.has(cand.fsn)) byFsn.set(cand.fsn, [cand, tsns[ik]]);
+      }
+
+      var iParts = [head.payload];
+      var iConsumed = [tsns[i]];
+      var iDone = false;
+      for (var want = 1; ; want++) {
+        var hit = byFsn.get(want);
+        if (!hit) break;                         // chain incomplete — wait
+        iParts.push(hit[0].payload);
+        iConsumed.push(hit[1]);
+        if (hit[0].isEnd) { iDone = true; break; }
+      }
+      if (iDone) {
+        for (var ic = 0; ic < iConsumed.length; ic++) store.delete(iConsumed[ic]);
         if (store.size === 0) delete fragStore[streamId];
         return {
           ssn: head.ssn, ppid: head.ppid, unordered: head.isUnordered,
-          payload: head.payload,
-          wide: (head.mid != null),   // SCTP-14: I-DATA -> ssn holds a 32-bit MID
+          payload: Buffer.concat(iParts),
+          // SCTP-14: ssn here is a 32-bit MID, not a 16-bit SSN. The
+          // ordered-delivery gate needs to know which, because the two
+          // wrap at different points.
+          wide: true,
         };
       }
-
-      // INTERLEAVED (RFC 8260): fragments of this message are found by mid
-      // and ordered by fsn, wherever they sit in TSN space. That is the
-      // entire point of the extension — another stream's fragments may be
-      // interleaved between them — so the contiguous-TSN walk below cannot
-      // be used.
-      if (head.mid != null) {
-        // Index this message's fragments by fsn in ONE pass, then walk them.
-        //
-        // The obvious shape — rescan the store for each fsn in turn — is
-        // O(n^2), and n here is the fragment count of a large message: a
-        // 256KB payload at a 1200-byte MTU is ~218 fragments, so ~47,000
-        // comparisons per assembly. This code path exists precisely for large
-        // messages, so that is the wrong cost to carry.
-        var byFsn = new Map();
-        for (var ik = 0; ik < tsns.length; ik++) {
-          var cand = store.get(tsns[ik]);
-          if (!cand || cand.mid !== head.mid) continue;
-          // Same consistency rules the contiguous path enforces: a fragment
-          // claiming this message must agree about what the message is.
-          if (cand.ppid !== head.ppid && cand.ppid !== 0) continue;   // N2
-          if (cand.isUnordered !== head.isUnordered) continue;        // N15
-          if (!byFsn.has(cand.fsn)) byFsn.set(cand.fsn, [cand, tsns[ik]]);
-        }
-
-        var iParts = [head.payload];
-        var iConsumed = [tsns[i]];
-        var iDone = false;
-        for (var want = 1; ; want++) {
-          var hit = byFsn.get(want);
-          if (!hit) break;                         // chain incomplete — wait
-          iParts.push(hit[0].payload);
-          iConsumed.push(hit[1]);
-          if (hit[0].isEnd) { iDone = true; break; }
-        }
-        if (iDone) {
-          for (var ic = 0; ic < iConsumed.length; ic++) store.delete(iConsumed[ic]);
-          if (store.size === 0) delete fragStore[streamId];
-          return {
-            ssn: head.ssn, ppid: head.ppid, unordered: head.isUnordered,
-            payload: Buffer.concat(iParts),
-            // SCTP-14: ssn here is a 32-bit MID, not a 16-bit SSN. The
-            // ordered-delivery gate needs to know which, because the two
-            // wrap at different points.
-            wide: true,
-          };
-        }
-        continue;   // not yet complete; try the next BEGIN
-      }
-
-      // Multi-fragment: walk forward from BEGIN.
-      var parts = [head.payload];
-      var consumed = [tsns[i]];
-      var expectTsn = (tsns[i] + 1) >>> 0;
-      var ssn = head.ssn, ppid = head.ppid, unordered = head.isUnordered;
-      var assembled = null;
-
-      for (var j = i + 1; j < tsns.length; j++) {
-        if (tsns[j] !== expectTsn) break;             // gap in chain
-        var f = store.get(tsns[j]);
-        if (f.isBegin) break;                          // unexpected BEGIN — abort
-        if (f.ssn !== ssn) break;                      // N1: SSN mismatch
-        if (f.ppid !== ppid) break;                    // N2: PPID mismatch
-        if (f.isUnordered !== unordered) break;        // N15: U-bit mismatch
-        parts.push(f.payload);
-        consumed.push(tsns[j]);
-        if (f.isEnd) {
-          assembled = {
-            ssn: ssn, ppid: ppid, unordered: unordered,
-            payload: Buffer.concat(parts),
-          };
-          break;
-        }
-        expectTsn = (tsns[j] + 1) >>> 0;
-      }
-
-      if (assembled) {
-        for (var k = 0; k < consumed.length; k++) store.delete(consumed[k]);
-        if (store.size === 0) delete fragStore[streamId];
-        return assembled;
-      }
-      // BEGIN found but chain incomplete — try the next BEGIN, if any.
-      // (Two BEGINs can coexist if the peer has interleaved fragments
-      // from two different messages, which RFC 4960 forbids per stream
-      // but we should be defensive about.)
     }
     return null;
   }
@@ -4839,16 +5586,30 @@ function SctpAssociation(config) {
   //     resetStreams() is a no-op and dc.close() leaves the peer's view
   //     of the channel open.
   function detectSupportedExtensions(paramsBuf) {
+    applyExtensionsMask(supportedExtensionsMask(paramsBuf));
+  }
+
+  // The peer's Supported Extensions parameter as a bit mask — the form the
+  // State Cookie carries it in (see makeCookie).
+  function supportedExtensionsMask(paramsBuf) {
     var ext = extractParam(paramsBuf, PARAM_SUPPORTED_EXTENSIONS);
-    if (!ext) return;
+    var mask = 0;
+    if (!ext) return mask;
     for (var i = 0; i < ext.length; i++) {
-      if (ext[i] === CHUNK_FORWARD_TSN) peerSupportsForwardTsn = true;
-      if (ext[i] === CHUNK_RECONFIG)    peerSupportsReconfig    = true;
+      if (ext[i] === CHUNK_FORWARD_TSN) mask |= EXT_FORWARD_TSN;
+      if (ext[i] === CHUNK_RECONFIG)    mask |= EXT_RECONFIG;
       // RFC 8260: the peer telling us it can RECEIVE I-DATA. Recorded now so
       // stage 2b can gate sending on it — a peer that did not advertise must
       // never be sent I-DATA, since it has no parser for the chunk type.
-      if (ext[i] === CHUNK_I_DATA)      peerSupportsIData       = true;
+      if (ext[i] === CHUNK_I_DATA)      mask |= EXT_I_DATA;
     }
+    return mask;
+  }
+
+  function applyExtensionsMask(mask) {
+    if (mask & EXT_FORWARD_TSN) peerSupportsForwardTsn = true;
+    if (mask & EXT_RECONFIG)    peerSupportsReconfig    = true;
+    if (mask & EXT_I_DATA)      peerSupportsIData       = true;
   }
 
 
@@ -4918,6 +5679,7 @@ function SctpAssociation(config) {
   /* ========================= Public API ========================= */
 
   this.abort = abort;
+  this.destroy = destroy;   // destroy() — stop silently (after 'restart')
 
   // Did the peer advertise RFC 8260 interleaving? Useful for diagnostics and
   // for the interop harness, which reports whether it was negotiated.

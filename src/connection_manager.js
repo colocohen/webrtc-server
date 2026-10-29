@@ -147,8 +147,13 @@ function ConnectionManager(config) {
   // not an override. This is how { router } acts as sugar for
   // { socket, socket6, announcedAddresses } all pointing at the router.
   if (config.router) {
-    if (!config.socket  && config.router.socket4) config.socket  = config.router.socket4;
-    if (!config.socket6 && config.router.socket6) config.socket6 = config.router.socket6;
+    // While a TURN server is attached to the router, through its carriers —
+    // they hand a packet for a linked relay straight to it (see router.js).
+    if (!config.socket  && config.router.socket4) config.socket  = config.router.udpCarrier4 || config.router.socket4;
+    if (!config.socket6 && config.router.socket6) config.socket6 = config.router.udpCarrier6 || config.router.socket6;
+    // ICE-TCP carriers, once router.tcp() has been called (see router.js).
+    if (!config.tcpSocket  && config.router.tcpSocket)  config.tcpSocket  = config.router.tcpSocket;
+    if (!config.tcpSocket6 && config.router.tcpSocket6) config.tcpSocket6 = config.router.tcpSocket6;
     if (!config.announcedAddresses && config.router.announcedAddresses) {
       config.announcedAddresses = config.router.announcedAddresses;
     }
@@ -243,7 +248,9 @@ function ConnectionManager(config) {
     // the roster (localGatheredCandidates) and surfaced only once a
     // description is set — matching browser behavior, where pooled
     // candidates never reach onicecandidate before setLocalDescription.
-    pregatherStarted: false,          // pregather() ran (agent up early)
+    pregatherStarted: false,
+    iceRoleDecided:   false,          // the first offer decided the ICE role (trackNegotiationRole)
+    iceControlling:   false,          // ... and this is it          // pregather() ran (agent up early)
     pregatherFlushed: false,          // deferred candidates surfaced post-SLD
     pregatherGatheringDone: false,    // agent finished gathering pre-SLD
     emittedCandidateKeys: {},         // _candidateKey → true (dedupes flush vs live emission)
@@ -772,6 +779,8 @@ function ConnectionManager(config) {
   // RTCP send/receive, RTP send/receive, NACK retransmit, scheduling timers,
   // BWE feedback dispatch. Most data-plane state still lives in shared state;
   // a future milestone moves it into the class.
+  // onFirstInboundPacket's per-SSRC memo of where its transceiver sits.
+  var _tcByMapping = new WeakMap();
   var mediaTransport = new MediaTransport({
     // Media arriving on an SSRC unmutes the matching receiver track (W3C 5.3).
     //
@@ -795,9 +804,21 @@ function ConnectionManager(config) {
     onFirstInboundPacket: function (ssrc) {
       var mapping = state.remoteSsrcMap && state.remoteSsrcMap[ssrc];
       if (!mapping || mapping.isRtx) return;
-      for (var i = 0; i < state.transceivers.length; i++) {
+      // Runs on every packet. Remember where this SSRC's transceiver sits so
+      // the steady state is one check instead of a scan of all transceivers;
+      // the cached slot is trusted only while it still holds the same
+      // transceiver with the same mid (anything removed or inserted before it
+      // moves it, and the scan runs again).
+      var start = 0;
+      var cached = _tcByMapping.get(mapping);
+      if (cached && state.transceivers[cached.i] === cached.tc &&
+          String(cached.tc.mid) === String(mapping.mid)) {
+        start = cached.i;
+      }
+      for (var i = start; i < state.transceivers.length; i++) {
         var tc = state.transceivers[i];
         if (String(tc.mid) !== String(mapping.mid)) continue;
+        if (!cached || cached.i !== i || cached.tc !== tc) _tcByMapping.set(mapping, { i: i, tc: tc });
         // Negotiated to receive? currentDirection is the committed answer;
         // before the first answer lands it is null and direction stands in.
         var _dir = tc.currentDirection || tc.direction || 'sendrecv';
@@ -866,7 +887,8 @@ function ConnectionManager(config) {
     //     corrects via tie-breaker if we guessed wrong.
     var controlling = (state.mode === 'lite')
       ? false
-      : (state.signalingState === 'have-local-offer');
+      : (state.iceRoleDecided ? state.iceControlling
+                              : (state.signalingState === 'have-local-offer'));
 
     iceAgent = new IceAgent({
       mode:               state.mode,
@@ -883,6 +905,9 @@ function ConnectionManager(config) {
       // External socket mode (shared UDP port — server scenario).
       socket:             config.socket  || null,
       socket6:            config.socket6 || null,
+      // ICE-TCP (passive) carriers — present after router.tcp().
+      tcpSocket:          config.tcpSocket  || null,
+      tcpSocket6:         config.tcpSocket6 || null,
       // Announced addresses override bind-IP when set (needed for NAT /
       // cloud / 0.0.0.0 bind — see IceAgent.gatherHostCandidates).
       announcedAddresses: state.announcedAddresses,
@@ -1219,10 +1244,20 @@ function ConnectionManager(config) {
 
     // Incoming packets from ICE → demux by type
     iceAgent.on('packet', function(buf, rinfo, type) {
-      if (state.closed) return;
+      if (state.closed || state._faulted) return;
+      try { _onIcePacket(buf, rinfo, type); }
+      catch (err) { _fault(err, 'incoming ' + (type || 'packet')); }
+    });
+    function _onIcePacket(buf, rinfo, type) {
 
       // Diagnostic: tally packet types for 30 seconds so we can see if RTCP
       // arrives at all, and which type the classifier assigned.
+      //
+      // WEBRTC_DEBUG only (_DBG_ON). _diag prints nothing without it, but the
+      // tallying ran for every packet regardless — a string key built per
+      // packet, and every 5 s a JSON.stringify per connection for _diag to
+      // throw away (its arguments are computed before it looks at the flag).
+      if (_DBG_ON) {
       if (!state._diagPktCounts) state._diagPktCounts = { dtls:0, rtp:0, rtcp:0, unknown:0 };
       state._diagPktCounts[type || 'unknown']++;
 
@@ -1242,19 +1277,26 @@ function ConnectionManager(config) {
         }, 5000);
         if (state._diagPktCountsTimer.unref) state._diagPktCountsTimer.unref();
       }
+      }
 
       if (type === 'dtls') {
+        // A plain Uint8Array VIEW, not a copy: lemon-tls copies what it keeps
+        // (its record parsing uses Uint8Array.prototype.slice, which copies on
+        // a plain Uint8Array — not on a Buffer, hence not passing buf itself),
+        // and every datagram buffer here is fresh and never written again
+        // (dgram, TCP frames, the in-process TURN relay).
+        var dtlsView = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
         if (state.dtlsSession) {
-          state.dtlsSession.feedDatagram(new Uint8Array(buf));
+          state.dtlsSession.feedDatagram(dtlsView);
         } else {
-          state.dtlsBuffer.push(new Uint8Array(buf));
+          state.dtlsBuffer.push(dtlsView);
         }
       } else if (type === 'rtp') {
         mediaTransport.handleIncomingRtp(buf, rinfo);
       } else if (type === 'rtcp') {
         mediaTransport.handleIncomingRtcp(buf, rinfo);
       }
-    });
+    }
 
     // Feed any remote candidates that arrived before agent was created
     if (state.remoteIceUfrag && state.remoteIcePwd) {
@@ -1798,7 +1840,9 @@ function ConnectionManager(config) {
           }
         }
         if (key === 'connectionState' && !state.closed && !state._closing) ev.emit('connectionstatechange', { type: 'connectionstatechange' });
-        if (key === 'sctpState') ev.emit('sctp:statechange', state.sctpState);
+        // Silent when pc.close() caused it (see close()); an association
+        // that ends on its own (peer ABORT/SHUTDOWN) still fires.
+        if (key === 'sctpState' && !state._pcClosing) ev.emit('sctp:statechange', state.sctpState);
         // Fires on every transition ('new' → 'connecting' → 'connected' →
         // 'failed'/'closed'). Consumed by RTCDtlsTransport.onstatechange.
         // W3C 4.4.3, same rule signalingState already follows: close()
@@ -2338,6 +2382,7 @@ function ConnectionManager(config) {
     // Ordering is the same as fix 23: negotiation outranks observation, so a
     // transceiver negotiated NOT to receive is already muted by that path and
     // is left alone here.
+    if (state._mediaStallTimer) clearInterval(state._mediaStallTimer);
     state._mediaStallTimer = setInterval(function () {
       if (state.closed) return;
       var now = Date.now();
@@ -2389,7 +2434,16 @@ function ConnectionManager(config) {
 
     var _dtlsDataCount = 0;
     session.on('data', function(data) {
-      var buf = Buffer.from(data);
+      if (state._faulted) return;
+      try { _onDtlsData(data); }
+      catch (err) { _fault(err, 'dtls data'); }
+    });
+    function _onDtlsData(data) {
+      // A Buffer VIEW over the same bytes, not a copy. lemon-tls hands up the
+      // decrypted record as a view of the decipher's own fresh output — a new
+      // buffer per record that nothing reuses — and SCTP copies every chunk
+      // payload it keeps (fragStore), so nothing here holds on to it.
+      var buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
       _dtlsDataCount++;
       if (_dtlsDataCount <= 5 || _dtlsDataCount % 50 === 0) {
         _diag('[cm-diag] dtls.data #' + _dtlsDataCount + ' len=' + buf.length +
@@ -2412,6 +2466,22 @@ function ConnectionManager(config) {
         });
       }
       dcController.handleDtlsData(buf);
+    }
+
+    // The peer's close_notify (lemon-tls emits 'close' for it): the DTLS
+    // transport is 'closed' — W3C 5.5, WPT RTCDtlsTransport-state "close()
+    // causes the other end's DTLS transport to close". Nothing listened, so
+    // it stayed 'connected' for good. connectionState is left to its own
+    // rule (ICE connected and every DTLS transport connected or closed is
+    // still 'connected'; ICE consent ends it). Our own close() emits 'close'
+    // too, after state.closed — that one is close()'s, and silent.
+    session.on('close', function() {
+      if (state.closed || state._pcClosing) return;
+      if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
+      if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
+      if (state.dtlsState !== 'closed' && state.dtlsState !== 'failed') {
+        setState({ dtlsState: 'closed' });
+      }
     });
 
     session.on('error', function(err) {
@@ -2877,6 +2947,18 @@ function ConnectionManager(config) {
             streamsAnnounced: (_upAll.length > 1) ? _upAll : null,
           });
         } catch (eUp) {}
+      }
+
+      // RFC 4588: an RTX payload type names the payload type it repairs
+      // (fmtp apt=). Remember it for every m-section, so an incoming RTX
+      // packet is unwrapped with the payload type it actually carries —
+      // not whatever the primary stream's first packet happened to use.
+      if (Array.isArray(m.fmtp)) {
+        if (!state.remoteRtxApt) state.remoteRtxApt = {};
+        for (var _af = 0; _af < m.fmtp.length; _af++) {
+          var _aptM = /(?:^|;)\s*apt=(\d+)/.exec(m.fmtp[_af].config || '');
+          if (_aptM) state.remoteRtxApt[m.fmtp[_af].payload] = parseInt(_aptM[1], 10);
+        }
       }
 
       // Negotiated-RTX override (code-review finding: the birth-time
@@ -3693,8 +3775,42 @@ function ConnectionManager(config) {
     return RtpManager.findPrimaryForRtx(state, rtxMapping);
   }
 
+  // ── Fault boundary ──
+  //
+  // An exception while handling this connection's incoming data — a bug in
+  // the library or a state nobody expected — ended the packet's handling
+  // half done and, thrown on up to the socket, the whole thread with every
+  // connection on it. It ends this connection only: reported with where it
+  // happened, no further packets are handled, and connectionState goes to
+  // 'failed', so the application sees the connection fail and closes it
+  // like any other failure.
+  function _fault(err, where) {
+    if (state._faulted) return;
+    state._faulted = true;
+    try {
+      console.error('[webrtc-server] connection failed on an exception (' + where + ', ice ' +
+        state.localIceUfrag + '/' + state.remoteIceUfrag + ') — only this connection is affected:',
+        err && err.stack ? err.stack : err);
+    } catch (eL) {}
+    try {
+      // dtlsState too, as a DTLS error does: connectionState is re-derived
+      // from it, and a 'connected' DTLS set it straight back to 'connected'.
+      if (!state.closed && state.connectionState !== 'failed' && state.connectionState !== 'closed') {
+        setState({ dtlsState: 'failed', connectionState: 'failed' });
+      }
+    } catch (eS) {
+      try { console.error('[webrtc-server] … and failing the connection threw too:', eS && eS.stack ? eS.stack : eS); } catch (eL2) {}
+    }
+  }
+
   function close() {
     if (state.closed) return;
+    // From here on every transition is close()'s own, and W3C 4.4.1.6 makes
+    // the SCTP transport's one silent (WPT: no statechange on pc.close()).
+    // It comes from dcController.close() below — the ABORT closes the
+    // association — before the final batch that _closing marks, so it has
+    // a flag of its own.
+    state._pcClosing = true;
     // RTCP / TCC / NACK feedback timers are owned by MediaTransport.
     try { mediaTransport.close(); } catch (e) {}
 
@@ -3724,9 +3840,18 @@ function ConnectionManager(config) {
     //
     // Guarded on state.closed so a second close() cannot double-free, and the
     // timer is unref'd so it never holds the process open.
+    // DTLS first, and the ICE agent one task later: DTLS close() sends the
+    // close_notify through the agent (session 'packet' → iceAgent.send).
+    // The agent closed first dropped it, and closed in the same tick its
+    // socket went with the datagram still queued — the same reason as the
+    // ABORT above. Either way the peer's DTLS transport never learned it was
+    // closed and stayed 'connected' (WPT RTCDtlsTransport-state).
     var _teardown = function () {
-      if (iceAgent) { try { iceAgent.close(); } catch (e) {} }
       if (state.dtlsSession) { try { state.dtlsSession.close(); } catch (e) {} }
+      if (iceAgent) {
+        var _iceTimer = setTimeout(function () { try { iceAgent.close(); } catch (e) {} }, 0);
+        if (_iceTimer.unref) _iceTimer.unref();
+      }
     };
     var _tdTimer = setTimeout(_teardown, 0);
     if (_tdTimer.unref) _tdTimer.unref();
@@ -3746,6 +3871,13 @@ function ConnectionManager(config) {
     if (state._dtlsReconcileTimer) {
       clearInterval(state._dtlsReconcileTimer);
       state._dtlsReconcileTimer = null;
+    }
+    // An active interval is a GC root: left running, it kept this whole
+    // connection (DTLS session, keys, transceivers, buffers) alive forever
+    // after close.
+    if (state._mediaStallTimer) {
+      clearInterval(state._mediaStallTimer);
+      state._mediaStallTimer = null;
     }
 
     // W3C webrtc-pc: when the peer connection closes, every transport
@@ -3862,8 +3994,28 @@ function ConnectionManager(config) {
     return m ? m[1].trim() : null;
   }
   function trackNegotiationRole(desc, weAreOfferer) {
-    if (!desc || desc.type !== 'offer' || !desc.sdp) return;  // answers never move roles
     if (state.mode === 'lite') return;
+    // THE FIRST OFFER DECIDES THE ROLE — not the agent's birth.
+    //
+    // An agent born before any negotiation (iceCandidatePoolSize →
+    // pregather) guessed 'controlled' from signalingState 'stable', and the
+    // role never moved after that. So a side that then offered first stayed
+    // controlled: its peer, the answerer, controlled too — every first check
+    // a 487 and a wasted check interval before ICE could connect (measured:
+    // ~45ms on a ~40ms local connection, whenever the answerer's checks
+    // reached the offerer first). libwebrtc decides it the same way: the
+    // initial offerer is controlling (JsepTransportController's
+    // initial_offerer), and rolling the initial offer back undoes the
+    // decision — the next offer, either side's, decides again (this.rollback).
+    if (!desc || desc.type !== 'offer' || !desc.sdp) return;  // answers never move roles
+    if (!state.iceRoleDecided) {
+      state.iceRoleDecided = true;
+      state.iceControlling = !!weAreOfferer;
+      if (iceAgent && iceAgent.role !== (weAreOfferer ? 'controlling' : 'controlled')) {
+        iceAgent.setRole(!!weAreOfferer);
+      }
+      return;
+    }
     var offered = _sdpFirstUfrag(desc.sdp);
     if (offered == null) return;
     var prev = weAreOfferer ? state.localIceUfrag : state.remoteIceUfrag;
@@ -4017,6 +4169,11 @@ function ConnectionManager(config) {
   // setLocal/RemoteDescription({type:'rollback'}) — api.js maps the W3C
   // surface to this internal call).
   this.rollback = function (source, cb) {
+    // Rolling back the very first offer (nothing negotiated yet): the role it
+    // decided goes with it — the next offer decides (trackNegotiationRole).
+    if (state.mode !== 'lite' && !state.currentLocalDescription && !state.currentRemoteDescription) {
+      state.iceRoleDecided = false;
+    }
     sdpOA.rollback(source, cb);
   };
 
@@ -4105,6 +4262,12 @@ function ConnectionManager(config) {
       rtcp:                  raw.rtcp,
       remoteOutbound:        raw.remoteOutbound,
       selectedPair:          state.selectedPair || null,
+      // The agent's own lists, for the candidate and candidate-pair stats:
+      // every pair being checked (with its state and STUN counters) and
+      // every candidate on both sides. Live arrays — read, never written.
+      iceCheckList:          iceAgent ? iceAgent.context.checkList : null,
+      iceLocalCandidates:    iceAgent ? iceAgent.context.localCandidates : null,
+      iceRemoteCandidates:   iceAgent ? iceAgent.context.remoteCandidates : null,
       remoteAddress:         state.remoteAddress || null,
       estimatedBandwidthBps: raw.estimatedBandwidthBps,
       remoteRembBps:         raw.remoteRembBps,

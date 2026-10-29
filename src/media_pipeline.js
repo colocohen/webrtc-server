@@ -1424,12 +1424,12 @@ function createAudioSendPipeline(opts) {
 
     if (changed) {
       try {
-        encoder.configure({
-          codec:            codecInfo.decoderCodec,
-          sampleRate:       codecInfo.clockRate,
-          numberOfChannels: codecInfo.numberOfChannels,
-          bitrate:          bitrate,
-        });
+        // Same configuration as the running one, new bitrate: the track's
+        // actual channel count and the negotiated Opus settings (in-band
+        // FEC, DTX, ...). Reconfiguring from the codec defaults instead
+        // turned those off and switched a mono encoder to stereo — and
+        // back on the next frame, an encoder restart each way.
+        _configureEncoder(_configuredChannels);
       } catch (e) {
         if (typeof console !== 'undefined' && console.error) {
           console.error('[media_pipeline] audio encoder.configure failed:', e && e.message || e);
@@ -1465,9 +1465,16 @@ function createAudioSendPipeline(opts) {
         ssrc: ssrc,
         payloadType: opts.dtmfPayloadType,
         clockRate: 48000,
+        // The audio packetizer's real counter is _seq (see _packetizerSeq).
+        // Reading `sequenceNumber`, which rtp-packet does not have, numbered
+        // the tone 0, 1, 2… on the audio SSRC: a jump back in the stream's
+        // sequence that SRTP read as a rollover (or as replays), after which
+        // the peer could not decrypt the audio any more.
         nextSequenceNumber: function () {
-          var s = packetizer.sequenceNumber & 0xFFFF;
-          packetizer.sequenceNumber = (s + 1) & 0xFFFF;
+          var useSeq = packetizer._seq != null;
+          var s = (useSeq ? packetizer._seq : packetizer.sequenceNumber) & 0xFFFF;
+          if (useSeq) packetizer._seq = (s + 1) & 0xFFFF;
+          else packetizer.sequenceNumber = (s + 1) & 0xFFFF;
           return s;
         },
       });
@@ -1744,7 +1751,7 @@ function createAudioReceivePipeline(opts) {
   var onRtp = function (rtpBuf, rinfo, info) {
     if (stopped) return;
     if (info.ssrc !== ssrc) return;
-    var parsed = parseRtp(rtpBuf);
+    var parsed = (info && info.parsed) || parseRtp(rtpBuf);   // transport already parsed it
     if (!parsed) return;
     jitterBuffer.push(parsed);
   };
@@ -2201,7 +2208,7 @@ function createVideoReceivePipeline(opts) {
                   ' hdr=' + hdrBytes);
     }
     if (info.ssrc !== ssrc) return;
-    var parsed = parseRtp(rtpBuf);
+    var parsed = (info && info.parsed) || parseRtp(rtpBuf);   // transport already parsed it
     if (!parsed) return;
     jitterBuffer.push(parsed);
   };
@@ -2395,9 +2402,47 @@ function createVideoReceiveSimulcastPipeline(opts) {
       reader.read().then(function (r) {
         if (r.done || stopped) return;
         _forwardToMerged(r.value);
+        _forwardToLayer(sub, r.value);
         drain();
       }).catch(function () {});
     })();
+  }
+
+  // The sub-pipeline's own readable is consumed (locked) by the drain above,
+  // so it cannot also be handed to the application: getReader() on it threw.
+  // A layer's stream for the application is a separate one, created on first
+  // request and fed from the same drain. Same bounded queue and drop-on-full
+  // policy as the merged readable.
+  function _forwardToLayer(sub, chunk) {
+    var c = sub._appLayerController;
+    if (!c) return;
+    if (c.desiredSize != null && c.desiredSize <= 0) return;
+    // Its own copy of the bytes: the merged readable carries the same chunk,
+    // and an application transferring or changing one must not affect the
+    // other. (Copied only for layers an application asked for.)
+    var d = chunk.data;
+    var own = (d instanceof ArrayBuffer) ? d.slice(0)
+            : (ArrayBuffer.isView(d) ? Buffer.from(new Uint8Array(d.buffer, d.byteOffset, d.byteLength)) : d);
+    var md = (typeof chunk.getMetadata === 'function') ? chunk.getMetadata() : {};
+    try {
+      c.enqueue({
+        type: chunk.type, timestamp: chunk.timestamp, duration: chunk.duration,
+        data: own,
+        getMetadata: function () { return md; },
+      });
+    } catch (e) { /* closed or cancelled */ }
+  }
+  function _appLayerReadable(sub) {
+    if (!sub._appLayerReadable) {
+      sub._appLayerReadable = new ReadableStream({
+        start: function (c) { sub._appLayerController = c; },
+        cancel: function () { sub._appLayerController = null; },
+      }, {
+        highWaterMark: 30,
+        size: function () { return 1; },
+      });
+    }
+    return sub._appLayerReadable;
   }
 
   // Build sub-pipeline for a single layer. The PRIMARY layer (= first one
@@ -2493,6 +2538,7 @@ function createVideoReceiveSimulcastPipeline(opts) {
     stopped = true;
     for (var si = 0; si < layerPipelines.length; si++) {
       try { layerPipelines[si].sub.stop(); } catch (e) {}
+      try { if (layerPipelines[si].sub._appLayerController) layerPipelines[si].sub._appLayerController.close(); } catch (e) {}
     }
     try { if (_mergedController) _mergedController.close(); } catch (e) {}
   }
@@ -2553,7 +2599,7 @@ function createVideoReceiveSimulcastPipeline(opts) {
   function getLayerEncodedStreams() {
     var m = new Map();
     for (var i = 0; i < layerPipelines.length; i++) {
-      m.set(_layerKey(layerPipelines[i]), layerPipelines[i].sub.readable);
+      m.set(_layerKey(layerPipelines[i]), _appLayerReadable(layerPipelines[i].sub));
     }
     return m;
   }

@@ -190,17 +190,27 @@ class RTCDataChannel {
   /**
    * Send a message. W3C §6.2.5 — accepts string, Buffer, ArrayBuffer.
    * Silent no-op if the channel is not open or SCTP is gone (matches
-   * pre-class behaviour). Throws on SCTP-level errors after firing
-   * 'error' on the channel.
+   * pre-class behaviour) — returns false then, true once the message is
+   * handed to SCTP, so api.js can give back the bytes it counted in
+   * bufferedAmount. Throws on SCTP-level errors after firing 'error' on
+   * the channel.
    */
   send(data) {
     var sctp = this._controller._sctp;
     if (this.readyState !== 'open' || !sctp) {
       if (this._controller._dbgOn) this._controller._diag('DC send SKIPPED — readyState=' + this.readyState +
         ' sctpAssoc=' + !!sctp);
-      return;
+      return false;
     }
-    var buf  = typeof data === 'string' ? Buffer.from(data, 'utf-8') : Buffer.from(data);
+    // No copy here: SCTP copies the bytes into its packets before send()
+    // returns, or snapshots the message itself when it keeps it across ticks
+    // (sctp.send). A typed array / DataView sends its own bytes (W3C §6.2.5,
+    // ArrayBufferView) — Buffer.from(view) would convert element by element.
+    var buf;
+    if (typeof data === 'string') buf = Buffer.from(data, 'utf-8');
+    else if (Buffer.isBuffer(data)) buf = data;
+    else if (ArrayBuffer.isView(data)) buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    else buf = Buffer.from(data);   // ArrayBuffer: a view over it
     var ppid = typeof data === 'string' ? PPID_STRING : PPID_BINARY;
     if (buf.length === 0) ppid = typeof data === 'string' ? PPID_STRING_EMPTY : PPID_BINARY_EMPTY;
 
@@ -212,9 +222,17 @@ class RTCDataChannel {
     // pace via bufferedAmount + the 'bufferedamountlow' event, exactly
     // the pattern browsers force. Checked BEFORE stats/queueing so a
     // rejected send neither inflates counters nor enters the SCTP queue.
-    if (this.bufferedAmount + buf.length > this._maxBufferedAmount) {
+    //
+    // bufferedAmount ALREADY includes this message: api.js raises it in
+    // send() before calling here (and gives it back when this throws).
+    // Adding buf.length again counted the message twice, and refused it
+    // one message short of the cap. Messages still waiting in api.js's
+    // queue behind this one (_sendQBytes) are counted too, but are not
+    // ahead of it.
+    var ahead = this.bufferedAmount - (this._sendQBytes || 0);
+    if (ahead > this._maxBufferedAmount) {
       var qErr = new Error('RTCDataChannel.send: send buffer full — ' +
-        this.bufferedAmount + ' bytes queued + ' + buf.length +
+        (ahead - buf.length) + ' bytes queued + ' + buf.length +
         ' new exceeds maxBufferedAmount (' + this._maxBufferedAmount +
         '). Pace sends: check dataChannel.bufferedAmount and wait for the ' +
         '"bufferedamountlow" event before sending more.');
@@ -270,6 +288,7 @@ class RTCDataChannel {
       // still see the failure.
       throw sendErr;
     }
+    return true;
   }
 
   /**
@@ -295,6 +314,7 @@ class RTCDataChannel {
       if (self.readyState !== 'closing') return;
       self.readyState = 'closed';
       try { self._ev.emit('close'); } catch (e) {}
+      self._controller._forgetChannel(self);
     };
 
     if (sctp && sctp.peerSupportsReconfig && this.id != null) {
@@ -431,12 +451,8 @@ class DataChannelController extends EventEmitter {
     this._diag('startSctp called — role=' + params.dtlsRole +
       ' sctpPort=' + params.localPort + ' remoteSctpPort=' + params.remotePort);
 
-    var sctp = new this._SctpAssociation({
-      port:           params.localPort,
-      remotePort:     params.remotePort,
-      role:           params.dtlsRole,   // 'client' or 'server' — same as DTLS
-      maxMessageSize: params.maxMessageSize,
-    });
+    this._sctpParams = params;
+    var sctp = this._newSctp(null);
 
     this._sctp = sctp;
     this._wireSctpEvents(sctp);
@@ -607,6 +623,14 @@ class DataChannelController extends EventEmitter {
     return this._allocStreamId();
   }
 
+  // A channel that has finished closing leaves the id registry: its stream
+  // id can carry a new channel.
+  // (The channel stays in _dataChannels: getStats() reports closed channels
+  // and lifetime counters from that list.)
+  _forgetChannel(dc) {
+    if (dc.id != null && this._dataChannelMap[dc.id] === dc) delete this._dataChannelMap[dc.id];
+  }
+
   _allocStreamId() {
     if (this._nextDataChannelId === null) {
       // RFC 8832 §6: DTLS-client uses evens (0, 2, 4...), DTLS-server
@@ -618,29 +642,111 @@ class DataChannelController extends EventEmitter {
       var role = this._deps.getDtlsRole();
       this._nextDataChannelId = (role === 'client') ? 0 : 1;
     }
+    // Next id of our parity that no live channel holds (a negotiated channel
+    // may have taken one explicitly). Ids keep increasing, so a just-closed id
+    // is not handed out again while its reset may still be in flight; past
+    // the last stream id, start over from the lowest free one (closed
+    // channels leave the map).
+    var map = this._dataChannelMap;
     var id = this._nextDataChannelId;
-    this._nextDataChannelId += 2;
+    while (id <= 65534 && map[id]) id += 2;
+    if (id > 65534) {
+      id = this._nextDataChannelId % 2;
+      while (id <= 65534 && map[id]) id += 2;
+      if (id > 65534) throw new Error('RTCDataChannel: no free stream id');
+    }
+    this._nextDataChannelId = id + 2;
     return id;
   }
 
 
   /* ====================== Internal — SCTP wiring ====================== */
 
+  // An association for this transport. cookieSecret: the key of the one it
+  // replaces after a peer restart, so it can accept the cookie that one
+  // signed (see _onSctpRestart).
+  _newSctp(cookieSecret) {
+    var params = this._sctpParams;
+    var config = {
+      port:           params.localPort,
+      remotePort:     params.remotePort,
+      role:           params.dtlsRole,   // 'client' or 'server' — same as DTLS
+      maxMessageSize: params.maxMessageSize,
+    };
+    if (cookieSecret) config.cookieSecret = cookieSecret;
+    return new this._SctpAssociation(config);
+  }
+
+  /**
+   * The peer restarted the SCTP association (RFC 4960 §5.2.4 action A): it
+   * lost its state — its channels with it — and set up a new association over
+   * the same DTLS. The old association is dropped without a word (the peer no
+   * longer knows it), a new one takes over from the packet that carried the
+   * restart, and every channel of the old one ends the way a remote ABORT
+   * ends it: 'error' (sctp-failure), then 'close'. The transport stays up —
+   * sctpState remains 'connected' — so channels created from those handlers,
+   * or after, open on the new association.
+   *
+   * Order: the old association goes first (a send from an app handler then
+   * finds no association and is dropped, instead of reaching a peer that no
+   * longer knows the stream); the channels are closed next, and a channel an
+   * app handler creates there waits, 'connecting', for the new association;
+   * the new association comes last, and its 'open' sends that channel's DCEP.
+   */
+  _onSctpRestart(old, info) {
+    if (this._sctp !== old) return;
+    this._diag('sctp restart — the peer restarted the association; channels close, a new association takes over');
+
+    old.destroy();
+    this._sctp = null;
+
+    var failure = this._buildSctpFailure('The peer restarted the SCTP association', null);
+    var live = this._dataChannels.slice();
+    for (var i = 0; i < live.length; i++) {
+      var dc = live[i];
+      if (!dc || dc.readyState === 'closed') continue;
+      if (dc.readyState !== 'closing') {
+        dc.readyState = 'closing';
+        try { dc._ev.emit('closing'); } catch (e) {}
+      }
+      dc.readyState = 'closed';
+      this._forgetChannel(dc);
+      try { dc._ev.emit('error', failure); } catch (e) {}
+      try { dc._ev.emit('close'); } catch (e) {}
+    }
+
+    if (this._deps.getClosed()) return;   // an app handler closed the connection
+    var sctp = this._newSctp(info.cookieSecret);
+    this._sctp = sctp;
+    this._wireSctpEvents(sctp);
+    sctp.handlePacket(info.packet);
+    if (!sctp.established) {
+      // The packet the old association accepted, refused by the new one —
+      // cannot happen with the same key; reported, and the transport is gone.
+      this._diag('sctp restart — the new association did not come up from the restart packet');
+      sctp.destroy();
+      this._sctp = null;
+      this._setSctpState('closed');
+    }
+  }
+
   _wireSctpEvents(sctp) {
     var self = this;
+
+    sctp.on('restart', function (info) { self._onSctpRestart(sctp, info); });
 
     // SCTP→DTLS pipe. The controller is the natural owner of this wire
     // because (a) it owns the SCTP association, and (b) it owns the
     // DTLS reference via deps. Putting the pipe inline in start() keeps
     // wire concerns out of cm.js entirely.
     sctp.on('packet', function (data) {
-      self._diag('sctp→dtls len=' + (data && data.length));
+      if (self._debug) self._diag('sctp→dtls len=' + (data && data.length));   // per packet: no string unless debugging
       var dtls = self._deps.getDtlsSession();
       if (dtls) dtls.send(data);
     });
 
     sctp.on('data', function (streamId, ppid, data) {
-      self._diag('sctp.data streamId=' + streamId + ' ppid=' + ppid +
+      if (self._debug) self._diag('sctp.data streamId=' + streamId + ' ppid=' + ppid +
         ' len=' + (data && data.length));
       if (ppid === PPID_DCEP) {
         self._handleDcep(streamId, data);
@@ -761,6 +867,11 @@ class DataChannelController extends EventEmitter {
           dc.readyState = 'closed';
           try { dc._ev.emit('close'); } catch (e) {}
         }
+        // The peer has reset its side of the stream: the id is free for it to
+        // open a new channel on. Leaving the closed channel registered made a
+        // DCEP_OPEN on that id land on the dead channel — no 'datachannel'
+        // event, and its data delivered to a closed channel.
+        if (dc.readyState === 'closed') self._forgetChannel(dc);
 
         // If peer reset their outgoing (info.incoming=true), reciprocate:
         // reset our outgoing on the same stream so peer sees the channel
@@ -771,62 +882,50 @@ class DataChannelController extends EventEmitter {
       }
     });
 
-    // bufferedAmount accounting (W3C §6.2.1). chunkSent fires every time
-    // send() enqueues bytes; chunkAcked fires when those bytes are
-    // cumulatively SACKed. We translate stream-level events into per-DC
-    // counter updates.
-    //
-    // DCEP control (PPID 50) is filtered out — those are setup bytes
-    // generated by us, not by the application calling dc.send(). W3C
-    // bufferedAmount should reflect only user data.
-    // bufferedAmount ACCOUNTING MODEL (WPT harvest):
+    // bufferedAmount accounting (W3C §6.2.1). Only user data counts: DCEP
+    // control (PPID 50) is setup bytes generated by us, not by the
+    // application calling dc.send().
     //   increase — synchronously inside RTCDataChannel.send() in api.js
     //              (W3C: observable immediately after the call).
-    //   decrease — on chunkAcked below (genuinely-unacked user bytes;
-    //              the useful backpressure signal on an instant-DTLS path).
-    // chunkSent deliberately has NO handler anymore: a second increase
-    // point would double-count every byte against a single drain point,
-    // so bufferedAmount would never return to zero and
-    // 'bufferedamountlow' would never fire.
+    //   decrease — below.
 
-    // DRAIN point = chunkSent (W3C: bufferedAmount decreases when data
-    // is handed to the transport — and WPT measures right after the
-    // receiver got the message, long before SACKs round-trip). chunkAcked
-    // stays as a safety floor for retransmission edge cases.
-    var _drain = function (info /*, deferred */) {
+    // DRAIN point = chunkUnbuffered (W3C §6.2: bufferedAmount counts bytes
+    // queued by send() that have not yet been transmitted to the network).
+    // It fires when a chunk first goes on the wire — or is dropped before
+    // that — so a sender pacing on 'bufferedamountlow' really waits for the
+    // transport. (Draining on chunkSent, which fires when a fragment is
+    // merely queued, let bufferedAmount fall to zero right after send()
+    // while megabytes still sat in the SCTP queue.)
+    //
+    // Drains are summed per stream and applied in ONE microtask: never
+    // inside the send() call itself (its synchronous increase must stay
+    // observable), and before message delivery, a macrotask, so a reader
+    // checking bufferedAmount when the receiver gets a message sees it drained.
+    var _pendingDrain = null;
+    var _applyDrains = function () {
+      var drains = _pendingDrain;
+      _pendingDrain = null;
+      drains.forEach(function (bytes, dc) {
+        var before = dc.bufferedAmount;
+        dc.bufferedAmount = Math.max(0, before - bytes);
+        if (before > dc.bufferedAmountLowThreshold &&
+            dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
+          try { dc._ev.emit('bufferedamountlow', { type: 'bufferedamountlow' }); } catch (e) {}
+        }
+      });
+    };
+    sctp.on('chunkUnbuffered', function (info) {
       if (info.ppid === PPID_DCEP) return;
-      // TIMING GUARD: chunkSent can fire synchronously inside send() on
-      // an open SCTP window — draining in the same tick would erase the
-      // spec-mandated synchronous bufferedAmount increase before the caller
-      // can observe it. So the drain is deferred.
-      //
-      // It must be deferred by a MICROTASK, not a macrotask. The observable
-      // requirement is only that the increase survives the send() call
-      // itself; a microtask satisfies that. But an application — and WPT —
-      // reads the sender's bufferedAmount as soon as the RECEIVER's message
-      // event fires, and message delivery is itself a macrotask. Deferring
-      // with setImmediate put the drain AFTER that read, so bufferedAmount
-      // still showed the full message length long after it had been sent:
-      //
-      //   after send:     bufferedAmount=10   (correct)
-      //   after delivery: bufferedAmount=10   (should be 0)
-      //
-      // queueMicrotask drains before delivery and keeps the synchronous
-      // increase intact.
-      if (!arguments[1]) {
-        queueMicrotask(function () { _drain(info, true); });
-        return;
-      }
+      // The channel is resolved now, not when the microtask runs: by then
+      // its stream id may already carry a new channel.
       var dc = self._dataChannelMap[info.streamId];
       if (!dc) return;
-      var before = dc.bufferedAmount;
-      dc.bufferedAmount = Math.max(0, before - info.bytes);
-      if (before > dc.bufferedAmountLowThreshold &&
-          dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
-        try { dc._ev.emit('bufferedamountlow', { type: 'bufferedamountlow' }); } catch (e) {}
+      if (_pendingDrain === null) {
+        _pendingDrain = new Map();
+        queueMicrotask(_applyDrains);
       }
-    };
-    sctp.on('chunkSent', _drain);
+      _pendingDrain.set(dc, (_pendingDrain.get(dc) || 0) + info.bytes);
+    });
   }
 
   /**
@@ -845,25 +944,31 @@ class DataChannelController extends EventEmitter {
    * api.js publishes both constructors on state; lower layers cannot import
    * them without a cycle.
    */
-  _buildSctpFailure() {
+  // message / causeCode: the defaults describe the connection closing (cause
+  // 12, User-Initiated Abort); a peer restart passes its own message and no
+  // cause code — SCTP defines none for it.
+  _buildSctpFailure(message, causeCode) {
+    if (message === undefined) message = 'The peer connection was closed';
+    if (causeCode === undefined) causeCode = 12;
     var st = (this._deps && this._deps.getState) ? this._deps.getState() : null;
     var ErrCtor = st && st._RTCErrorCtor;
     var EvtCtor = st && st._RTCErrorEventCtor;
     var err = null;
+    var init = { errorDetail: 'sctp-failure' };
+    if (causeCode != null) init.sctpCauseCode = causeCode;
     if (typeof ErrCtor === 'function') {
       try {
-        err = new ErrCtor({ errorDetail: 'sctp-failure', sctpCauseCode: 12 },
-                          'The peer connection was closed');
+        err = new ErrCtor(init, message);
       } catch (e) { err = null; }
     }
     if (!err) {
-      err = new Error('The peer connection was closed');
+      err = new Error(message);
       err.name = 'OperationError';
       err.errorDetail = 'sctp-failure';
-      err.sctpCauseCode = 12;
+      err.sctpCauseCode = causeCode;
     }
     if (typeof EvtCtor === 'function') {
-      try { return new EvtCtor({ error: err }); } catch (e) {}
+      try { return new EvtCtor('error', { error: err }); } catch (e) {}
     }
     return { type: 'error', error: err };
   }
@@ -1001,8 +1106,9 @@ class DataChannelController extends EventEmitter {
 
   get _dbgOn() {
     // hot-path mirror: DataChannel.send checks this BEFORE building the
-    // (potentially long) log string — zero cost when debug is off.
-    return !!(process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true');
+    // (potentially long) log string — zero cost when debug is off. Read once
+    // at load: process.env is slow to read on every send.
+    return _DCC_ENV_DEBUG;
   }
 
   _diag() {
@@ -1016,6 +1122,9 @@ class DataChannelController extends EventEmitter {
   }
 }
 
+
+var _DCC_ENV_DEBUG = typeof process !== 'undefined' && !!process.env &&
+  (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true');
 
 export {
   DataChannelController,

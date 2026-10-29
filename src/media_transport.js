@@ -64,6 +64,16 @@ if (_DROP_RTP_PCT > 0 && typeof console !== 'undefined' && console.warn) {
 }
 
 
+// Minimum spacing of keyframe requests (PLI) for one SSRC — see requestKeyframe.
+var PLI_MIN_INTERVAL_MS = 300;
+
+// Do two byte views overlap in memory?
+function _sharesMemory(a, b) {
+  if (!a || !b || a.buffer !== b.buffer) return false;
+  return a.byteOffset < b.byteOffset + b.byteLength &&
+         b.byteOffset < a.byteOffset + a.byteLength;
+}
+
 class MediaTransport extends EventEmitter {
   /**
    * @param {Object} deps
@@ -162,13 +172,24 @@ class MediaTransport extends EventEmitter {
     // The stamper owns the per-session counter state and centralizes all
     // RTP-protocol knowledge in one place (libwebrtc's RTPSenderEgress
     // does the same).
+    var unstamped = rtpPacket;
     rtpPacket = state.headerStamper.stamp(rtpPacket, hints);
 
-    // Save a copy of the plaintext RTP for potential NACK retransmission.
-    // We store the packet as it will go on the wire (transport-cc extension
-    // already applied) so an RTX retransmit carries the same original
-    // transport-wide seq — that's what the remote expects.
-    state.senderBuffer.store(rtpPacket);
+    // Save the plaintext RTP for potential NACK retransmission. We store the
+    // packet as it will go on the wire (transport-cc extension already
+    // applied) so an RTX retransmit carries the same original transport-wide
+    // seq — that's what the remote expects.
+    //
+    // When stamping built a new packet, that buffer is ours alone and nothing
+    // below writes to it, so it is kept as is. Otherwise it is (or shares
+    // memory with) the caller's buffer, which the caller may reuse: store()
+    // takes a snapshot.
+    if (rtpPacket !== unstamped && !_sharesMemory(rtpPacket, unstamped) &&
+        typeof state.senderBuffer.storeOwned === 'function') {
+      state.senderBuffer.storeOwned(rtpPacket);
+    } else {
+      state.senderBuffer.store(rtpPacket);
+    }
 
     // Bandwidth estimator: record send time so future transport-cc feedback
     // can compute delay gradients against our send times. Pair the recorded
@@ -552,6 +573,16 @@ class MediaTransport extends EventEmitter {
     var state = this._state;
     var mapping = state.remoteSsrcMap[remoteSsrc];
     if (mapping && mapping.isRtx) return;   // PLI to RTX is invalid
+    // One PLI per SSRC per PLI_MIN_INTERVAL_MS. Gap, resync and NACK-overflow
+    // can each ask for a keyframe for the same loss; a keyframe is already
+    // on its way after the first, and the rest only add load on the sender's
+    // encoder (a PLI storm under sustained loss). The pipelines rely on this
+    // ("MediaTransport throttles duplicates").
+    var nowPli = Date.now();
+    if (!this._lastPliAt) this._lastPliAt = Object.create(null);
+    var lastPli = this._lastPliAt[remoteSsrc];
+    if (lastPli !== undefined && nowPli - lastPli < PLI_MIN_INTERVAL_MS) return;
+    this._lastPliAt[remoteSsrc] = nowPli;
     // RFC 4585 6.1: the sender SSRC identifies US. The natural choice is the
     // SSRC we send on this mid — but a RECEIVE-ONLY mid has none, which is
     // the normal case for an SFU consuming a producer's stream, and the
@@ -1029,9 +1060,12 @@ class MediaTransport extends EventEmitter {
                          ? state.rtpStats[_mapping.primarySsrc]
                          : null;
       if (_mapping.primarySsrc != null && primaryStats) {
+        // The payload type the RTX payload type repairs (SDP apt=); the
+        // primary's first payload type only when the SDP did not say.
+        var aptPt = state.remoteRtxApt ? state.remoteRtxApt[rtp[1] & 0x7F] : undefined;
         var primaryPkt = parseRtxPacket(rtp, {
           primarySsrc: _mapping.primarySsrc,
-          primaryPt:   primaryStats.payloadType,
+          primaryPt:   (aptPt != null) ? aptPt : primaryStats.payloadType,
         });
         if (primaryPkt) {
           this._handleIncomingRtpInner(primaryPkt, rinfo, /*isRecovered=*/true, byteLen);
@@ -1217,9 +1251,14 @@ class MediaTransport extends EventEmitter {
       var tccBuf = parsed.extensions[tccExtId];
       if (tccBuf.length >= 2) {
         var tccSeq = tccBuf.readUInt16BE(0);
-        var gen = state.tccFeedbackGenerators[ssrc];
+        // ONE generator for the whole transport. The sequence number is
+        // transport-wide — shared by every SSRC on the transport — so a
+        // generator per SSRC saw only its own share of the numbers and
+        // reported every packet of the other streams in between as lost,
+        // feeding the sender's bandwidth estimate false loss.
+        var gen = state.tccFeedbackGenerators.transport;
         if (!gen) {
-          // Lazily create one generator per incoming media SSRC. The
+          // Created on the first packet carrying the extension. The
           // senderSsrc field on outgoing feedback is our local SSRC on
           // the matching m= section if we know it, else 1.
           var localSenderSsrc = 1;
@@ -1231,7 +1270,7 @@ class MediaTransport extends EventEmitter {
             senderSsrc: localSenderSsrc,
             mediaSsrc:  ssrc,
           });
-          state.tccFeedbackGenerators[ssrc] = gen;
+          state.tccFeedbackGenerators.transport = gen;
         }
         gen.recordArrival(tccSeq, arrival);
       }
@@ -1260,25 +1299,29 @@ class MediaTransport extends EventEmitter {
                     : Date.now();
 
       if (parsed.csrc && parsed.csrc.length) {
-        if (!receiver._csrcEntries) receiver._csrcEntries = [];
+        // Newest sighting per contributing source — exactly what
+        // getContributingSources reports (one entry per source, the newest,
+        // within 10 s). Keeping every sighting in a list grew it by one entry
+        // per CSRC per packet, and its "every 16th append" trim could stop
+        // firing for good once the per-packet CSRC count changed parity.
+        var csrcMap = receiver._csrcEntries;
+        if (!csrcMap || Array.isArray(csrcMap)) csrcMap = receiver._csrcEntries = Object.create(null);
         for (var ci = 0; ci < parsed.csrc.length; ci++) {
-          receiver._csrcEntries.push({
-            source:       parsed.csrc[ci],
-            timestamp:    nowWall,
-            rtpTimestamp: parsed.timestamp,
-          });
-        }
-        // Lazy trim every 16th append — bounds memory growth.
-        // getContributingSources filters at read time anyway.
-        if ((receiver._csrcEntries.length & 0x0F) === 0) {
-          var cutoff = nowWall - 10000;
-          var kept = [];
-          for (var ki = 0; ki < receiver._csrcEntries.length; ki++) {
-            if (receiver._csrcEntries[ki].timestamp >= cutoff) {
-              kept.push(receiver._csrcEntries[ki]);
+          var csrcSrc = parsed.csrc[ci];
+          var ce = csrcMap[csrcSrc];
+          if (ce) { ce.timestamp = nowWall; ce.rtpTimestamp = parsed.timestamp; }
+          else {
+            csrcMap[csrcSrc] = { source: csrcSrc, timestamp: nowWall, rtpTimestamp: parsed.timestamp };
+            receiver._csrcCount = (receiver._csrcCount || 0) + 1;
+            // Sources that went quiet over 10 s ago are never reported again:
+            // drop them once enough have accumulated to be worth a pass.
+            if (receiver._csrcCount > 64) {
+              var csrcCut = nowWall - 10000;
+              for (var ck in csrcMap) {
+                if (csrcMap[ck].timestamp < csrcCut) { delete csrcMap[ck]; receiver._csrcCount--; }
+              }
             }
           }
-          receiver._csrcEntries = kept;
         }
       }
 
@@ -1302,7 +1345,10 @@ class MediaTransport extends EventEmitter {
       receiver._ssrcEntries[ssrc] = _sync;
     }
 
-    var info = { payloadType: pt, sequenceNumber: seq, ssrc: ssrc };
+    // `parsed` rides along so the receive pipeline does not parse the same
+    // packet a second time. Read-only for listeners: nothing here writes to
+    // it after this point.
+    var info = { payloadType: pt, sequenceNumber: seq, ssrc: ssrc, parsed: parsed };
     this.emit('rtp', rtp, rinfo, info);
   }
 

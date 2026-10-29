@@ -716,7 +716,11 @@ function parseRemoteSdp(sdpString) {
       rtcp: m.rtcp || null,
 
       // SCTP (for DataChannel)
-      sctpPort: m.sctpPort || null,
+      // RFC 8841 §5: an SCTP m=application without a=sctp-port means port
+      // 5000. Read as null, the section counted as "no SCTP": remoteSctpPort
+      // stayed unset and the data channel never opened.
+      sctpPort: m.sctpPort ||
+                ((m.type === 'application' && /SCTP/i.test(m.protocol || '')) ? 5000 : null),
       // ZERO IS A VALUE (RFC 8841: no limit), so it must survive the
       // parse — || collapsed it to null, which every consumer then read
       // as "attribute absent" and substituted 65536 for.
