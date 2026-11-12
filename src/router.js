@@ -53,6 +53,7 @@
 //         const router = new WebRTCRouter({ socket, announcedAddresses, turn });
 
 import dgram from 'node:dgram';
+import { checkedSocketBufferSize, udpSocketOptions } from 'turn-server';
 import net from 'node:net';
 
 
@@ -164,6 +165,11 @@ function WebRTCRouter(options) {
   //   await router.listen(443);
   //   await router.listen(443, '0.0.0.0');
   //   await router.listen({ port: 443, address: '::', family: 'udp6' });
+  //
+  // opts.socketBufferSize: the socket's receive/send buffers, in bytes —
+  // 4 MB by default, as turn-server's IceAgent (its udp_buffers.js: the OS
+  // default, 208 KB on Linux, drops a data channel's bursts); 0 or false for
+  // the OS's. The kernel caps it at net.core.rmem_max / wmem_max.
   this.listen = function(portOrOpts, address) {
     return new Promise(function(resolve, reject) {
       if (closed) return reject(new Error('Router closed'));
@@ -187,7 +193,10 @@ function WebRTCRouter(options) {
         return reject(new Error('IPv4 socket already bound on this router'));
       }
 
-      const sock = dgram.createSocket({ type: family, reuseAddr: true });
+      let bufferSize;
+      try { bufferSize = checkedSocketBufferSize(opts.socketBufferSize, 'router.listen: socketBufferSize'); }
+      catch (e) { return reject(e); }
+      const sock = dgram.createSocket(udpSocketOptions({ type: family, reuseAddr: true }, bufferSize));
 
       const onError = function(err) {
         sock.removeListener('error', onError);

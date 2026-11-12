@@ -41,6 +41,7 @@ Build SFUs, MCUs, recording servers, WHIP/WHEP endpoints, SIP gateways, conferen
 - [ICE modes: lite vs full](#ice-modes-lite-vs-full)
 - [Codec support](#codec-support)
 - [Loss resilience](#loss-resilience)
+- [UDP socket buffers](#udp-socket-buffers)
 - [Use cases](#use-cases)
 - [Debugging](#debugging)
 - [Interoperability](#interoperability)
@@ -172,7 +173,7 @@ All standard methods are implemented: `createOffer`, `createAnswer`, `setLocalDe
 
 All standard events are emitted: `ontrack`, `ondatachannel`, `onicecandidate`, `onicecandidateerror`, `onnegotiationneeded`, `onsignalingstatechange`, `oniceconnectionstatechange`, `onicegatheringstatechange`, `onconnectionstatechange`.
 
-The static method `RTCPeerConnection.generateCertificate(algorithm)` produces an `RTCCertificate` you can pass via `configuration.certificates` to reuse a long-lived identity across connections — useful for servers where re-generating certificates per connection is wasteful.
+The static method `RTCPeerConnection.generateCertificate(algorithm)` produces an `RTCCertificate` you can pass via `configuration.certificates` to reuse a long-lived identity across connections — useful for servers where re-generating certificates per connection is wasteful. The certificate (self-signed, ECDSA P-256/P-384/P-521 or RSA) is encoded by `cryptographic-formats`; the keys and signature are `node:crypto`'s. `test/cert.test.js` checks every algorithm with `node:crypto` and `openssl`, and 2,000 certificates in a row (random serials, leading zero bytes among them).
 
 Legacy `createOffer` options are honored for older codebases: `offerToReceiveAudio` / `offerToReceiveVideo` behave per JSEP §5.1 (`true` ensures a receive-capable transceiver exists; `false` strips the receive direction from existing ones).
 
@@ -317,11 +318,13 @@ import { WebRTCRouter, RTCPeerConnection } from 'webrtc-server';
 const router = new WebRTCRouter({
   announcedAddresses: ['203.0.113.5'],
 });
-await router.listen(443);
+await router.listen(443);   // or listen({ port: 443, socketBufferSize: 8 << 20 })
 
 const pc = new RTCPeerConnection({ router });
 // All peers created with { router } share the one UDP socket on :443.
 ```
+
+`listen()` gives the socket 4 MB receive/send buffers (`socketBufferSize`, bytes; `0` for the OS default) — see [UDP socket buffers](#udp-socket-buffers).
 
 **Mode 2: External socket** (coexist with TURN/QUIC on the same port — RFC 9443)
 
@@ -329,7 +332,8 @@ const pc = new RTCPeerConnection({ router });
 import dgram from 'node:dgram';
 import { WebRTCRouter, RTCPeerConnection } from 'webrtc-server';
 
-const socket = dgram.createSocket('udp4');
+// Your socket, your buffers: give it room (see UDP socket buffers below).
+const socket = dgram.createSocket({ type: 'udp4', recvBufferSize: 4 << 20, sendBufferSize: 4 << 20 });
 socket.bind(443);
 
 const router = new WebRTCRouter({
@@ -535,6 +539,29 @@ Three complementary recovery layers run automatically once negotiated — no con
 | **FlexFEC** (flexfec-03, video) | XOR repair packet per group on a dedicated SSRC, paired via `a=ssrc-group:FEC-FR` | ~1/groupSize bitrate overhead | One loss per group, zero RTT |
 
 Recovered packets are re-injected through the normal receive path, so jitter buffering, NACK bookkeeping, and statistics all see them as regular media. FEC packets themselves are excluded from retransmission and congestion-control accounting, matching libwebrtc behavior. Interop verified against the formats Chrome ships (RED at PT 63 with `fmtp <pt>/<pt>`, flexfec-03 with `repair-window`).
+
+## UDP socket buffers
+
+Every UDP socket webrtc-server binds — `WebRTCRouter.listen()`'s, and the
+ones each peer connection binds through turn-server's `IceAgent` — gets 4 MB
+receive and send buffers. The OS default (208 KB on Linux) holds about 180
+datagrams; a data channel at full rate delivers them faster than one
+event-loop turn drains them, and the kernel drops the rest — each a
+retransmission and a congestion-window cut. Measured against Chromium,
+32 MB each way: hundreds of drops with the default, none at 4 MB.
+
+**The kernel caps the size at `net.core.rmem_max` / `wmem_max`, silently**
+— often 208 KB on a stock server, which leaves the buffers where they were.
+On the server, raise it:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
+# kept across reboots:
+printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' > /etc/sysctl.d/90-webrtc.conf
+```
+
+A socket you hand in (`socket`, `socket6`, `WebRTCRouter({ socket })`) is
+yours: set `recvBufferSize` / `sendBufferSize` when you create it.
 
 ## Use cases
 

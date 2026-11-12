@@ -142,6 +142,11 @@ var RTO_MIN_MS          = 400;
 var RTO_MAX_MS          = 60000;
 var ASSOC_MAX_RETRANS   = 10;
 var FAST_RETRANSMIT_THRESHOLD = 3;        // RFC 4960 §7.2.4
+// Max.Burst (RFC 9260 §16, §6.1): packets sent at once, in answer to a SACK
+// or a send. A whole window in one go — a hundred datagrams on a fast link —
+// overruns the receiver's socket buffer (Chrome's, on loopback: hundreds of
+// drops per 16 MB), and each drop is a retransmission and a window cut.
+var MAX_BURST = 4;
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HEARTBEAT_MAX_RETRANS = 5;
 
@@ -283,6 +288,7 @@ function SctpAssociation(config) {
   var maxInitRetransmits      = config.maxInitRetransmits      || 8;
   var assocMaxRetrans         = config.assocMaxRetrans         || ASSOC_MAX_RETRANS;
   var fastRetransmitThreshold = config.fastRetransmitThreshold || FAST_RETRANSMIT_THRESHOLD;
+  var maxBurst                = config.maxBurst                || MAX_BURST;
   var heartbeatIntervalMs     = config.heartbeatIntervalMs     || HEARTBEAT_INTERVAL_MS;
   var heartbeatMaxRetrans     = config.heartbeatMaxRetrans     || HEARTBEAT_MAX_RETRANS;
 
@@ -488,7 +494,11 @@ function SctpAssociation(config) {
    *                   declared dead and the association tears down.
    *   missingReports  count of SACKs that reported this TSN as missing
    *                   (i.e., a higher TSN was acked but this one wasn't).
-   *                   At >= 3 we fast-retransmit per RFC 4960 §7.2.4.
+   *                   At >= 3 we fast-retransmit per RFC 9260 §7.2.4
+   *                   (counted as markMissing says: HTNA, retxFence).
+   *   retxFence       fast-retransmitted: the highest TSN sent at the time.
+   *                   Reports count again only once something above it is
+   *                   acknowledged. null: never fast-retransmitted.
    *
    * Queue invariants:
    *   - Strictly TSN-ordered: sendData appends with the next-monotonic TSN.
@@ -554,9 +564,12 @@ function SctpAssociation(config) {
                                    Math.max(2 * (config.pmtu || DEFAULT_PMTU), 4380));
   var ssthresh          = DEFAULT_A_RWND;     // updated to peer's rwnd on handshake
   var partialBytesAcked = 0;
-  // SCTP-9: gate to halve cwnd at most once per loss event. Gets cleared
-  // when the cum-ack actually advances (peer caught up — loss recovered).
-  var fastRetransmitCutThisRound = false;
+  // Fast Recovery (RFC 9260 §7.2.4): entered at a fast retransmit, with the
+  // highest TSN then outstanding; left when the cumulative ack reaches it,
+  // or at a T3 expiry. cwnd is cut once on the way in, and neither cut again
+  // nor grown inside it. It was left at ANY cumulative-ack advance, so one
+  // burst of losses halved the window once per hole.
+  var fastRecoveryExit = null;
 
   // RTO / RTT state (RFC 4960 §6.3.1).
   // SRTT/RTTVAR are null until the first RTT measurement; before that we
@@ -1550,8 +1563,8 @@ function SctpAssociation(config) {
    *   2. Walk gap blocks. Any chunk whose TSN sits in a gap (i.e., is
    *      below the highest-acked TSN but missing from the gap-block
    *      coverage) gets its missingReports counter bumped. At >= 3 we
-   *      fast-retransmit (RFC 4960 §7.2.4); only the lowest such TSN
-   *      retransmits per SACK to avoid bursts.
+   *      fast-retransmit (RFC 9260 §7.2.4) — every such TSN, lowest
+   *      first, up to Max.Burst per SACK.
    *   3. Manage T3 lifecycle. Empty queue → clear timer; otherwise
    *      restart (covering the new oldest chunk).
    *   4. If we're in SHUTDOWN_PENDING and the queue just drained,
@@ -1644,6 +1657,7 @@ function SctpAssociation(config) {
       if (!e.inFlight || !!e.gapAcked === acked) continue;
       e.gapAcked = acked;
       outstandingBytes += acked ? -e.payloadLen : e.payloadLen;
+      if (acked && (sackHtna === null || tsnGt(e.tsn, sackHtna))) sackHtna = e.tsn;
     }
   }
 
@@ -1660,49 +1674,58 @@ function SctpAssociation(config) {
   // only the lowest — abandoning costs no bandwidth and does not touch cwnd,
   // and one per SACK left the rest waiting for later SACKs, which after a
   // burst never come (then T3, an RTO per message).
+  //
+  // RFC 9260 §7.2.4: a report counts only for a TSN below the highest TSN
+  // this SACK newly acknowledged (HTNA) — a SACK that acknowledges nothing
+  // new, or only what lies below the hole, says nothing about it — except in
+  // Fast Recovery, when the cumulative ack advanced: then every TSN reported
+  // missing. And reports for a TSN already fast-retransmitted count only
+  // from SACKs that acknowledge something sent AFTER that retransmission
+  // (retxFence, as usrsctp's fast_retran_tsn): those sent before it arrived
+  // still report the TSN missing, and each three of them sent it again — on
+  // loopback against Chrome, seven retransmissions for every lost packet.
+  // RFC 9260 §7.2.4 makes such a TSN ineligible outright; then a lost
+  // retransmission waits for T3 (400 ms at least), and at 5% loss the
+  // transfer took twice as long.
   var sackAbandon = null;   // messageSeqs to abandon after this SACK's walk; null outside one
   var sackNow = 0;
-  function markMissing(k, fastIdx) {
+  var sackHtna = null;      // this SACK: the highest TSN it newly acknowledged
+  var sackCountAll = false; // this SACK: in Fast Recovery, and the cumulative ack advanced
+  var sackFast = null;      // this SACK: the chunks at the threshold, lowest TSN first
+  function markMissing(k) {
     var entry = sendQueue[k];
-    if (!entry.inFlight) return fastIdx;
+    if (!entry.inFlight) return;
+    if (!sackCountAll && !(sackHtna !== null && tsnLt(entry.tsn, sackHtna))) return;
+    if (entry.retxFence !== null && !(sackHtna !== null && tsnGt(sackHtna, entry.retxFence))) return;
     entry.missingReports++;
     if (entry.missingReports >= fastRetransmitThreshold) {
-      if (sackAbandon !== null && shouldAbandon(entry, sackNow)) {
-        sackAbandon.add(entry.messageSeq);
-        return fastIdx;
-      }
-      if (fastIdx === -1) return k;
+      if (shouldAbandon(entry, sackNow)) sackAbandon.add(entry.messageSeq);
+      else sackFast.push(entry);
     }
-    return fastIdx;
   }
 
   // Every queued chunk whose offset from cumTsn is in [lo, hi] — found by
   // binary search (the queue is in ascending TSN order), then walked.
-  function markMissingRange(lo, hi, cumTsn, fastIdx) {
-    if (lo > hi) return fastIdx;
+  function markMissingRange(lo, hi, cumTsn) {
+    if (lo > hi) return;
     var a = 0, b = sendQueue.length;
     while (a < b) {
       var mid = (a + b) >> 1;
       if (((sendQueue[mid].tsn - cumTsn) >>> 0) < lo) a = mid + 1; else b = mid;
     }
-    for (var k = a; k < sendQueue.length && ((sendQueue[k].tsn - cumTsn) >>> 0) <= hi; k++) {
-      fastIdx = markMissing(k, fastIdx);
-    }
-    return fastIdx;
+    for (var k = a; k < sendQueue.length && ((sendQueue[k].tsn - cumTsn) >>> 0) <= hi; k++) markMissing(k);
   }
 
   // The walk of the whole queue against the gap blocks (sorted by start).
   function markMissingScan(gaps, highestAckedTsn) {
-    var fastIdx = -1;
     var gp = 0;
     for (var k = 0; k < sendQueue.length; k++) {
       var entry = sendQueue[k];
       if (!tsnLeq(entry.tsn, highestAckedTsn)) break;
       while (gp < gaps.length && tsnLt(gaps[gp].end, entry.tsn)) gp++;
       var inGap = gp < gaps.length && tsnLeq(gaps[gp].start, entry.tsn);
-      if (!inGap) fastIdx = markMissing(k, fastIdx);
+      if (!inGap) markMissing(k);
     }
-    return fastIdx;
   }
 
   function handleSack(data) {
@@ -1781,9 +1804,11 @@ function SctpAssociation(config) {
     // (slow-start exponential / CA linear) at the end.
     var dropCount  = 0;
     var bytesAcked = 0;
+    sackHtna = null;
     while (dropCount < sendQueue.length && tsnLeq(sendQueue[dropCount].tsn, cumTsn)) {
       var acked = sendQueue[dropCount];
       ackedSomething = true;
+      if (!acked.gapAcked) sackHtna = acked.tsn;   // newly acknowledged by this SACK
       // Karn's algorithm skips retransmitted chunks. A chunk the peer had
       // already reported in an earlier SACK is skipped too: it was received
       // back then (gap-acked behind a hole) and is only cum-acked now that
@@ -1809,11 +1834,13 @@ function SctpAssociation(config) {
     // updateGapCoverage) — so a hole does not freeze the window.
     updateGapCoverage(cumTsn, gaps);
 
-    // SCTP-9: cum-ack progressed → loss event recovered. Allow another
-    // fast-retransmit halving on the next loss.
-    // SCTP-14: forward progress also retires any T3 backoff still in effect.
-    if (dropCount > 0) fastRetransmitCutThisRound = false;
-    // SCTP-14: any evidence the peer is still receiving retires the backoff.
+    // Fast Recovery (RFC 9260 §7.2.4): in it, a SACK that advances the
+    // cumulative ack has every TSN it reports missing counted (markMissing);
+    // it is over once that ack reaches the TSN it was entered at.
+    sackCountAll = fastRecoveryExit !== null && dropCount > 0;
+    if (fastRecoveryExit !== null && tsnLeq(fastRecoveryExit, cumTsn)) fastRecoveryExit = null;
+    // SCTP-14: any evidence the peer is still receiving retires the T3
+    // backoff still in effect.
     // BOTH signals are needed and they are not the same event. A cum-ack
     // advance is the obvious one. Gap progress catches the case where the
     // head chunk is missing so cumTsn cannot move at all. And the reverse:
@@ -1833,7 +1860,8 @@ function SctpAssociation(config) {
     }
     // A stream may have just gone quiet — release any reset waiting on it.
     _releaseReadyStreamResets();
-    // SCTP-9: grow cwnd according to slow-start / CA rules.
+    // SCTP-9: grow cwnd according to slow-start / CA rules — not in Fast
+    // Recovery (RFC 9260 §7.2.4).
     // RFC 4960 §7.2.1 gates growth on "cwnd was fully utilised". The
     // strict reading "outstandingBytes >= cwnd" is overly conservative
     // when chunks don't pack the window exactly: transmitPending stops
@@ -1850,7 +1878,7 @@ function SctpAssociation(config) {
     // transmitPending keeps and tests the same way ("nothing pending" is
     // inFlightCount === sendQueue.length). It walked the queue to find one.
     var hasPending = inFlightCount < sendQueue.length;
-    if (bytesAcked > 0 && hasPending) {
+    if (bytesAcked > 0 && hasPending && fastRecoveryExit === null) {
       var mtu = pmtu;
       if (cwnd < ssthresh) {
         // Slow start: cwnd += min(bytes, MTU). The min cap prevents one
@@ -1890,7 +1918,7 @@ function SctpAssociation(config) {
     // the LOWEST such chunk that's hit FAST_RETRANSMIT_THRESHOLD reports.
     if (sendQueue.length > 0 && gaps.length > 0) {
       var highestAckedTsn = gaps[gaps.length - 1].end;
-      var fastRetransmitIdx = -1;
+      sackFast = [];
       sackAbandon = new Set();
       sackNow = now;
 
@@ -1938,63 +1966,66 @@ function SctpAssociation(config) {
         if (cs >= 0x80000000 || ce >= 0x80000000 || cs > ce) byHoles = false;
       }
       if (!byHoles) {
-        fastRetransmitIdx = markMissingScan(gaps, highestAckedTsn);
+        markMissingScan(gaps, highestAckedTsn);
       } else {
         var pos = 1;                                // first offset not yet known covered
         for (var gi = 0; gi < gaps.length && pos <= hOff; gi++) {
           var gsOff = ((gaps[gi].start - cumTsn) >>> 0);
           var geOff = ((gaps[gi].end - cumTsn) >>> 0);
           if (gsOff > pos) {
-            fastRetransmitIdx = markMissingRange(pos, Math.min(gsOff - 1, hOff), cumTsn, fastRetransmitIdx);
+            markMissingRange(pos, Math.min(gsOff - 1, hOff), cumTsn);
           }
           if (geOff + 1 > pos) pos = geOff + 1;
         }
         if (pos <= hOff) {
-          fastRetransmitIdx = markMissingRange(pos, hOff, cumTsn, fastRetransmitIdx);
+          markMissingRange(pos, hOff, cumTsn);
         }
       }
 
       var toDrop = sackAbandon;
       sackAbandon = null;
-      var fr = fastRetransmitIdx !== -1 ? sendQueue[fastRetransmitIdx] : null;
       // SCTP-6: abandon-before-retransmit — see markMissing. The budget
       // check is `>=` evaluated BEFORE the increment, so retransmits=N with
       // maxRetransmits=N means "next retransmit would be N+1 = over budget".
       if (toDrop.size > 0) abandonMessages(toDrop);
-      // The chunk picked for retransmit may belong to a message just
-      // abandoned (another fragment of it ran out of budget).
-      if (fr !== null && fr.abandoned) fr = null;
 
-      if (fr !== null) {
-        {
-          fr.retransmits++;
-          fr.missingReports = 0;
-          fr.sentAt = now;
-          // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
-          // no CRC recomputation. Packet bytes are byte-identical to the
-          // original send (vtag, ports, TSN, payload all unchanged).
-          _sctpDiagPacket(soloPacket(fr), 'retransmit');
-          ev.emit('packet', fr.packet);
-          sctpStats.fastRetransmits++;
-          sctpStats.chunksRetransmitted++;
+      // Every chunk at the threshold goes again (RFC 9260 §7.2.4: all that
+      // are marked, as cwnd allows) — up to Max.Burst of them now, lowest TSN
+      // first; the rest, still at the threshold, with the next SACK. Only
+      // the lowest went: with several holes in one window (a burst of
+      // losses), each waited for a SACK of its own, and the last ones for T3.
+      // A chunk whose message was just abandoned (another fragment of it ran
+      // out of budget) is not resent.
+      var frs = sackFast;
+      sackFast = null;
+      var resent = 0;
+      for (var fi = 0; fi < frs.length && resent < maxBurst; fi++) {
+        var fr = frs[fi];
+        if (fr.abandoned) continue;
+        resent++;
+        fr.retransmits++;
+        fr.missingReports = 0;
+        fr.retxFence = sendQueue[inFlightCount - 1].tsn;   // the highest TSN sent so far
+        fr.sentAt = now;
+        // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
+        // no CRC recomputation. Packet bytes are byte-identical to the
+        // original send (vtag, ports, TSN, payload all unchanged).
+        _sctpDiagPacket(soloPacket(fr), 'retransmit');
+        ev.emit('packet', fr.packet);
+        sctpStats.fastRetransmits++;
+        sctpStats.chunksRetransmitted++;
+      }
 
-          // SCTP-9: fast retransmit signals moderate congestion (peer's
-          // sending SACKs, path's not dead — just losing some chunks).
-          // RFC 4960 §7.2.4:
-          //   ssthresh = max(cwnd/2, 4*MTU)
-          //   cwnd     = ssthresh   ← NOT 1*MTU; we go straight to CA
-          //   pba      = 0
-          // We only halve once per "loss event" — multiple gap-block
-          // detections in the same SACK shouldn't keep cutting cwnd.
-          // Track via a flag we reset when something gets cum-acked.
-          if (!fastRetransmitCutThisRound) {
-            var mtu = pmtu;
-            ssthresh          = Math.max((cwnd / 2) | 0, 4 * mtu);
-            cwnd              = ssthresh;
-            partialBytesAcked = 0;
-            fastRetransmitCutThisRound = true;
-          }
-        }
+      // SCTP-9: fast retransmit signals moderate congestion (peer's sending
+      // SACKs, path's not dead — just losing some chunks). RFC 4960 §7.2.4:
+      //   ssthresh = max(cwnd/2, 4*MTU); cwnd = ssthresh (straight to CA); pba = 0
+      // Once per loss event: on entering Fast Recovery (fastRecoveryExit).
+      if (resent > 0 && fastRecoveryExit === null) {
+        var mtu = pmtu;
+        ssthresh          = Math.max((cwnd / 2) | 0, 4 * mtu);
+        cwnd              = ssthresh;
+        partialBytesAcked = 0;
+        fastRecoveryExit  = sendQueue[inFlightCount - 1].tsn;   // the highest outstanding
       }
     }
 
@@ -3589,6 +3620,7 @@ function SctpAssociation(config) {
       sentAt:         nowTs,
       retransmits:    0,
       missingReports: 0,
+      retxFence:      null,       // fast-retransmitted: the highest TSN sent then (markMissing)
       needsRetx:      false,      // SCTP-14: set by T3 (RFC 4960 §6.3.3 E3)
       messageSeq:     job.messageSeq,
       mid:            job.mid,        // SCTP-14: needed for I-FORWARD-TSN skips
@@ -4085,6 +4117,7 @@ function SctpAssociation(config) {
 
     function flushBundle() {
       if (bundle.length === 0) return;
+      packetsOut++;
       if (bundle.length === 1) {
         // Single chunk — emit its standalone packet untouched (byte-for-
         // byte identical to the non-bundled path; no concat, no CRC redo).
@@ -4113,12 +4146,18 @@ function SctpAssociation(config) {
       bundleLen = 0;
     }
 
+    var packetsOut = 0;     // packets emitted this pass (Max.Burst)
     for (var i = inFlightCount; i < sendQueue.length; i++) {
       var entry = sendQueue[i];
       // Invariant: entry.inFlight === false here.
       if ((outstandingBytes + entry.payloadLen) > effectiveWindow && !probeAllowed) {
         break;   // stop at the first non-fitting entry
       }
+      // Max.Burst: no more packets than that in one pass — the rest go as
+      // the SACKs for these come back (ack-clocked).
+      var nextLen = entry.packet.length - SCTP_HEADER_OVERHEAD;
+      var opensPacket = bundle.length === 0 || nextLen > maxChunksBytes || bundleLen + nextLen > maxChunksBytes;
+      if (opensPacket && packetsOut + (bundle.length > 0 ? 1 : 0) >= maxBurst) break;
       probeAllowed = false;   // probe is one-shot: only the first chunk of a
                               // pass may exceed the window, and only when the
                               // link is otherwise idle
@@ -4151,6 +4190,7 @@ function SctpAssociation(config) {
       // current bundle, then emit it solo (its own standalone packet).
       if (chunkLen > maxChunksBytes) {
         flushBundle();
+        packetsOut++;
         ev.emit('packet', soloPacket(entry));
         continue;
       }
@@ -4649,6 +4689,7 @@ function SctpAssociation(config) {
       re.needsRetx = true;
       re.gapAcked  = false;
       re.missingReports = 0;   // reports from before the timeout are void (RFC 4960 §6.3.3)
+      re.retxFence = null;            // resent by T3: counted afresh
       pendingBytes += re.payloadLen;   // SCTP-14: moved in-flight -> pending
     }
     outstandingBytes = 0;
@@ -4657,6 +4698,8 @@ function SctpAssociation(config) {
 
     oldest.sentAt = now;
     oldest.missingReports = 0;   // expiry supersedes any in-flight gap reporting
+    oldest.retxFence = null;
+    fastRecoveryExit = null;     // a T3 expiry ends Fast Recovery (RFC 9260 §7.2.4)
     // Retransmit the oldest chunk here and now; the rest go out through
     // transmitPending as cwnd (one MTU, then slow start) permits.
     oldest.needsRetx = false;    // already counted via oldest.retransmits++ above

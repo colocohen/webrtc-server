@@ -13,6 +13,7 @@ import {
   createAudioSendPipeline, createAudioReceivePipeline,
 } from './media_pipeline.js';
 import * as SDP from './sdp.js';
+import { pem as PEM } from 'cryptographic-formats';
 import * as RtpManager from './rtp_transmission_manager.js';
 import { getSupportedVideoCodecs, getSupportedAudioCodecs, MediaStreamTrack } from 'media-processing';
 
@@ -6946,11 +6947,9 @@ function _certificateEntry(fp, isLocal, now, pem) {
         if (typeof pem !== 'string' && pem.length != null) {
           return Buffer.from(pem).toString('base64');
         }
-        var body = String(pem)
-          .replace(/-----BEGIN CERTIFICATE-----/g, '')
-          .replace(/-----END CERTIFICATE-----/g, '')
-          .replace(/[\r\n\s]/g, '');
-        return body;
+        // The PEM's first certificate (cryptographic-formats): its DER, in base64
+        var block = PEM.decode(String(pem)).filter(function (b) { return b.label === 'CERTIFICATE'; })[0];
+        return block ? Buffer.from(block.der).toString('base64') : '';
       } catch (eB) { return ''; }
     })(),
   };

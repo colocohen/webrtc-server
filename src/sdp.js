@@ -1878,11 +1878,17 @@ function resolveSetup(offerSetup) {
   return 'active';
 }
 
-// Generate random ICE credentials
+// Generate random ICE credentials.
+//
+// Both are ice-char strings (RFC 8839 §5.4: ALPHA / DIGIT / "+" / "/"),
+// ufrag 4-256 characters, pwd 22-256. The pwd was 16 random bytes in base64:
+// 24 characters ending in "==", and "=" is no ice-char — Chromium logs it as
+// a protocol violation it tolerates "to allow upgrading", for now. 18 bytes
+// are 24 base64 characters with no padding: 144 bits, all of them ice-chars.
 function generateIceCredentials() {
   return {
     ufrag: crypto.randomBytes(4).toString('hex'),
-    pwd: crypto.randomBytes(16).toString('base64'),
+    pwd: crypto.randomBytes(18).toString('base64'),
   };
 }
 

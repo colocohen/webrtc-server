@@ -6,6 +6,7 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { DTLSSession } from 'lemon-tls';
+import { pem as PEM } from 'cryptographic-formats';
 import * as SDP from './sdp.js';
 import { IceAgent } from 'turn-server';
 import { SctpAssociation } from './sctp.js';
@@ -2169,20 +2170,28 @@ function ConnectionManager(config) {
     var certStr = typeof state.cert === 'string' ? state.cert : state.cert.toString();
     var keyStr  = typeof state.key  === 'string' ? state.key  : state.key.toString();
 
-    // Validate PEM shape before handing to lemon-tls, so a malformed cert
-    // gives a clear diagnostic rather than ERR_OSSL_PEM_NO_START_LINE from
-    // deep inside OpenSSL.
-    if (!/^-----BEGIN /.test(certStr)) {
-      console.error('[dtls] cert is not a PEM string. typeof=', typeof state.cert,
+    // Validate the PEM before handing it to lemon-tls, so a malformed cert
+    // gives a clear diagnostic here rather than an error from deep inside the
+    // handshake setup. cryptographic-formats reads the blocks: the cert must hold a
+    // CERTIFICATE block and the key a private key one, each decoding.
+    var pemProblem = function (text, labels) {
+      var blocks;
+      try { blocks = PEM.decode(text); } catch (e) { return e.message; }
+      return blocks.some(function (b) { return labels.indexOf(b.label) >= 0; })
+        ? null : 'no ' + labels.join(' / ') + ' block (found: ' + blocks.map(function (b) { return b.label; }).join(', ') + ')';
+    };
+    var certProblem = pemProblem(certStr, ['CERTIFICATE']);
+    if (certProblem) {
+      console.error('[dtls] cert is not a PEM certificate:', certProblem, 'typeof=', typeof state.cert,
                     'length=', certStr.length,
                     'first 120 chars:', JSON.stringify(certStr.substring(0, 120)));
-      throw new Error('startDtls: cert does not appear to be PEM');
+      throw new Error('startDtls: cert does not appear to be PEM (' + certProblem + ')');
     }
-    if (!/^-----BEGIN /.test(keyStr)) {
-      console.error('[dtls] key is not a PEM string. typeof=', typeof state.key,
-                    'length=', keyStr.length,
-                    'first 120 chars:', JSON.stringify(keyStr.substring(0, 120)));
-      throw new Error('startDtls: key does not appear to be PEM');
+    var keyProblem = pemProblem(keyStr, ['PRIVATE KEY', 'EC PRIVATE KEY', 'RSA PRIVATE KEY', 'ENCRYPTED PRIVATE KEY']);
+    if (keyProblem) {
+      console.error('[dtls] key is not a PEM private key:', keyProblem, 'typeof=', typeof state.key,
+                    'length=', keyStr.length);
+      throw new Error('startDtls: key does not appear to be PEM (' + keyProblem + ')');
     }
 
     var isServer = (state.dtlsRole === 'server');
@@ -2199,21 +2208,15 @@ function ConnectionManager(config) {
       // that DTLS-SRTP key derivation depends on); we were the ones
       // capping it. A peer that speaks only 1.2 still negotiates 1.2,
       // because offering a version never removes the older ones.
-      // DTLS 1.2 for now. Chrome 137+ and Firefox negotiate DTLS 1.3
-      // when offered, and lemon-tls implements it — a local loopback
-      // completes a 1.3 handshake (version reads 0xFEFC), carries a data
-      // channel and derives SRTP keys correctly. But against Chrome the
-      // handshake gets as far as Finished and then the connection dies:
-      // Chrome's flight arrives and is read in full (ServerHello,
-      // EncryptedExtensions, CertificateRequest, Certificate,
-      // CertificateVerify, Finished), so version selection, the 1.3
-      // record layer and the key schedule are all fine — what Chrome
-      // rejects is something in OUR reply, and there is no falling back
-      // once 1.3 has been selected.
-      // To retry: set 'DTLSv1.3' here AND put the 1.3 cipher suites
-      // (0x1301/0x1302/0x1303) first in the list below — a 1.2-only
-      // cipher list makes a 1.3 handshake fail with "No cipher suite in
-      // common". lemon-tls logs both directions under WEBRTC_DEBUG=1.
+      //
+      // Verified against Chromium 141 (lemon-tls r90), webrtc-server as the
+      // DTLS client and as the DTLS server: DTLS 1.2 and DTLS 1.3 both carry
+      // a data channel. (An earlier note here said 1.3 died against Chrome
+      // after the Finished; that is no longer so.) In that test Chromium
+      // offered DTLS 1.3 only with the WebRTC-ForceDtls13 field trial forced
+      // on — Playwright runs it with --disable-field-trial-config, so what a
+      // stock Chrome enables by default was not seen; without the trial it
+      // offered, and negotiated, 1.2.
       maxVersion: 'DTLSv1.3',
       minVersion: 'DTLSv1.2',
       rejectUnauthorized: false,
