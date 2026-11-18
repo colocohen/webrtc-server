@@ -3,7 +3,7 @@
 // Built on top of sdp-transform for generic SDP parse/write.
 
 import sdpTransform from 'sdp-transform';
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
 
 
 /* ========================= Constants ========================= */
@@ -867,7 +867,7 @@ function createAnswer(parsedOffer, config) {
       localAudioCodecs: localAudioCodecs,
       localVideoCodecs: localVideoCodecs,
       localSsrc: config.ssrcs ? config.ssrcs[offer.mid] : null,
-      localCname: config.cname || crypto.randomBytes(8).toString('hex'),
+      localCname: config.cname || randomBuffer(8).toString('hex'),
       localExtensions: config.extensions ? config.extensions[offer.type] : null,
       // User-set transceiver.direction for this mid (from MSF). Per W3C §5.5
       // step 2, the answer's direction is the intersection of offer dir,
@@ -1887,14 +1887,14 @@ function resolveSetup(offerSetup) {
 // are 24 base64 characters with no padding: 144 bits, all of them ice-chars.
 function generateIceCredentials() {
   return {
-    ufrag: crypto.randomBytes(4).toString('hex'),
-    pwd: crypto.randomBytes(18).toString('base64'),
+    ufrag: randomBuffer(4).toString('hex'),
+    pwd: randomBuffer(18).toString('base64'),
   };
 }
 
 // Generate random SSRC
 function generateSsrc() {
-  return crypto.randomBytes(4).readUInt32BE(0);
+  return randomBuffer(4).readUInt32BE(0);
 }
 
 // Get the first BUNDLE group mids (most common case)

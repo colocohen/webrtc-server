@@ -4,7 +4,10 @@
 // Emits raw 'data' events: (streamId, ppid, payload).
 // Consumers (connection_manager.js) interpret PPIDs and handle DCEP.
 
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+import { equal_sync } from 'cryptographic-primitives/ct.js';
 import { EventEmitter } from 'node:events';
 import flatRanges from 'flat-ranges';
 
@@ -358,16 +361,16 @@ function SctpAssociation(config) {
 
   // Association state
   var state = STATE_CLOSED;
-  var localVerificationTag = crypto.randomBytes(4).readUInt32BE(0);
+  var localVerificationTag = randomBuffer(4).readUInt32BE(0);
   var remoteVerificationTag = 0;
-  var localTsn = crypto.randomBytes(4).readUInt32BE(0);   // our next TSN to send
+  var localTsn = randomBuffer(4).readUInt32BE(0);   // our next TSN to send
   var remoteTsn = 0;                                       // expected next TSN from peer
   var remoteRwnd = DEFAULT_A_RWND;
   // The key that signs our State Cookies. config.cookieSecret lets an
   // association verify cookies another one issued — the owner replacing an
   // association after a peer restart hands the new one the old one's key,
   // since the restart's COOKIE ECHO was signed by the old (see 'restart').
-  var cookieSecret = config.cookieSecret ? Buffer.from(config.cookieSecret) : crypto.randomBytes(16);
+  var cookieSecret = config.cookieSecret ? Buffer.from(config.cookieSecret) : randomBuffer(16);
 
   // Stream state
   var sendSSN = {};      // streamId → next SSN (sequence number within stream)
@@ -1101,7 +1104,7 @@ function SctpAssociation(config) {
         state === STATE_SHUTDOWN_SENT ||
         state === STATE_SHUTDOWN_RECEIVED) {
       var newTag = randomTag();
-      var newTsn = crypto.randomBytes(4).readUInt32BE(0);
+      var newTsn = randomBuffer(4).readUInt32BE(0);
       sendInitAck(initiateTag, newTag, newTsn,
                   makeCookie(initiateTag, newTag, newTsn, initialTsn, aRwnd, numOutbound, numInbound,
                              remoteVerificationTag, localVerificationTag, extMask));
@@ -1131,7 +1134,7 @@ function SctpAssociation(config) {
   // A Verification Tag: random, never zero (RFC 4960 §5.3.1).
   function randomTag() {
     var t;
-    do { t = crypto.randomBytes(4).readUInt32BE(0); } while (t === 0);
+    do { t = randomBuffer(4).readUInt32BE(0); } while (t === 0);
     return t;
   }
 
@@ -1164,7 +1167,7 @@ function SctpAssociation(config) {
     cookieData.writeUInt32BE(localTieTag >>> 0, 36);
     cookieData[40] = extMask & 0xFF;
 
-    var mac = crypto.createHmac('sha256', cookieSecret).update(cookieData).digest();
+    var mac = hmac_sync(sha256_sync, cookieSecret, cookieData);
     return Buffer.concat([cookieData, mac]);
   }
 
@@ -1248,8 +1251,8 @@ function SctpAssociation(config) {
     var cookieMac  = data.subarray(COOKIE_DATA_LEN, COOKIE_DATA_LEN + COOKIE_MAC_LEN);
 
     // Verify MAC. timingSafeEqual prevents timing-based key recovery.
-    var expectedMac = crypto.createHmac('sha256', cookieSecret).update(cookieData).digest();
-    if (!crypto.timingSafeEqual(Buffer.from(cookieMac), expectedMac)) {
+    var expectedMac = hmac_sync(sha256_sync, cookieSecret, cookieData);
+    if (!equal_sync(cookieMac, expectedMac)) {
       try { ev.emit('protocolViolation', { code: 'cookie-mac-invalid' }); } catch (e) {}
       return;
     }
@@ -2183,7 +2186,7 @@ function SctpAssociation(config) {
     }
 
     // Build a fresh nonce; remember it for the matching HB_ACK.
-    var nonce = crypto.randomBytes(16);
+    var nonce = randomBuffer(16);
     hbOutstandingNonce = nonce;
 
     // Heartbeat Info parameter: type(2)=1, length(2), body(N).

@@ -21,7 +21,7 @@
 // milestone 2). Subsequent milestones may further isolate the state, but
 // for now the goal is a tight, safe code-move with zero behavior change.
 
-import crypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import { createSecureContext } from 'lemon-tls';
 import { generateCertificate } from './cert.js';
 import * as SDP from './sdp.js';
@@ -100,7 +100,7 @@ function ensureLocalFingerprint(state) {
       cert: typeof state.cert === 'string' ? state.cert : state.cert.toString(),
     });
     var certDer = sctx.certificateChain[0].cert;
-    var fpHash = crypto.createHash('sha256').update(certDer).digest();
+    var fpHash = sha256_sync(certDer);
     state.localFingerprint = {
       algorithm: 'sha-256',
       value: Array.from(new Uint8Array(fpHash)).map(function(b) {

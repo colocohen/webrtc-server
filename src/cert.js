@@ -1,8 +1,9 @@
 // src/cert.js
 // Generate self-signed ECDSA (P-256) certificates for DTLS.
 // The certificate's encoding is cryptographic-formats' (x509_build: the
-// TBSCertificate to sign, then the certificate around the signature); the
-// keys and the signature are node:crypto's.
+// TBSCertificate to sign, then the certificate around the signature; the
+// keys' PKCS#8 and SPKI); the keys and the signature are
+// cryptographic-primitives' (it picks native or pure JavaScript).
 //
 // Usage:
 //   import { generateCertificate } from './cert.js';
@@ -14,29 +15,36 @@
 // node:crypto refuse, crashing DTLS setup at startup. cryptographic-formats writes
 // minimal DER whatever the bytes.
 
-import crypto from 'node:crypto';
 import { x509_build, pem } from 'cryptographic-formats';
+import * as PKCS8 from 'cryptographic-formats/pkcs8';
+import * as SPKI from 'cryptographic-formats/spki';
+import * as SIG from 'cryptographic-formats/signature';
+import { p256, p384, p521 } from 'cryptographic-primitives/nist.js';
+import * as RSA from 'cryptographic-primitives/rsa.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
+import { sha256_sync, sha384_sync, sha512_sync } from 'cryptographic-primitives/sha2.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 
 
 /* ========================= Algorithm parameter resolution ========================= */
 
-// Map W3C namedCurve string → node:crypto's curve name.
-// Node's crypto API uses different curve identifiers than the WebCrypto spec.
+// W3C namedCurve string → the library's curve, and its name in
+// cryptographic-formats (the SPKI / PKCS#8 curve OID).
 var EC_CURVES = {
-  'P-256': { nodeName: 'prime256v1' },
-  'P-384': { nodeName: 'secp384r1' },
-  'P-521': { nodeName: 'secp521r1' },
+  'P-256': { lib: p256, name: 'secp256r1' },
+  'P-384': { lib: p384, name: 'secp384r1' },
+  'P-521': { lib: p521, name: 'secp521r1' },
 };
 
-// Map hash name → { nodeName, ecdsaAlg, rsaAlg }
-// nodeName is what crypto.sign() takes; ecdsaAlg / rsaAlg the signature
+// Map hash name → { fn, ecdsaAlg, rsaAlg }
+// fn is the library's hash the signature is made with; ecdsaAlg / rsaAlg the signature
 // algorithm as cryptographic-formats names it (x509_build writes its OID, and for
 // RSA the NULL parameters RFC 3279 §2.2.1 requires).
 var HASH_ALGS = {
-  'SHA-1':   { nodeName: 'SHA1',   ecdsaAlg: null,              rsaAlg: 'sha1WithRSAEncryption' },
-  'SHA-256': { nodeName: 'SHA256', ecdsaAlg: 'ecdsaWithSHA256', rsaAlg: 'sha256WithRSAEncryption' },
-  'SHA-384': { nodeName: 'SHA384', ecdsaAlg: 'ecdsaWithSHA384', rsaAlg: 'sha384WithRSAEncryption' },
-  'SHA-512': { nodeName: 'SHA512', ecdsaAlg: 'ecdsaWithSHA512', rsaAlg: 'sha512WithRSAEncryption' },
+  'SHA-1':   { fn: sha1_sync,   ecdsaAlg: null,              rsaAlg: 'sha1WithRSAEncryption' },
+  'SHA-256': { fn: sha256_sync, ecdsaAlg: 'ecdsaWithSHA256', rsaAlg: 'sha256WithRSAEncryption' },
+  'SHA-384': { fn: sha384_sync, ecdsaAlg: 'ecdsaWithSHA384', rsaAlg: 'sha384WithRSAEncryption' },
+  'SHA-512': { fn: sha512_sync, ecdsaAlg: 'ecdsaWithSHA512', rsaAlg: 'sha512WithRSAEncryption' },
 };
 
 // Resolve a W3C-style keygenAlgorithm into our internal config object.
@@ -149,30 +157,39 @@ function generateCertificate(options) {
   // behavior).
   var alg = _resolveKeygenAlgorithm(options.keygenAlgorithm);
 
-  // 1. Generate key pair
-  var keyPair;
+  // 1. Generate the key pair (cryptographic-primitives), and its PKCS#8 and
+  //    SPKI (cryptographic-formats). sign(tbs) signs with it, in the form
+  //    X.509 carries (ECDSA as DER).
+  var publicKeyDer, privateKeyDer, sign;
   if (alg.kind === 'ec') {
-    keyPair = crypto.generateKeyPairSync('ec', {
-      namedCurve: alg.curve.nodeName,
-      publicKeyEncoding:  { type: 'spki',  format: 'der' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    });
+    var kp = alg.curve.lib.keygen_sync();
+    var point = alg.curve.lib.get_public_key_sync(kp.sk, false);
+    privateKeyDer = PKCS8.to_der({ algorithm: 'ecPublicKey', curve: alg.curve.name, scalar: kp.sk, point: point });
+    publicKeyDer = SPKI.to_der({ algorithm: 'ecPublicKey', curve: alg.curve.name, point: point });
+    sign = function (bytes) {
+      var signer = alg.curve.lib.signer_create(kp.sk);
+      try {
+        var rs = signer.sign_message_sync(alg.hash.fn, bytes);
+        return SIG.from_pair({ r: bytes_of(rs.r), s: bytes_of(rs.s) });
+      } finally { signer.wipe(); kp.sk.fill(0); }
+    };
   } else {
-    keyPair = crypto.generateKeyPairSync('rsa', {
-      modulusLength:  alg.modulusLength,
-      publicExponent: alg.publicExponent,
-      publicKeyEncoding:  { type: 'spki',  format: 'der' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    });
+    var k = RSA.keygen_sync(alg.modulusLength, null, BigInt(alg.publicExponent));
+    var rsa = { n: bytes_of(k.n), e: bytes_of(k.e), d: bytes_of(k.d), p: bytes_of(k.p), q: bytes_of(k.q),
+                dp: bytes_of(k.dp), dq: bytes_of(k.dq), qinv: bytes_of(k.qinv) };
+    privateKeyDer = PKCS8.to_der({ algorithm: 'rsaEncryption', rsa: rsa });
+    publicKeyDer = SPKI.to_der({ algorithm: 'rsaEncryption', rsa: { n: rsa.n, e: rsa.e } });
+    sign = function (bytes) {
+      var signer = RSA.signer_create(k);
+      try { return signer.sign_pkcs1_message_sync(bytes, alg.hash.fn); } finally { signer.wipe(); }
+    };
   }
-
-  var publicKeyDer  = keyPair.publicKey;   // DER Buffer (SubjectPublicKeyInfo)
-  var privateKeyPem = keyPair.privateKey;  // PEM string
+  var privateKeyPem = pem.encode(privateKeyDer, 'PRIVATE KEY');
 
   // 2. The TBSCertificate (cryptographic-formats): self-signed, v3, no extensions.
   //    Issuer and subject CN=webrtc (or options.commonName); valid from now
   //    for a year; a random 16-byte serial, positive (the top bit cleared).
-  var serial = crypto.randomBytes(16);
+  var serial = random_bytes_sync(16);
   serial[0] = serial[0] & 0x7F;
 
   var cn = options.commonName || 'webrtc';
@@ -183,26 +200,25 @@ function generateCertificate(options) {
   notAfter.setFullYear(notAfter.getFullYear() + 1);
 
   var tbs = x509_build.prepare({
-    serial: new Uint8Array(serial),
+    serial: serial,
     issuer: name,
     subject: name,                       // the same as the issuer: self-signed
     validity: { not_before: notBefore, not_after: notAfter },
-    public_key: new Uint8Array(publicKeyDer),
+    public_key: publicKeyDer,
     signature_algorithm: (alg.kind === 'ec') ? alg.hash.ecdsaAlg : alg.hash.rsaAlg,
   });
 
-  // 3. Sign it with the chosen hash (an ECDSA signature in DER, as X.509 has it)
-  var privateKey = crypto.createPrivateKey(privateKeyPem);
-  var signature = crypto.sign(alg.hash.nodeName, Buffer.from(tbs.bytes), privateKey);
+  // 3. Sign it with the chosen hash
+  var signature = sign(tbs.bytes);
 
   // 4. The certificate around the signature, and 5. its PEM
-  var certificate = Buffer.from(x509_build.assemble(tbs, new Uint8Array(signature)));
+  var certificate = Buffer.from(x509_build.assemble(tbs, signature));
   var certPem = pem.encode(certificate, 'CERTIFICATE');
 
   // 6. Compute SHA-256 fingerprint of the DER cert (for SDP a=fingerprint).
   // Note: the SDP fingerprint hash is independent of the signing hash —
   // RFC 8122 mandates the cert's own digest, not the signing algorithm.
-  var fpHash = crypto.createHash('sha256').update(certificate).digest();
+  var fpHash = sha256_sync(certificate);
   var fingerprint = Array.from(new Uint8Array(fpHash)).map(function(b) {
     return b.toString(16).padStart(2, '0').toUpperCase();
   }).join(':');
@@ -236,6 +252,14 @@ function _hashNameOf(hash) {
         HASH_ALGS[k] === hash) return k;
   }
   return null;
+}
+
+
+// A non-negative bigint as big-endian bytes, no leading zeros.
+function bytes_of(n) {
+  var h = n.toString(16);
+  var b = Buffer.from(h.length % 2 ? '0' + h : h, 'hex');
+  return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
 }
 
 

@@ -3,7 +3,10 @@
 // Manages: ICE ↔ DTLS ↔ SCTP ↔ SRTP pipeline, reactive state machine.
 // NOT imported by users — api.js wraps this with browser-compatible API.
 
-import crypto from 'node:crypto';
+import { randomBuffer } from './random.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
+import { sha256_sync, sha384_sync, sha512_sync } from 'cryptographic-primitives/sha2.js';
+import { tls1_prf_sync } from 'cryptographic-primitives/kdf.js';
 import { EventEmitter } from 'node:events';
 import { DTLSSession } from 'lemon-tls';
 import { pem as PEM } from 'cryptographic-formats';
@@ -231,11 +234,11 @@ function ConnectionManager(config) {
     // uniqueness without collision risk across PCs created in the same
     // millisecond.
     localSessionId: (function () {
-      var b = crypto.randomBytes(8);
+      var b = randomBuffer(8);
       b[0] &= 0x7F;   // clear the top bit → value < 2^63
       return b.readBigUInt64BE(0).toString();
     })(),
-    localCname: crypto.randomBytes(8).toString('hex'),
+    localCname: randomBuffer(8).toString('hex'),
 
     // ICE
     localIceUfrag: null,
@@ -2603,20 +2606,20 @@ function ConnectionManager(config) {
     state.remoteCertificates = chain.map(function (c) { return c && c.cert; })
       .filter(function (d) { return !!d; });
 
-    // Map SDP algorithm names (RFC 8122 §5) to Node's hash names.
+    // Map SDP algorithm names (RFC 8122 §5) to the library's hashes.
     // sha-1 is technically still allowed by RFC 8122 but actively
     // discouraged — Chrome announces sha-256 by default. We support it
     // here for interop with legacy peers but don't recommend it.
     var algo = String(state.remoteFingerprint.algorithm || '').toLowerCase();
-    var nodeAlgo = null;
-    if      (algo === 'sha-256') nodeAlgo = 'sha256';
-    else if (algo === 'sha-384') nodeAlgo = 'sha384';
-    else if (algo === 'sha-512') nodeAlgo = 'sha512';
-    else if (algo === 'sha-1')   nodeAlgo = 'sha1';
+    var hashFn = null;
+    if      (algo === 'sha-256') hashFn = sha256_sync;
+    else if (algo === 'sha-384') hashFn = sha384_sync;
+    else if (algo === 'sha-512') hashFn = sha512_sync;
+    else if (algo === 'sha-1')   hashFn = sha1_sync;
     else return { ok: false, reason: 'unsupported fingerprint algorithm: ' + algo };
 
     // Compute the digest and format as colon-separated hex (RFC 8122 §5).
-    var digest = crypto.createHash(nodeAlgo).update(leafDer).digest();
+    var digest = hashFn(leafDer);
     var parts = [];
     for (var i = 0; i < digest.length; i++) {
       var byte = digest[i].toString(16);
@@ -4342,24 +4345,8 @@ function ConnectionManager(config) {
 // this helper can go away and extractSrtpKeys() can just call it.
 
 function _tls12Prf(secret, label, seed, length) {
-  // PRF(secret, label, seed) = P_SHA256(secret, label || seed)
-  var fullSeed = Buffer.concat([Buffer.from(label, 'ascii'), seed]);
-  return _pHash(secret, fullSeed, length);
-}
-
-function _pHash(secret, seed, length) {
-  // RFC 5246 §5:  A(0) = seed,  A(i) = HMAC(secret, A(i-1))
-  //               output = HMAC(secret, A(i) || seed)   until enough bytes
-  var chunks = [];
-  var total = 0;
-  var a = seed;
-  while (total < length) {
-    a = crypto.createHmac('sha256', secret).update(a).digest();
-    var out = crypto.createHmac('sha256', secret).update(a).update(seed).digest();
-    chunks.push(out);
-    total += out.length;
-  }
-  return Buffer.concat(chunks).subarray(0, length);
+  // PRF(secret, label, seed) = P_SHA256(secret, label || seed) (RFC 5246 §5)
+  return Buffer.from(tls1_prf_sync(sha256_sync, secret, label, seed, length));
 }
 
 
