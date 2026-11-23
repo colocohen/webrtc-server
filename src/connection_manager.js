@@ -187,20 +187,20 @@ function ConnectionManager(config) {
     ? config.mdns
     : (resolvedMode === 'full');
 
-  // ── Port-mapping assisted gathering ('auto' from the resolved mode) ──
-  // full mode = a P2P client application — the same category where
-  // qBittorrent / Transmission / Syncthing enable UPnP/NAT-PMP by default,
-  // and where the mapping often beats STUN srflx outright (a forwarding
-  // rule works behind symmetric NAT; a reflexive mapping does not). The
-  // mapped port leads only to the ICE socket, which drops anything that
-  // is not credentialed STUN or session DTLS — exposure is equivalent to
-  // what srflx already implies. lite (cloud server) → off: public address,
-  // no home gateway to ask. Explicit config.portMapping always wins
-  // (false disables; an options object customizes and is forwarded
-  // verbatim — e.g. { description: 'MyApp' } for the router UI).
+  // ── Port-mapping assisted gathering: OPT-IN ──
+  // UPnP/NAT-PMP/PCP mapping gives a forwarding rule that can beat STUN
+  // srflx behind symmetric NAT, and the mapped port leads only to the ICE
+  // socket (exposure equivalent to srflx). It used to be on by default in
+  // full mode, but gathering cannot complete until every mapping attempt
+  // settles: wherever no gateway answers (servers, containers, CI, most
+  // networks without UPnP) each gathering phase sat 3 s in 'gathering' —
+  // the per-mapping budget — before the null candidate, where a browser
+  // finishes in milliseconds. Browsers do not do this, so it is opt-in:
+  // config.portMapping true or an options object (forwarded verbatim —
+  // e.g. { description: 'MyApp' } for the router UI).
   var resolvedPortMapping = (config.portMapping !== undefined)
     ? config.portMapping
-    : (resolvedMode === 'full');
+    : false;
 
   /* ====================== State ====================== */
 
@@ -213,6 +213,9 @@ function ConnectionManager(config) {
     dtlsState: 'new',
     sctpState: 'new',
     srtpState: 'new',
+    // mid of the m-section that owns the transport (the BUNDLE tag) under
+    // the last completed negotiation — see onAnswerCommitted.
+    transportMid: null,
 
     // Config
     iceServers: config.iceServers || DEFAULT_ICE_SERVERS,
@@ -256,6 +259,8 @@ function ConnectionManager(config) {
     iceRoleDecided:   false,          // the first offer decided the ICE role (trackNegotiationRole)
     iceControlling:   false,          // ... and this is it          // pregather() ran (agent up early)
     pregatherFlushed: false,          // deferred candidates surfaced post-SLD
+    _gatheringAnnouncePending: false, // 'gathering' flip queued, not yet published
+    _heldCandidateAnnounces: [],      // candidates waiting for that flip
     pregatherGatheringDone: false,    // agent finished gathering pre-SLD
     emittedCandidateKeys: {},         // _candidateKey → true (dedupes flush vs live emission)
     // Local candidates gathered in the CURRENT gathering phase (full-ICE
@@ -562,6 +567,11 @@ function ConnectionManager(config) {
       recordRemoteIceCredentials(parsed);
     },
 
+    // A final answer completed a negotiation (local or remote).
+    onAnswerCommitted: function (parsed) {
+      onAnswerCommitted(parsed);
+    },
+
     // Take ICE gathering back to its initial state. Called by rollback when
     // no local description remains — see the note there.
     resetIceGathering: function () {
@@ -602,6 +612,15 @@ function ConnectionManager(config) {
       // negotiationneeded kept firing after a restart the peer had already
       // satisfied.
       var _remoteRestart = _remoteCredentialsChanged();
+      // The offer being answered becomes the baseline for the next round.
+      // sdp_offer_answer records only remote ANSWERS, so a side that had
+      // only ever answered never had a baseline: every restart offer looked
+      // like a first description, the answer kept the old ufrag/pwd, nothing
+      // was re-gathered, and a latched ICE 'failed' outlived a restart that
+      // had succeeded on the wire (RFC 8445 §9, RFC 8839 §4.4.1.1.2).
+      // Recorded here, after the comparison, so a second createAnswer for
+      // the same offer is not mistaken for another restart.
+      recordRemoteIceCredentials(state.parsedRemoteSdp);
       ensureIceCredentials(_remoteRestart);
       if (_remoteRestart) {
         state.localGatheredCandidates = [];
@@ -611,6 +630,21 @@ function ConnectionManager(config) {
             ufrag: state.localIceUfrag,
             pwd:   state.localIcePwd,
           });
+          // restart() drops the remote credentials and candidates, but on
+          // this side the new ones are already here: the restart offer was
+          // applied (and possibly trickled into) before createAnswer. Hand
+          // them back now, or the agent checks nothing until the next
+          // trickled candidate.
+          if (state.remoteIceUfrag && state.remoteIcePwd) {
+            iceAgent.setRemoteParameters({
+              ufrag:   state.remoteIceUfrag,
+              pwd:     state.remoteIcePwd,
+              iceLite: state.remoteIceLite,
+            });
+          }
+          for (var _rci = 0; _rci < state.remoteCandidates.length; _rci++) {
+            iceAgent.addRemoteCandidate(state.remoteCandidates[_rci]);
+          }
           // AND GATHER. Same omission the offer path had (fix 42): restart()
           // only arms the agent. Without this the ANSWERER of a restart
           // rotated its credentials and then gathered nothing, so it had no
@@ -719,8 +753,12 @@ function ConnectionManager(config) {
     // Per-application post-processing of a parsed remote SDP. Lives in
     // cm.js because it touches MediaReceivers, jitter buffers, simulcast
     // SSRC reconciliation — runtime concerns the class doesn't own.
-    processRemoteMedia: function (parsedSdp) {
-      processRemoteMedia(parsedSdp);
+    processRemoteMedia: function (parsedSdp, descType) {
+      processRemoteMedia(parsedSdp, descType);
+    },
+
+    applyLocalAnswerCodecs: function (parsedSdp) {
+      applyLocalAnswerCodecs(parsedSdp);
     },
 
     // Diagnostic logger. Gated by WEBRTC_DEBUG env var in cm.js. The
@@ -754,6 +792,14 @@ function ConnectionManager(config) {
     // fails and cannot import either without a cycle — api.js publishes the
     // constructors on state for exactly this.
     getState:                    function () { return state; },
+    // Is a local offer that moves the transport (a new BUNDLE tag) waiting
+    // for its answer? The peer may already have moved — and aborted the
+    // old SCTP association — before that answer reaches us.
+    isTransportMoveExpected:     function () {
+      if (state.signalingState !== 'have-local-offer' || state.transportMid == null) return false;
+      var next = TransportController.bundleTransportMid(state.parsedLocalSdp);
+      return next != null && next !== state.transportMid;
+    },
     SctpAssociation:             SctpAssociation,
     debug:                       _DBG,
   });
@@ -807,7 +853,7 @@ function ConnectionManager(config) {
     // report that media has actually started, which negotiation cannot know.
     onFirstInboundPacket: function (ssrc) {
       var mapping = state.remoteSsrcMap && state.remoteSsrcMap[ssrc];
-      if (!mapping || mapping.isRtx) return;
+      if (!mapping || mapping.isRtx || mapping.isFec) return;
       // Runs on every packet. Remember where this SSRC's transceiver sits so
       // the steady state is one check instead of a scan of all transceivers;
       // the cached slot is trusted only while it still holds the same
@@ -1014,17 +1060,42 @@ function ConnectionManager(config) {
       // candidates after. The patch still happens in the same turn, so
       // one-shot signalling (WHIP/WHEP) that reads the description from
       // an icecandidate handler is unaffected.
-      if (isNewCandidate) {
-        patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx);
+      var _announce = function () {
+        if (isNewCandidate) {
+          patchLocalDescriptionWithCandidate(candidate, bundleMid, bundleIdx);
+        }
+        state.emittedCandidateKeys[_candidateKey(candidate)] = true;
+        ev.emit('icecandidate', {
+          candidate: SDP.buildCandidateString(candidate),
+          sdpMid: bundleMid,
+          sdpMLineIndex: bundleIdx,
+        });
+      };
+      // 'gathering' FIRST (W3C 4.4.1: the gathering state moves to
+      // 'gathering' before any candidate of the phase is surfaced). The
+      // state flip is a queued task (see 'gatheringstatechange' below) but
+      // the agent hands us candidates at once, and api.js delivers them on
+      // setImmediate — which ran before our setTimeout, so the first
+      // icecandidate reached the application while iceGatheringState still
+      // read 'new'. Hold the candidate until the flip has been published.
+      if (state._gatheringAnnouncePending) {
+        state._heldCandidateAnnounces.push(_announce);
+        return;
       }
-
-      state.emittedCandidateKeys[_candidateKey(candidate)] = true;
-      ev.emit('icecandidate', {
-        candidate: SDP.buildCandidateString(candidate),
-        sdpMid: bundleMid,
-        sdpMLineIndex: bundleIdx,
-      });
+      _announce();
     });
+
+    // Publish 'gathering' (if the queued flip has not already) and release
+    // the candidates held for it, in order.
+    function _announceGathering() {
+      state._gatheringAnnouncePending = false;
+      if (state.iceGatheringState !== 'gathering') {
+        setState({ iceGatheringState: 'gathering' });
+      }
+      var held = state._heldCandidateAnnounces;
+      state._heldCandidateAnnounces = [];
+      for (var hi = 0; hi < held.length && !state.closed; hi++) held[hi]();
+    }
 
     iceAgent.on('statechange', function(newState) {
       if (state.closed) return;
@@ -1048,8 +1119,12 @@ function ConnectionManager(config) {
           if (state.closed) return;
           // Only if nothing has moved past it in the meantime — a fast
           // connect can reach 'connected' before this task runs, and
-          // announcing 'checking' after that would be a lie.
-          if (state.iceConnectionState === 'new') {
+          // announcing 'checking' after that would be a lie. Read from the
+          // agent rather than requiring 'new': the agent also re-enters
+          // 'checking' from 'failed' (a late trickled candidate), and that
+          // transition was swallowed.
+          if (iceAgent && iceAgent.state === 'checking' &&
+              state.iceConnectionState !== 'checking') {
             setState({ iceConnectionState: 'checking' });
           }
         }, 0);
@@ -1099,11 +1174,10 @@ function ConnectionManager(config) {
         // Publishing either flip synchronously inside SLD breaks that
         // sequence, so the phase advances one macrotask at a time and
         // stops dead if the connection closes in between.
+        state._gatheringAnnouncePending = true;
         setTimeout(function () {
           if (state.closed) return;
-          if (state.iceGatheringState !== 'gathering') {
-            setState({ iceGatheringState: 'gathering' });
-          }
+          _announceGathering();
           setTimeout(function () {
             if (state.closed) return;   // close freezes the phase
             setState({ iceGatheringState: 'complete' });
@@ -1117,9 +1191,10 @@ function ConnectionManager(config) {
         // observable transition belongs to a later task (W3C 4.4.1) —
         // reading gatheringState right after `await sLD()` must still
         // see 'new'.
+        state._gatheringAnnouncePending = true;
         setTimeout(function () {
           if (state.closed) return;
-          setState({ iceGatheringState: 'gathering' });
+          _announceGathering();
         }, 0);
         return;
       }
@@ -1144,10 +1219,13 @@ function ConnectionManager(config) {
 
     iceAgent.on('selectedpair', function(pair, prev) {
       if (state.closed) return;
-      // stats: selectedCandidatePairChanges counts nominations after the
-      // first one (W3C: it is 0 until a pair is selected, then counts
-      // subsequent switches).
-      state.selectedPairChanges = (state.selectedPairChanges || 0) + (prev ? 1 : 0);
+      // stats: selectedCandidatePairChanges counts EVERY change of the
+      // selected pair, the first selection included (webrtc-stats
+      // RTCTransportStats: "the number of times the selected candidate pair
+      // of this transport has changed. Going from not having a selected pair
+      // to having one counts as a change"). The first one was skipped, so a
+      // connected transport read 0 where Chrome reads 1.
+      state.selectedPairChanges = (state.selectedPairChanges || 0) + 1;
       // ── [ice-diag] ALWAYS-ON: selected-pair changes are rare and are the
       // prime suspect for mid-session one-directional path death (all
       // outbound DTLS/SRTP retargets instantly via agent.send()). Log the
@@ -1323,35 +1401,35 @@ function ConnectionManager(config) {
   // 3.5.1), compared against what we recorded on the previous apply.
   // Remember the ICE credentials of a remote description as it is applied.
   // The comparison baseline for detecting a restart (RFC 8829 3.5.1).
+  // The ufrag is read where applyRemoteDescription reads it — the section
+  // owning the transport (TransportController.transportSection). The first
+  // section carrying one may be a rejected section frozen at its old
+  // credentials, which hid every later restart.
+  function _remoteIceUfragOf(parsed) {
+    var sec = TransportController.transportSection(parsed);
+    return (sec && sec.iceUfrag) || parsed.iceUfrag || null;
+  }
+
   function recordRemoteIceCredentials(parsed) {
     if (!parsed || !parsed.media) return;
-    var ufrag = null;
-    for (var i = 0; i < parsed.media.length; i++) {
-      if (parsed.media[i] && parsed.media[i].iceUfrag) { ufrag = parsed.media[i].iceUfrag; break; }
-    }
-    if (!ufrag) ufrag = parsed.iceUfrag;
+    var ufrag = _remoteIceUfragOf(parsed);
     if (ufrag) state._lastRemoteIceUfrag = ufrag;
   }
 
   function _remoteCredentialsChanged() {
     var d = state.parsedRemoteSdp;
     if (!d || !d.media || !d.media.length) return false;
-    var ufrag = null;
-    for (var i = 0; i < d.media.length; i++) {
-      if (d.media[i] && d.media[i].iceUfrag) { ufrag = d.media[i].iceUfrag; break; }
-    }
-    if (!ufrag) ufrag = d.iceUfrag;
+    var ufrag = _remoteIceUfragOf(d);
     if (!ufrag) return false;
     // Compare against the ufrag of the description we ANSWERED last, not
     // against the most recent one seen — this function runs while the new
     // offer is already applied, so reading and updating in one step compares
     // the offer with itself.
-    // READ ONLY. The baseline is recorded on EVERY remote description that is
-    // applied — see recordRemoteIceCredentials — because a peer alternates
-    // between offering and answering, and a side that offered last round has
-    // still seen the other's credentials. Recording only here meant a side
-    // that had never answered had no baseline, so the first restart it
-    // answered looked like a first description and was missed.
+    // READ ONLY. The baseline is recorded for every remote ANSWER as it is
+    // applied (sdp_offer_answer) and for every remote OFFER once it has been
+    // compared here (prepareForCreateAnswer) — a peer alternates between
+    // offering and answering, and both kinds of round set what the peer is
+    // using now.
     var prev = state._lastRemoteIceUfrag;
     if (prev == null) return false;      // no baseline yet: not a restart
     return String(prev) !== String(ufrag);
@@ -1760,6 +1838,18 @@ function ConnectionManager(config) {
     } catch (eAssoc) {}
   }
 
+  // W3C webrtc-pc 4.3.3 (RTCPeerConnectionState) over our one bundled
+  // transport. null = leave it alone (closing, or already closed).
+  function deriveConnectionState() {
+    if (state.closed || state._closing || state.connectionState === 'closed') return null;
+    var ice = state.iceConnectionState, dtls = state.dtlsState;
+    if (ice === 'failed' || dtls === 'failed') return 'failed';
+    if (ice === 'disconnected') return 'disconnected';
+    if ((ice === 'new' || ice === 'closed') && (dtls === 'new' || dtls === 'closed')) return 'new';
+    if (ice === 'new' || ice === 'checking' || dtls === 'new' || dtls === 'connecting') return 'connecting';
+    return 'connected';
+  }
+
   function setState(updates) {
     if (!updates || typeof updates !== 'object') return;
     if (state.closed) return;
@@ -2011,21 +2101,16 @@ function ConnectionManager(config) {
       startDtls();
     }
 
-    // 3b. Surface handshake progress (W3C webrtc-pc §4.3.3 connectionState
-    //     derivation: any transport in 'connecting' ⇒ PC 'connecting').
-    //     Previously the PC jumped straight new → connected, so a stalled
-    //     DTLS handshake left connectionState frozen at 'new' with no
-    //     observable transition at all — apps saw ICE connect and then
-    //     silence. Now they see 'connecting', and the watchdog in
-    //     startDtls guarantees an eventual 'failed' if DTLS never lands.
-    if (state.dtlsState === 'connecting' && state.connectionState === 'new') {
-      setState({ connectionState: 'connecting' });
-    }
-
-    // 4. Connection ready: DTLS connected → update connectionState
-    //    Trigger: onDtlsConnected → setState({ dtlsState: 'connected' })
-    if (state.dtlsState === 'connected' && state.connectionState !== 'connected') {
-      setState({ connectionState: 'connected' });
+    // 4. connectionState, derived from ICE AND DTLS together (W3C webrtc-pc
+    //    4.3.3 RTCPeerConnectionState). It used to follow DTLS alone: ICE
+    //    'checking' left it at 'new' (Chrome says 'connecting'), and an ICE
+    //    'disconnected' / 'failed' after the network died never reached it,
+    //    so it read 'connected' forever and servers keyed on it (sfu-server)
+    //    never let go of dead peers. Re-derived on every cascade run, so ICE
+    //    recovering (or an ICE restart) moves it back as well.
+    var _connState = deriveConnectionState();
+    if (_connState && _connState !== state.connectionState) {
+      setState({ connectionState: _connState });
     }
 
     // 5. SRTP: DTLS connected + media in SDP → derive keys
@@ -2058,14 +2143,19 @@ function ConnectionManager(config) {
     //    sessions previously fired an INIT into the DTLS anyway; lenient
     //    peers ignored it, but strict ones (libdatachannel) answer with
     //    a fatal alert and tear the whole connection down post-connect.
-    if (state.dtlsState === 'connected' && state.sctpState === 'new' &&
-        state.remoteSctpPort != null) {
-      state.sctpState = 'connecting';
+    //    After a transport move (migrateTransport) the controller waits for
+    //    the new DTLS session with sctpState 'connecting' and no
+    //    association: the same start, on the new session.
+    if (state.dtlsState === 'connected' && state.remoteSctpPort != null &&
+        (state.sctpState === 'new' ||
+         (dcController.awaitingTransport && !dcController.sctpAssociation))) {
+      if (state.sctpState === 'new') state.sctpState = 'connecting';
       dcController.start({
         dtlsRole:       state.dtlsRole,
         localPort:      state.sctpPort,
         remotePort:     state.remoteSctpPort,
         maxMessageSize: state.sendMaxMessageSize,
+        maxRecvMessageSize: state.maxMessageSize,
       });
     }
 
@@ -2363,6 +2453,7 @@ function ConnectionManager(config) {
     //      than hanging. 30s covers the full worst-case retransmit
     //      schedule (1s doubling × 6) with margin.
     state._dtlsReconcileTimer = setInterval(function () {
+      if (session !== state.dtlsSession) return;
       if (state.closed || state.dtlsState !== 'connecting') return;
       if (session.connected) {
         console.warn('[dtls] session reports connected but the connect ' +
@@ -2403,7 +2494,7 @@ function ConnectionManager(config) {
         for (var k in state.remoteSsrcMap) {
           if (!Object.prototype.hasOwnProperty.call(state.remoteSsrcMap, k)) continue;
           var mp = state.remoteSsrcMap[k];
-          if (!mp || mp.isRtx || String(mp.mid) !== String(tc.mid)) continue;
+          if (!mp || mp.isRtx || mp.isFec || String(mp.mid) !== String(tc.mid)) continue;
           var st = state.rtpStats && state.rtpStats[k];
           if (st && st.lastPacketAt > last) last = st.lastPacketAt;
         }
@@ -2419,6 +2510,7 @@ function ConnectionManager(config) {
     if (state._mediaStallTimer.unref) state._mediaStallTimer.unref();
 
     state._dtlsWatchdog = setTimeout(function () {
+      if (session !== state.dtlsSession) return;
       state._dtlsWatchdog = null;
       if (state.closed || state.dtlsState !== 'connecting') return;
       // Last-chance reconcile before declaring failure.
@@ -2435,11 +2527,24 @@ function ConnectionManager(config) {
     }, 30000);
     if (state._dtlsWatchdog.unref) state._dtlsWatchdog.unref();
 
-    session.on('packet', function(data) { if (iceAgent) iceAgent.send(data); });
-    session.on('connect', function() { onDtlsConnected(session); });
+    // Every handler below first checks that this session is still THE
+    // session. One replaced by migrateTransport (the transport moved to a
+    // new BUNDLE tag) is closed and goes quiet: its close_notify is not
+    // sent (the selected pair may already lead to the peer's NEW
+    // transport), and its close/error/connect must not touch the state the
+    // new session now owns.
+    session.on('packet', function(data) {
+      if (session !== state.dtlsSession) return;
+      if (iceAgent) iceAgent.send(data);
+    });
+    session.on('connect', function() {
+      if (session !== state.dtlsSession) return;
+      onDtlsConnected(session);
+    });
 
     var _dtlsDataCount = 0;
     session.on('data', function(data) {
+      if (session !== state.dtlsSession) return;
       if (state._faulted) return;
       try { _onDtlsData(data); }
       catch (err) { _fault(err, 'dtls data'); }
@@ -2469,6 +2574,7 @@ function ConnectionManager(config) {
           localPort:      state.sctpPort,
           remotePort:     state.remoteSctpPort,
           maxMessageSize: state.sendMaxMessageSize,
+          maxRecvMessageSize: state.maxMessageSize,
         });
       }
       dcController.handleDtlsData(buf);
@@ -2482,6 +2588,7 @@ function ConnectionManager(config) {
     // still 'connected'; ICE consent ends it). Our own close() emits 'close'
     // too, after state.closed — that one is close()'s, and silent.
     session.on('close', function() {
+      if (session !== state.dtlsSession) return;
       if (state.closed || state._pcClosing) return;
       if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
       if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
@@ -2491,6 +2598,7 @@ function ConnectionManager(config) {
     });
 
     session.on('error', function(err) {
+      if (session !== state.dtlsSession) return;
       if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
       if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
       ev.emit('dtls:error', err);
@@ -2644,7 +2752,138 @@ function ConnectionManager(config) {
   }
 
 
+  /* ====================== Transport ownership ====================== */
+
+  /**
+   * A final answer completed a negotiation. Records which m-section owns
+   * the transport now and, when that changed, moves to a new transport
+   * (TransportController.transportOwnerChange has the rule and why).
+   */
+  function onAnswerCommitted(parsed) {
+    if (state.closed || state._pcClosing) return;
+    var change = TransportController.transportOwnerChange(state.transportMid, parsed);
+    var owner = TransportController.bundleTransportMid(parsed);
+    if (owner != null) state.transportMid = owner;
+    if (change) migrateTransport(change);
+    else dcController.abandonParked();   // an ABORT parked for a move that did not happen
+  }
+
+  /**
+   * Follow the peer to the transport of a new BUNDLE tag.
+   *
+   * What the peer does (Chrome, seen in its logs and getStats): new
+   * sockets and ICE checks on them under the same credentials, then a NEW
+   * DTLS handshake (same certificate, same client/server roles), new SRTP
+   * keys from it, and a new SCTP association. Its old DTLS association is
+   * closed. We used to keep that old association: our SRTP keys no longer
+   * matched the peer's, nothing decrypted in either direction, and the
+   * connection never came back.
+   *
+   * Here:
+   *   - ICE: every pair is checked again (IceAgent.recheck, below). The
+   *     candidates of the new tag reached the agent with the description
+   *     or by trickle; the peer's new sockets also show up as
+   *     peer-reflexive from its checks.
+   *   - DTLS: the old session is dropped and closed silently (see the
+   *     identity guards in startDtls). Back to dtlsState 'new', the cascade
+   *     starts a new handshake as soon as ICE is connected — the same path
+   *     as the first connection. Records of the old association that still
+   *     arrive are discarded by the new session (an epoch it has no keys
+   *     for — lemon-tls, RFC 9147 §4.5.2).
+   *   - SRTP: no session until the new handshake's keys exist; sendRtp and
+   *     the receive path skip while there is none. The RTCP / transport-cc
+   *     / NACK timers stop and start again with the new keys; the RTCP
+   *     timer's first round sends a PLI for every incoming video stream,
+   *     which recovers the frames lost meanwhile. Outgoing RTP sequence
+   *     numbers continue; the SRTP context (and its rollover counter)
+   *     starts fresh on both sides.
+   *
+   * connectionState goes through 'connecting' meanwhile, as Chrome's does.
+   */
+  // The remote candidates of one m-section, as the remote description
+  // holds them now: the section's own lines plus the trickled ones, which
+  // addIceCandidate writes into the description text under their mid.
+  // null when the section has none (a bundle-only section) — the caller
+  // then keeps the candidates it has rather than check against nothing.
+  function _remoteCandidatesOfMid(mid) {
+    var desc = state.currentRemoteDescription || state.pendingRemoteDescription;
+    if (!desc || !desc.sdp) return null;
+    var parsed;
+    try {
+      parsed = desc.type === 'offer' ? SDP.parseOffer(desc.sdp) : SDP.parseAnswer(desc.sdp);
+    } catch (e) { return null; }
+    var sec = parsed && parsed.media && SDP.getMediaByMid(parsed, mid);
+    if (!sec || !sec.candidates || sec.candidates.length === 0) return null;
+    var out = sec.candidates.slice();
+    if (sec.endOfCandidates) out.push(null);   // the agent's end-of-candidates
+    return out;
+  }
+
+  function migrateTransport(change) {
+    if (state.closed || state._pcClosing) return;
+    _diag('[cm-diag] transport moves from mid ' + change.from + ' to mid ' + change.to +
+          ' — new DTLS handshake (dtlsState was ' + state.dtlsState + ')');
+
+    // First, before any state below changes: api.js retires the old
+    // RTCDtlsTransport / RTCSctpTransport / RTCIceTransport objects (they
+    // must not mirror the resets that follow as their own) and makes the new
+    // tag's set the live one, which then reports the new handshake.
+    try { ev.emit('transport:moving', { from: change.from, to: change.to }); } catch (e) {}
+
+    var old = state.dtlsSession;
+    if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
+    if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
+    state.dtlsSession = null;          // from here the old session's handlers are inert
+    state.dtlsBuffer = [];
+    if (old) { try { old.close(); } catch (e) {} }
+
+    mediaTransport.stopTimers();
+    state.srtpSession = null;
+    state.srtpKeys = null;
+    state.srtpState = 'new';
+    state.negotiatedSrtpProfile = null;   // the new handshake negotiates it again
+
+    // ICE: start checking afresh against the new transport's candidates
+    // only (IceAgent.recheck — same credentials, no restart). The old
+    // transport's addresses are left out on purpose: when we answered, the
+    // peer keeps its old transport alive until it applies our answer, and
+    // a check answered there would win the selection. Before the DTLS
+    // reset below, so the cascade sees ICE 'checking' and starts the new
+    // handshake only once a pair to the new transport is selected: its
+    // first flight then goes there instead of to the peer's closed socket
+    // (a lost first flight costs DTLS's 1 s + 2 s + 4 s retransmissions).
+    if (iceAgent && typeof iceAgent.recheck === 'function') {
+      iceAgent.recheck(_remoteCandidatesOfMid(change.to));
+    }
+
+    // 'checking' is applied here, in the same update as the DTLS reset —
+    // not left to the agent's statechange handler, which announces
+    // 'checking' a task later (for apps that attach listeners after
+    // awaiting setRemoteDescription; this connection's listeners are long
+    // attached). With iceConnectionState still reading 'connected' the
+    // cascade restarted DTLS at once, over no pair: the first flight was
+    // dropped and the handshake waited out the 1 s retransmission. Now
+    // the agent's 'connected' on the new pair is what starts it.
+    var upd = {};
+    if (iceAgent && iceAgent.state === 'checking' && state.iceConnectionState !== 'checking') {
+      upd.iceConnectionState = 'checking';
+    }
+    // dtlsState already 'new': no handshake ever started (ICE not up yet).
+    if (state.dtlsState !== 'new') upd.dtlsState = 'new';
+    setState(upd);
+
+    // SCTP: a new association on the new DTLS session, the data channels
+    // kept open across it (DataChannelController.moveToNewTransport); the
+    // cascade (6) starts it once the new session is up. AFTER the DTLS
+    // reset: its sctpState change runs the cascade, which — with dtlsState
+    // still reading the old session's 'connected' — started the new
+    // association at once, on the old session.
+    dcController.moveToNewTransport();
+  }
+
   function onDtlsConnected(dtlsSession) {
+    // A replaced session (migrateTransport) never decides anything.
+    if (dtlsSession !== state.dtlsSession) return;
     // Idempotency: lemon-tls may fire 'connect' multiple times under
     // unusual conditions, and the safety-net dispatch from session.on('data')
     // can also reach here. Once we've made a decision (connected or failed),
@@ -2719,7 +2958,9 @@ function ConnectionManager(config) {
     if (!primaryCodec) return null;
 
     return {
-      mid: mid, kind: kind, codec: primaryCodec,
+      // codecs: the whole negotiated set — the peer may send any of them
+      // (media_transport resolves the keyframe test per payload type).
+      mid: mid, kind: kind, codec: primaryCodec, codecs: codecs,
       depacketizer: null, packetCount: 0,
     };
   }
@@ -2751,7 +2992,102 @@ function ConnectionManager(config) {
     });
   }
 
-  function processRemoteMedia(parsed) {
+  // The codecs negotiated on a transceiver — the formats both descriptions
+  // carry, RTX and the protection formats left out — in two orders:
+  //
+  //   send: the REMOTE description's order. Its order is its author's
+  //     preference for what it receives (W3C setCodecPreferences governs
+  //     the receive side), and libwebrtc's sender follows it the same way:
+  //     Chrome answering an offer that lists VP8 first sends VP8, whatever
+  //     its own answer prefers. negotiatedCodec, the first, is what our
+  //     sender sends with (its payload type included).
+  //   recv: OUR description's order — what such a peer will send us.
+  //     negotiatedRecvCodec, its first, is what the receiver decodes.
+  //
+  // The receiver starts with that one and then follows the payload type of
+  // the packets: a peer is entitled to send any negotiated codec.
+  //
+  // Readers are told on 'transceiver:codec-negotiated' (queued, emitted
+  // once the description is applied): a send pipeline started earlier
+  // rebuilds itself if its codec or payload type changed.
+  var _codecNegotiatedQueue = null;
+  function _primaryCodecs(codecs) {
+    var out = [];
+    for (var i = 0; codecs && i < codecs.length; i++) {
+      var n = codecs[i] && codecs[i].name && codecs[i].name.toLowerCase();
+      if (!n || n === 'rtx' || n === 'red' || n === 'ulpfec' || n === 'flexfec-03') continue;
+      out.push(codecs[i]);
+    }
+    return out;
+  }
+  function _setNegotiatedCodecs(t, codecs, recvCodecs) {
+    if (!t || !codecs || !codecs.length) return;
+    if (t.sender) t.sender._negotiatedCodecs = codecs;
+    t._negotiatedCodecs = codecs;
+    t.negotiatedCodec = codecs[0];
+    t.negotiatedRecvCodec = (recvCodecs && recvCodecs.length) ? recvCodecs[0] : codecs[0];
+    // The whole receive set too: the receiver follows the payload type of
+    // the packets (media_pipeline's codecForPt), any codec in it.
+    t._negotiatedRecvCodecs = (recvCodecs && recvCodecs.length) ? recvCodecs : codecs;
+    // RTX goes with the codec we send: its apt partner. (processRemoteMedia's
+    // 'Negotiated-RTX override' takes the remote's FIRST video codec, which
+    // as answerer is the offer's — possibly one we declined: 102 → 103 while
+    // we send 108, whose RTX is 109.) This runs after it, so it decides.
+    if (t.kind === 'video' && t.sender && t.sender.layers && codecs[0].rtxPayloadType != null) {
+      for (var li = 0; li < t.sender.layers.length; li++) {
+        var L = t.sender.layers[li];
+        if (L.ssrc != null && L.rtxSsrc != null) mediaTransport.setRtxMapping(L.ssrc, L.rtxSsrc, codecs[0].rtxPayloadType);
+      }
+    }
+    (_codecNegotiatedQueue = _codecNegotiatedQueue || []).push(t);
+  }
+  // codecs (in their order) whose payload type is also in `among`.
+  function _inOrderOf(codecs, among) {
+    var pts = {};
+    for (var i = 0; among && i < among.length; i++) pts[among[i].payloadType] = true;
+    var out = [];
+    for (var j = 0; codecs && j < codecs.length; j++) if (pts[codecs[j].payloadType]) out.push(codecs[j]);
+    return out;
+  }
+  function _mediaByMid(parsed, mid) {
+    if (!parsed || !parsed.media) return null;
+    for (var i = 0; i < parsed.media.length; i++) if (String(parsed.media[i].mid) === String(mid)) return parsed.media[i];
+    return null;
+  }
+  function _flushCodecNegotiated() {
+    var q = _codecNegotiatedQueue;
+    _codecNegotiatedQueue = null;
+    for (var i = 0; q && i < q.length; i++) {
+      try { ev.emit('transceiver:codec-negotiated', { transceiver: q[i] }); } catch (e) {}
+    }
+  }
+
+  // setLocalDescription(answer): the answer we sent is the agreement —
+  // received in its order, sent in the offer's.
+  function applyLocalAnswerCodecs(parsed) {
+    if (!parsed || !parsed.media) return;
+    for (var i = 0; i < parsed.media.length; i++) {
+      var m = parsed.media[i];
+      if (!m || (m.type !== 'audio' && m.type !== 'video') || m.port === 0) continue;
+      var recv = _primaryCodecs(m.codecs);
+      var offerM = _mediaByMid(state.parsedRemoteSdp, m.mid);
+      var send = offerM ? _inOrderOf(_primaryCodecs(offerM.codecs), recv) : recv;
+      _setNegotiatedCodecs(findTransceiverByMid(m.mid), send.length ? send : recv, recv);
+    }
+    _flushCodecNegotiated();
+  }
+
+  function processRemoteMedia(parsed, descType) {
+    try { _processRemoteMedia(parsed, descType); }
+    finally { _flushCodecNegotiated(); }
+  }
+
+  function _processRemoteMedia(parsed, descType) {
+    // Session-wide (one flexfec-03 PT is enough, see below); set again from
+    // this description's video sections. It was only ever set, never
+    // cleared: a renegotiation that dropped flexfec kept us sending FEC on
+    // the old payload type.
+    state.flexfecPayloadType = null;
     for (var i = 0; i < parsed.media.length; i++) {
       var m = parsed.media[i];
       // A REJECTED section (port 0) still MAPS to a transceiver — WPT
@@ -2831,14 +3167,25 @@ function ConnectionManager(config) {
         existing.currentDirection = 'stopped';
         existing._stopped         = true;
         var _rjTrack = existing.receiver && existing.receiver.track;
-        if (_rjTrack && _rjTrack.readyState !== 'ended') {
-          setTimeout(function () {
+        // The remote source ended: _endSource ends every track of it (the
+        // application's clones too) with 'ended' — also when the application
+        // already stop()ped this one, so readyState is not the test. stop()
+        // is the fallback for a media-processing without track sources.
+        if (_rjTrack && (typeof _rjTrack._endSource === 'function' || _rjTrack.readyState !== 'ended')) {
+          // The track goes in as an ARGUMENT: `var _rjTrack` is one
+          // function-scoped variable for the whole m-section loop, so a
+          // closure reading it saw the LAST rejected section's track — with
+          // several sections rejected in one offer, the last receiver was
+          // ended twice and the others never (their tracks stayed live and
+          // their decoders ran until close()).
+          setTimeout(function (trk) {
             try {
-              if (_rjTrack.readyState === 'ended') return;
-              if (typeof _rjTrack.stop === 'function') _rjTrack.stop();
-              else _rjTrack.readyState = 'ended';
+              if (typeof trk._endSource === 'function') { trk._endSource(); return; }
+              if (trk.readyState === 'ended') return;
+              if (typeof trk.stop === 'function') trk.stop();
+              else trk.readyState = 'ended';
             } catch (eRj) {}
-          }, 0);
+          }, 0, _rjTrack);
         }
         continue;
       }
@@ -3171,6 +3518,31 @@ function ConnectionManager(config) {
           _senderCodecs.push(_mscodec);
         }
       }
+      // An OFFER lists what the peer can do; what is negotiated is what our
+      // answer will list (SDP.answerCodecs — the same computation the answer
+      // builder makes, our codecs and preferences intersected with the
+      // offer). The sender can start before the answer exists, so it needs
+      // that now. (Taken from the offer as it was, the sender picked the
+      // offer's first codec of a name — PT 102, an H264 profile the answer
+      // then declined — and the receiver the offer's first codec outright.)
+      // An ANSWER's list is the negotiated one already.
+      var _recvCodecs = null;
+      if (descType === 'offer' && (m.type === 'audio' || m.type === 'video') && m.codecs) {
+        var _offerTc = findTransceiverByMid(m.mid);
+        var _ansCodecs = _primaryCodecs(SDP.answerCodecs(m,
+          m.type === 'audio' ? SDP.DEFAULT_AUDIO_CODECS : SDP.DEFAULT_VIDEO_CODECS,
+          (_offerTc && _offerTc._codecPreferences && _offerTc._codecPreferences.length) ? _offerTc._codecPreferences : null));
+        if (_ansCodecs.length) {
+          _recvCodecs = _ansCodecs;                                      // our answer's order
+          _senderCodecs = _inOrderOf(_primaryCodecs(_senderCodecs), _ansCodecs);   // the offer's
+        }
+      } else {
+        _senderCodecs = _primaryCodecs(_senderCodecs);                   // the answer's order
+        if (descType === 'answer' || descType === 'pranswer') {
+          var _ourOffer = _mediaByMid(state.parsedLocalSdp, m.mid);
+          if (_ourOffer) _recvCodecs = _inOrderOf(_primaryCodecs(_ourOffer.codecs), _senderCodecs);
+        }
+      }
 
       // Compute whether the peer's offer declares simulcast in the SEND
       // direction (i.e., peer wants to send multiple layers, we receive).
@@ -3293,6 +3665,7 @@ function ConnectionManager(config) {
             remoteExtensions: m.extensions,
             remoteSimulcast:  _remoteSimulcast,
           });
+          _setNegotiatedCodecs(state.transceivers[state.transceivers.length - 1], _senderCodecs, _recvCodecs);
 
           // ANNOUNCE THE TRACK. This branch handles m-sections with no
           // a=ssrc lines, and it built the receiver track without ever
@@ -3377,33 +3750,21 @@ function ConnectionManager(config) {
           }
         } else {
           // Refresh on renegotiation — peer may have dropped/reordered codecs.
-          if (existing.sender) existing.sender._negotiatedCodecs = _senderCodecs;
-          existing._negotiatedCodecs = _senderCodecs;
+          _setNegotiatedCodecs(existing, _senderCodecs, _recvCodecs);
           existing.remoteSimulcast = _remoteSimulcast;
         }
         continue;
       }
 
-      var receiver = createMediaReceiver(m.mid, m.type, m.codecs);
+      var receiver = createMediaReceiver(m.mid, m.type,
+        (_recvCodecs && _recvCodecs.length) ? _recvCodecs : (_senderCodecs.length ? _senderCodecs : m.codecs));
       if (receiver) state.mediaReceivers[m.mid] = receiver;
 
       var transceiver;
       if (existing) {
         transceiver = existing;
         // Refresh on renegotiation
-        if (transceiver.sender) transceiver.sender._negotiatedCodecs = _senderCodecs;
-        transceiver._negotiatedCodecs = _senderCodecs;
-        // FlexFEC: surface the negotiated PT to media_transport's receive
-        // path (one PT per session is sufficient — flexfec-03 protects
-        // whole streams, pairing rides in a=ssrc-group:FEC-FR).
-        if (_senderCodecs) {
-          for (var _ffi = 0; _ffi < _senderCodecs.length; _ffi++) {
-            if (_senderCodecs[_ffi] && _senderCodecs[_ffi].flexfecPayloadType != null) {
-              state.flexfecPayloadType = _senderCodecs[_ffi].flexfecPayloadType;
-              break;
-            }
-          }
-        }
+        _setNegotiatedCodecs(transceiver, _senderCodecs, _recvCodecs);
         transceiver.remoteSimulcast = _remoteSimulcast;
       } else {
         transceiver = {
@@ -3431,12 +3792,33 @@ function ConnectionManager(config) {
           remoteCodecs: m.codecs,
           remoteExtensions: m.extensions,
           remoteSimulcast: _remoteSimulcast,
-          // Codec negotiation: pick the first non-RTX codec as primary.
-          // This matches createMediaReceiver's selection. Phase 1.5 (preferred
-          // codec list, priority ordering) can override this.
-          negotiatedCodec: receiver ? receiver.codec : null,
+          // See _setNegotiatedCodecs.
+          negotiatedCodec: _senderCodecs.length ? _senderCodecs[0] : (receiver ? receiver.codec : null),
+          negotiatedRecvCodec: receiver ? receiver.codec : null,
         };
         state.transceivers.push(transceiver);
+      }
+
+      // FlexFEC: surface the negotiated PT to media_transport (one PT per
+      // session is sufficient — flexfec-03 protects whole streams, pairing
+      // rides in a=ssrc-group:FEC-FR). For BOTH branches above: it used to
+      // sit in the `existing` one only, so with a transceiver created by
+      // this offer (the answerer flow) the PT was never set and FlexFEC did
+      // nothing either way — the answer accepted flexfec-03, yet no FEC
+      // packet was sent, and the peer's FEC packets went into the media path
+      // as an unknown payload type.
+      // Looked up in both orders: for an offer, the PT rides the codec list
+      // answerCodecs built (the receive order), not the offer's own codec
+      // objects, where the parse parked it on the first one — possibly a codec
+      // we declined (sdp.js negotiateCodecs).
+      var _ffList = [].concat(_recvCodecs || [], _senderCodecs || []);
+      if (state.flexfecPayloadType == null && !_rejectedSection) {
+        for (var _ffi = 0; _ffi < _ffList.length; _ffi++) {
+          if (_ffList[_ffi] && _ffList[_ffi].flexfecPayloadType != null) {
+            state.flexfecPayloadType = _ffList[_ffi].flexfecPayloadType;
+            break;
+          }
+        }
       }
 
       // Map SSRCs
@@ -3471,6 +3853,23 @@ function ConnectionManager(config) {
             isRtx: true,
             rid:   null,
             primarySsrc: group.ssrcs[0],
+          };
+        } else if (group.semantics === 'FEC-FR' && group.ssrcs.length >= 2) {
+          // Second SSRC in an FEC-FR group is the FlexFEC stream (flexfec-03
+          // / RFC 5956). Mapped above as a primary, like any a=ssrc, it was
+          // one: RTCRtpReceiver took the lowest-numbered "primary" of the
+          // mid, so whenever the FEC SSRC was the smaller number (5 runs in 8
+          // with Chrome's FlexFEC on) the receiver locked onto the FEC
+          // stream and never saw a frame; findPrimaryForRtx's "exactly one
+          // primary" fallback found two and gave up. FEC packets themselves
+          // are recognised by payload type in media_transport; this entry
+          // only says what the SSRC is, so nothing takes it for media.
+          state.remoteSsrcMap[group.ssrcs[1]] = {
+            mid: m.mid, transceiver: transceiver, receiver: receiver,
+            isRtx: false,
+            isFec: true,
+            rid:   null,
+            protectedSsrc: group.ssrcs[0],
           };
         }
       }
@@ -3735,6 +4134,45 @@ function ConnectionManager(config) {
 
     updateNegotiationNeededFlag();
     return transceiver;
+  }
+
+  // A transceiver created by setRemoteDescription is born with no SSRC (it
+  // was receive-only); RtpManager.ensureSendSsrc gives it one when it turns
+  // into a sender (direction setter, replaceTrack, addTrack's reuse). That
+  // allocation needs the same glue addTransceiverInternal gives a locally
+  // created one. api.js used to call RtpManager.ensureSendSsrc itself, so
+  // none of it ran: the RTX ssrc was in the answer's a=ssrc-group:FID but
+  // never registered, every NACK from the peer found no rtxStreams entry and
+  // went unserved (VP8 at 5% loss: ~30 of ~200 frames decoded, ~430 NACKs;
+  // with the mapping, ~190 frames and ~15 NACKs).
+  //
+  // The RTX pt: the apt partner of the first negotiated video codec, the same
+  // rule as processRemoteMedia's 'Negotiated-RTX override' (which re-registers
+  // on every SRD); 97 when nothing was negotiated yet, as above.
+  function ensureSendSsrcInternal(transceiver) {
+    if (!RtpManager.ensureSendSsrc(state, transceiver)) return false;
+    var layers = transceiver.sender.layers;
+    if (transceiver.kind === 'video') {
+      var rtxPt = 97;
+      var negCodecs = transceiver.sender._negotiatedCodecs || transceiver._negotiatedCodecs;
+      if (negCodecs) {
+        for (var ci = 0; ci < negCodecs.length; ci++) {
+          if (negCodecs[ci] && negCodecs[ci].rtxPayloadType != null) {
+            rtxPt = negCodecs[ci].rtxPayloadType;
+            break;
+          }
+        }
+      }
+      for (var mi = 0; mi < layers.length; mi++) {
+        if (layers[mi].ssrc != null && layers[mi].rtxSsrc != null) {
+          mediaTransport.setRtxMapping(layers[mi].ssrc, layers[mi].rtxSsrc, rtxPt);
+        }
+      }
+    }
+    for (var sli = 0; sli < layers.length; sli++) {
+      mediaTransport.registerTransceiverLayer(layers[sli]);
+    }
+    return true;
   }
 
   function getNextMid() {
@@ -4180,7 +4618,12 @@ function ConnectionManager(config) {
     if (state.mode !== 'lite' && !state.currentLocalDescription && !state.currentRemoteDescription) {
       state.iceRoleDecided = false;
     }
-    sdpOA.rollback(source, cb);
+    sdpOA.rollback(source, function (err) {
+      // A rolled-back offer moved nothing: an SCTP ABORT parked for the
+      // move it announced was the association's end after all.
+      if (!err) dcController.abandonParked();
+      if (cb) cb.apply(null, arguments);
+    });
   };
 
   // Exposed so api.js can trigger a negotiation-needed re-evaluation when
@@ -4197,6 +4640,7 @@ function ConnectionManager(config) {
 
   // Media
   this.addTransceiver = addTransceiverInternal;
+  this.ensureSendSsrc = ensureSendSsrcInternal;
   this.findTransceiverByMid = findTransceiverByMid;
 
   // DataChannel — logic lives in DataChannelController. This thin wrapper
@@ -4236,6 +4680,9 @@ function ConnectionManager(config) {
   // (the field receivers use to align media streams for lipsync).
   this.registerOutboundStream = function (ssrc, info) {
     mediaTransport.registerOutboundStream(ssrc, info);
+  };
+  this.unregisterOutboundStream = function (ssrc) {
+    mediaTransport.unregisterOutboundStream(ssrc);
   };
 
   // Transceiver layer registration. api.js calls

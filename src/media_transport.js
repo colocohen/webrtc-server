@@ -40,13 +40,14 @@ import { EventEmitter } from 'node:events';
 import {
   FlexFecDecoder,
   FlexFecEncoder,
+  flexfecProtectedSsrc,
   readAudioLevel,
   parse as parseRtp,
   parseRtxPacket,
   NackGenerator,
   TransportCCFeedbackGenerator,
   RtxStream,
-  buildPLI, buildRR, buildSR, buildNACK, buildREMB,
+  buildPLI, buildRR, buildSR, buildNACK, buildREMB, buildBYE,
   parseRTCPCompound,
   parseTransportCC, parseREMB,
 } from 'rtp-packet';
@@ -202,6 +203,14 @@ class MediaTransport extends EventEmitter {
 
     // Synthetic packet drop (DROP_RTP_PCT env var). Skips the first 30
     // packets so Chrome's decoder bootstraps cleanly. RTX packets exempt.
+    //
+    // The packet is lost on the NETWORK: it is still encrypted, counted in
+    // outbound-rtp and fed to the FlexFEC encoder — only ice.send is
+    // skipped. The drop used to `return` right here, before all three: FEC
+    // never saw the lost packet, so the FEC packets protected a stream with
+    // that packet missing and could not rebuild it (FEC under DROP_RTP_PCT
+    // recovered nothing), and outbound-rtp undercounted what was sent.
+    var _netDrop = false;
     if (_DROP_RTP_PCT > 0) {
       if (!state._sendRtpTotal) state._sendRtpTotal = 0;
       state._sendRtpTotal++;
@@ -217,7 +226,7 @@ class MediaTransport extends EventEmitter {
             ' ssrc=' + ssrcPeek + ' seq=' + seqPeek +
             ' (total sent=' + state._sendRtpTotal + ')');
         }
-        return;   // "drop" — skip encryption/send but keep the buffer entry
+        _netDrop = true;   // lost on the wire — everything but ice.send happens
       }
     }
 
@@ -267,7 +276,7 @@ class MediaTransport extends EventEmitter {
         ' ssrc=' + ssrc +
         ' selectedPair=' + (state.selectedPair ? 'yes' : 'NO'));
     }
-    ice.send(enc);
+    if (!_netDrop) ice.send(enc);
 
     // ── FlexFEC send path (flexfec-03) ──
     //
@@ -290,6 +299,7 @@ class MediaTransport extends EventEmitter {
           payloadType:   state.flexfecPayloadType,
           protectedSsrc: ssrc,
           groupSize:     state.flexfecGroupSize || 4,
+          extensions:    state.localExtensions || null,
         });
         this._diag('[cm-diag] flexfec: encoder created media=' + ssrc +
                    ' fec=' + state.localFecSsrcs[ssrc] +
@@ -298,6 +308,8 @@ class MediaTransport extends EventEmitter {
       var _fecPkts = _fenc.protect(rtpPacket);
       for (var _fpi = 0; _fpi < _fecPkts.length; _fpi++) {
         var _fecEnc = srtp.encryptRtp(_fecPkts[_fpi]);
+        // FEC packets cross the same network: the synthetic loss hits them too.
+        if (_DROP_RTP_PCT > 0 && (Math.random() * 100) < _DROP_RTP_PCT) continue;
         if (_fecEnc) ice.send(_fecEnc);
       }
     }
@@ -418,11 +430,27 @@ class MediaTransport extends EventEmitter {
 
   /**
    * Register the RTX association between a primary SSRC and its RTX SSRC.
-   * Called when a transceiver with RTX support is created (cm.js's
-   * addTransceiverInternal). Each call sets up a fresh RtxStream (fresh
-   * random initial seq) in rtp-packet.
+   * Called on transceiver setup and again on every negotiation.
+   *
+   * The RTX stream's sequence numbers CONTINUE while its SSRC stays the
+   * same. Every call used to build a fresh RtxStream with a random
+   * starting seq on the same RTX SSRC; the receiver's SRTP replay window
+   * (keyed by SSRC) then dropped every retransmission numbered below the
+   * old stream's highest as a replay — after any renegotiation, no
+   * retransmission got through. Only a new RTX SSRC starts a new stream;
+   * a changed payload type keeps the sequence.
    */
   setRtxMapping(primarySsrc, rtxSsrc, rtxPt) {
+    var cur = this._state.rtxStreams[primarySsrc];
+    if (cur && cur.ssrc() === (rtxSsrc >>> 0)) {
+      if (cur.pt() === (rtxPt & 0x7F)) return;
+      this._state.rtxStreams[primarySsrc] = new RtxStream({
+        rtxSsrc:    rtxSsrc,
+        rtxPt:      rtxPt,
+        initialSeq: cur.seq(),
+      });
+      return;
+    }
     this._state.rtxStreams[primarySsrc] = new RtxStream({
       rtxSsrc: rtxSsrc,
       rtxPt:   rtxPt,
@@ -572,7 +600,7 @@ class MediaTransport extends EventEmitter {
     if (!Number.isFinite(remoteSsrc) || remoteSsrc < 0) return;
     var state = this._state;
     var mapping = state.remoteSsrcMap[remoteSsrc];
-    if (mapping && mapping.isRtx) return;   // PLI to RTX is invalid
+    if (mapping && (mapping.isRtx || mapping.isFec)) return;   // PLI to RTX / FEC is invalid
     // One PLI per SSRC per PLI_MIN_INTERVAL_MS. Gap, resync and NACK-overflow
     // can each ask for a keyframe for the same loss; a keyframe is already
     // on its way after the first, and the rest only add load on the sender's
@@ -847,6 +875,48 @@ class MediaTransport extends EventEmitter {
   }
 
   /**
+   * Transport-CC: record one packet's arrival under its transport-wide seq.
+   *
+   * If the remote negotiated a transport-cc header extension on this media
+   * section (state.remoteTransportCcExtId is set from SDP), every incoming
+   * RTP packet carries a 16-bit transport-wide seq in that extension. We
+   * capture (seq, arrivalTime) pairs now; the tccFeedbackTimer drains them
+   * into an RTCP feedback packet every tccFeedbackIntervalMs. Every packet
+   * that crossed the transport counts — media, RTX and FlexFEC alike.
+   */
+  _recordTransportCc(parsed, ssrc, arrival) {
+    var state = this._state;
+    var tccExtId = state.remoteTransportCcExtId;
+    if (tccExtId == null || !parsed.extensions || !parsed.extensions[tccExtId]) return;
+    var tccBuf = parsed.extensions[tccExtId];
+    if (tccBuf.length >= 2) {
+      var tccSeq = tccBuf.readUInt16BE(0);
+      // ONE generator for the whole transport. The sequence number is
+      // transport-wide — shared by every SSRC on the transport — so a
+      // generator per SSRC saw only its own share of the numbers and
+      // reported every packet of the other streams in between as lost,
+      // feeding the sender's bandwidth estimate false loss.
+      var gen = state.tccFeedbackGenerators.transport;
+      if (!gen) {
+        // Created on the first packet carrying the extension. The
+        // senderSsrc field on outgoing feedback is our local SSRC on
+        // the matching m= section if we know it, else 1.
+        var localSenderSsrc = 1;
+        var mapping = state.remoteSsrcMap[ssrc];
+        if (mapping && state.localSsrcs[mapping.mid]) {
+          localSenderSsrc = state.localSsrcs[mapping.mid].id;
+        }
+        gen = new TransportCCFeedbackGenerator({
+          senderSsrc: localSenderSsrc,
+          mediaSsrc:  ssrc,
+        });
+        state.tccFeedbackGenerators.transport = gen;
+      }
+      gen.recordArrival(tccSeq, arrival);
+    }
+  }
+
+  /**
    * Inner receive pipeline: receives a plaintext RTP packet and runs through
    * the full inbound media flow. May be called recursively (with
    * isRecovered=true) when an RTX packet is unwrapped into its primary.
@@ -862,8 +932,11 @@ class MediaTransport extends EventEmitter {
    *                               outer RTX packet's byteLen so the primary
    *                               stream's bytes counter reflects the actual
    *                               cost of receipt (RTX wrapping overhead included).
+   * @param {boolean} [fromFec]    rebuilt by the FlexFEC decoder: it never
+   *                               crossed the transport (its transport-cc
+   *                               field is the zero the FEC protected).
    */
-  _handleIncomingRtpInner(rtp, rinfo, isRecovered, byteLen) {
+  _handleIncomingRtpInner(rtp, rinfo, isRecovered, byteLen, fromFec) {
     var state = this._state;
 
     // Parse once, use the result everywhere. parseRtp now returns the
@@ -885,19 +958,27 @@ class MediaTransport extends EventEmitter {
     // pattern RTX recovery uses, so NackGenerator/stats treat them right).
     if (state.flexfecPayloadType != null) {
       if (pt === state.flexfecPayloadType && !isRecovered) {
-        // Protected SSRC lives at FEC-payload offset 12 (after the
-        // 12-byte RTP header → bytes 24-27 of the packet).
-        if (rtp.length >= 28) {
-          var _protSsrc = rtp.readUInt32BE(24);
+        // The FEC packet came over the transport with its own transport-wide
+        // seq: acknowledge it, or the peer's bandwidth estimate counts every
+        // FEC packet (a quarter of the video at groupSize 4) as lost. It
+        // used to return before the transport-cc recording below.
+        this._recordTransportCc(parsed, ssrc, Date.now());
+        // The protected SSRC is in the FEC header, which follows the FEC
+        // packet's WHOLE RTP header. It was read at byte 24, which holds only
+        // with no CSRC and no extension — never for Chrome's FEC packets
+        // (abs-send-time, transport-cc, mid): no FEC packet of theirs went
+        // to the decoder of the stream it protects.
+        var _protSsrc = flexfecProtectedSsrc(rtp);
+        if (_protSsrc != null) {
           if (!state.flexfecDecoders) state.flexfecDecoders = {};
           var _dec = state.flexfecDecoders[_protSsrc];
           if (!_dec) {
-            _dec = state.flexfecDecoders[_protSsrc] = new FlexFecDecoder();
+            _dec = state.flexfecDecoders[_protSsrc] = new FlexFecDecoder({ extensions: state.remoteExtensions || null });
             this._diag('[cm-diag] flexfec: decoder created for protected ssrc=' + _protSsrc);
           }
           var _recovered = _dec.addFecPacket(rtp);
           for (var _ri = 0; _ri < _recovered.length; _ri++) {
-            this._handleIncomingRtpInner(_recovered[_ri], rinfo, /*isRecovered=*/true, _recovered[_ri].length);
+            this._handleIncomingRtpInner(_recovered[_ri], rinfo, /*isRecovered=*/true, _recovered[_ri].length, /*fromFec=*/true);
           }
         }
         return;   // FEC packets never continue into the media pipeline
@@ -913,10 +994,10 @@ class MediaTransport extends EventEmitter {
       if (!isRecovered) {
         if (!state.flexfecDecoders) state.flexfecDecoders = {};
         var _mdec = state.flexfecDecoders[ssrc];
-        if (!_mdec) _mdec = state.flexfecDecoders[ssrc] = new FlexFecDecoder();
+        if (!_mdec) _mdec = state.flexfecDecoders[ssrc] = new FlexFecDecoder({ extensions: state.remoteExtensions || null });
         var _rec2 = _mdec.addMediaPacket(rtp);
         for (var _ri2 = 0; _ri2 < _rec2.length; _ri2++) {
-          this._handleIncomingRtpInner(_rec2[_ri2], rinfo, /*isRecovered=*/true, _rec2[_ri2].length);
+          this._handleIncomingRtpInner(_rec2[_ri2], rinfo, /*isRecovered=*/true, _rec2[_ri2].length, /*fromFec=*/true);
         }
       }
     }
@@ -1053,6 +1134,13 @@ class MediaTransport extends EventEmitter {
     // Defensive: refuse to recurse if isRecovered is already set, in
     // case a sender ever wraps RTX inside RTX.
     if (_mapping && _mapping.isRtx && !isRecovered) {
+      // Transport-cc first, for EVERY RTX packet. Chrome's bandwidth probes
+      // are RTX packets with padding only: parseRtxPacket returns null for
+      // them, and the branch returned before anything was recorded, so each
+      // probe was reported lost and the peer's estimate never climbed past
+      // a few hundred kbps. The recovered primary below is not recorded
+      // again (it carries this packet's transport-wide seq).
+      this._recordTransportCc(parsed, ssrc, Date.now());
       if (_mapping.primarySsrc == null) {
         _mapping.primarySsrc = this._deps.findPrimaryForRtx(_mapping);
       }
@@ -1102,6 +1190,19 @@ class MediaTransport extends EventEmitter {
       this._diag('[cm-diag] handleIncomingRtp: first RTP from ssrc=' + ssrc + ' pt=' + pt);
     }
 
+    // THE PEER MAY SWITCH CODEC MID-STREAM (any negotiated payload type, no
+    // renegotiation — the receive pipeline follows it, media_pipeline's
+    // codecForPt). payloadType and peekKeyframeFn were fixed at the first
+    // packet: inbound-rtp.codecId kept naming the old codec, and the
+    // NackGenerator's keyframe test ran the OLD codec's parser over the new
+    // one's payloads (a VP8 keyframe check on VP9 packets) — the "keyframe,
+    // drop the older gaps" signal fired on the wrong packets or never.
+    // A change re-resolves the peek function for the new payload type.
+    if (pt !== s.payloadType) {
+      s.payloadType = pt;
+      s.peekKeyframeFn = undefined;
+    }
+
     // First-time peek-function resolution for this SSRC. We don't do this
     // in the rtpStats init block above because the SSRC↔mid mapping or the
     // codec table for the mid may not have been populated yet. Checking
@@ -1112,6 +1213,11 @@ class MediaTransport extends EventEmitter {
       var _midForCodec = _mapForCodec ? _mapForCodec.mid : null;
       var _recvForCodec = _midForCodec != null ? state.mediaReceivers[_midForCodec] : null;
       var _codecName = _recvForCodec && _recvForCodec.codec ? _recvForCodec.codec.name : null;
+      // The codec of THIS payload type, when the receiver knows the set.
+      var _rxSet = _recvForCodec && _recvForCodec.codecs;
+      for (var _pi = 0; _rxSet && _pi < _rxSet.length; _pi++) {
+        if (_rxSet[_pi] && _rxSet[_pi].payloadType === pt) { _codecName = _rxSet[_pi].name; break; }
+      }
       if (_codecName) {
         s.peekKeyframeFn = this._deps.resolvePeekKeyframeFn(_codecName);
       }
@@ -1239,42 +1345,14 @@ class MediaTransport extends EventEmitter {
       nackGen.observePacket(extSeq, isKeyframe, isRecovered);
     }
 
-    // Transport-CC feedback generation.
+    // Transport-CC feedback generation (_recordTransportCc).
     //
-    // If the remote negotiated a transport-cc header extension on this media
-    // section (state.remoteTransportCcExtId is set from SDP), every incoming
-    // RTP packet carries a 16-bit transport-wide seq in that extension. We
-    // capture (seq, arrivalTime) pairs now; the tccFeedbackTimer drains them
-    // into an RTCP feedback packet every tccFeedbackIntervalMs.
-    var tccExtId = state.remoteTransportCcExtId;
-    if (tccExtId != null && parsed.extensions && parsed.extensions[tccExtId]) {
-      var tccBuf = parsed.extensions[tccExtId];
-      if (tccBuf.length >= 2) {
-        var tccSeq = tccBuf.readUInt16BE(0);
-        // ONE generator for the whole transport. The sequence number is
-        // transport-wide — shared by every SSRC on the transport — so a
-        // generator per SSRC saw only its own share of the numbers and
-        // reported every packet of the other streams in between as lost,
-        // feeding the sender's bandwidth estimate false loss.
-        var gen = state.tccFeedbackGenerators.transport;
-        if (!gen) {
-          // Created on the first packet carrying the extension. The
-          // senderSsrc field on outgoing feedback is our local SSRC on
-          // the matching m= section if we know it, else 1.
-          var localSenderSsrc = 1;
-          var mapping = state.remoteSsrcMap[ssrc];
-          if (mapping && state.localSsrcs[mapping.mid]) {
-            localSenderSsrc = state.localSsrcs[mapping.mid].id;
-          }
-          gen = new TransportCCFeedbackGenerator({
-            senderSsrc: localSenderSsrc,
-            mediaSsrc:  ssrc,
-          });
-          state.tccFeedbackGenerators.transport = gen;
-        }
-        gen.recordArrival(tccSeq, arrival);
-      }
-    }
+    // Only packets that crossed the transport as they are. A packet FlexFEC
+    // rebuilt did not arrive: its transport-cc field is the zero the FEC
+    // protected (see FlexFecDecoder), and recording it reported seq 0 as
+    // received. An RTX-recovered one was already recorded as the RTX packet
+    // it arrived in (the RTX branch above).
+    if (!isRecovered) this._recordTransportCc(parsed, ssrc, arrival);
 
     // ── Per-receiver source tracking (W3C webrtc-pc §5.3.4) ──
     //
@@ -1283,7 +1361,7 @@ class MediaTransport extends EventEmitter {
     // window) and SSRC entries (latest-wins per SSRC). RTX packets are skipped
     // (retransmissions, not new source activity); SSRCs that map to nothing
     // are skipped too.
-    if (_mapping && !_mapping.isRtx && _mapping.transceiver) {
+    if (_mapping && !_mapping.isRtx && !_mapping.isFec && _mapping.transceiver) {
       var receiver = _mapping.transceiver.receiver;
       // W3C: the sync-source timestamp is on the SAME clock as
       // performance.timeOrigin + performance.now() — an absolute time, not
@@ -1349,6 +1427,12 @@ class MediaTransport extends EventEmitter {
     // packet a second time. Read-only for listeners: nothing here writes to
     // it after this point.
     var info = { payloadType: pt, sequenceNumber: seq, ssrc: ssrc, parsed: parsed };
+    // isRtx: this primary packet was unwrapped from RTX (a retransmission or
+    // a probe carrying a payload), not received on the primary SSRC. It
+    // looks exactly like the original, so a forwarder (sfu-server) needs
+    // the flag to keep it out of its own sequence/timestamp rewriting.
+    // Absent on primary packets and on FlexFEC recoveries.
+    if (isRecovered && !fromFec) info.isRtx = true;
     this.emit('rtp', rtp, rinfo, info);
   }
 
@@ -1468,6 +1552,13 @@ class MediaTransport extends EventEmitter {
         var oSsrc = parseInt(outSsrcs[os], 10);
         var oSt = state.outboundStats[oSsrc];
         if (!oSt || oSt.packets === 0) continue;
+        // RFC 3550 §6.4: a participant reports as a sender (SR) only for a
+        // source that sent RTP since the report before last; 1000 ms is
+        // this timer's interval. Before, every SSRC that had ever sent got
+        // an SR forever — after removeTrack, direction 'inactive' or
+        // replaceTrack(null) the peer kept receiving Sender Reports for a
+        // stream that had stopped. Sending again resumes them.
+        if (Date.now() - oSt.lastPacketAt > 2 * 1000) continue;
 
         var sent = Date.now();
         var ntpSec  = Math.floor(sent / 1000) + 2208988800;
@@ -1521,7 +1612,7 @@ class MediaTransport extends EventEmitter {
         for (var j = 0; j < remoteSsrcList.length; j++) {
           var remoteSsrcJ = remoteSsrcList[j];
           var mappingJ = state.remoteSsrcMap[remoteSsrcJ];
-          if (mappingJ && !mappingJ.isRtx) self.requestKeyframe(remoteSsrcJ);
+          if (mappingJ && !mappingJ.isRtx && !mappingJ.isFec) self.requestKeyframe(remoteSsrcJ);
         }
       }
     }, 1000);
@@ -1681,6 +1772,40 @@ class MediaTransport extends EventEmitter {
   }
 
   /**
+   * Reverse of registerOutboundStream. Without it a stream that ended
+   * (an SFU consumer that closed) kept its outboundStats entry, so a
+   * Sender Report was written for it on every RTCP interval for the rest
+   * of the connection, and kept its RTX mapping and header-stamper mid.
+   * sfu-server reached into state to delete them by hand.
+   *
+   * The stream has ended for good (transceiver.stop(), a closed SFU
+   * consumer), so the peer is also told with an RTCP BYE (RFC 3550 §6.6)
+   * for the SSRC and its RTX SSRC, as libwebrtc does when a sender is
+   * torn down. Only SSRCs that actually sent RTP are named — the peer
+   * never saw the others. Accepts a primary or an RTX SSRC.
+   */
+  unregisterOutboundStream(ssrc) {
+    if (ssrc == null) return;
+    ssrc = ssrc >>> 0;
+    var state = this._state;
+    var rtx = state.rtxStreams[ssrc];
+    var ssrcs = [ssrc];
+    if (rtx && typeof rtx.ssrc === 'function') ssrcs.push(rtx.ssrc() >>> 0);
+    var stamper = state.headerStamper;
+    var bye = [];
+    for (var i = 0; i < ssrcs.length; i++) {
+      var o = state.outboundStats[ssrcs[i]];
+      if (o && o.packets > 0) bye.push(ssrcs[i]);
+      delete state.outboundStats[ssrcs[i]];
+      if (stamper && typeof stamper.clearSsrc === 'function') stamper.clearSsrc(ssrcs[i]);
+    }
+    delete state.rtxStreams[ssrc];
+    if (bye.length > 0 && !state.closed) {
+      try { this.sendRtcp(buildBYE(bye)); } catch (e) {}
+    }
+  }
+
+  /**
    * Reverse of registerTransceiverLayer. Called by api.js when a transceiver
    * is stopped — clears the stamper's per-SSRC mapping so a future
    * transceiver reusing one of these SSRCs (rare) starts clean.
@@ -1704,7 +1829,20 @@ class MediaTransport extends EventEmitter {
    */
   syncExtMap(parsedLocal) {
     var stamper = this._state.headerStamper;
-    if (!stamper || !parsedLocal || !parsedLocal.media) return;
+    if (!parsedLocal || !parsedLocal.media) return;
+    // Every id → uri we negotiated, for the FlexFEC encoder: it protects
+    // our mutable extensions as zeros, which is how the peer's decoder
+    // (libwebrtc's FlexfecReceiver) XORs them.
+    var localExt = {};
+    for (var li = 0; li < parsedLocal.media.length; li++) {
+      var lm = parsedLocal.media[li];
+      if (!lm.extensions) continue;
+      for (var lei = 0; lei < lm.extensions.length; lei++) {
+        if (localExt[lm.extensions[lei].id] == null) localExt[lm.extensions[lei].id] = lm.extensions[lei].uri;
+      }
+    }
+    this._state.localExtensions = localExt;
+    if (!stamper) return;
     var URI_TO_NAME = {
       // RFC 6464 ssrc-audio-level. Missing here meant the rebuilt map had no
       // 'audio-level' key at all — including the one set at construction —
@@ -1767,12 +1905,25 @@ class MediaTransport extends EventEmitter {
   /* ====================== Lifecycle ====================== */
 
   /**
-   * Stop all timers. Called by cm.js's close().
+   * Stop the RTCP, transport-cc and NACK timers. Called by close(), and by
+   * cm.js when the SRTP session is replaced (transport moved to a new
+   * BUNDLE tag): the next startRtcpTimer() then starts all three again.
+   * Each timer only stops itself on its next tick once SRTP is gone, and
+   * startRtcpTimer() returns early while the RTCP one is still set — a
+   * swap shorter than its 1 s tick left transport-cc and NACK feedback
+   * stopped for good.
    */
-  close() {
+  stopTimers() {
     if (this._rtcpTimer)        { clearInterval(this._rtcpTimer);        this._rtcpTimer = null; }
     if (this._tccFeedbackTimer) { clearInterval(this._tccFeedbackTimer); this._tccFeedbackTimer = null; }
     if (this._nackFeedbackTimer){ clearInterval(this._nackFeedbackTimer); this._nackFeedbackTimer = null; }
+  }
+
+  /**
+   * Stop all timers. Called by cm.js's close().
+   */
+  close() {
+    this.stopTimers();
   }
 }
 

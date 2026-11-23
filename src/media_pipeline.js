@@ -31,6 +31,7 @@ import {
   OpusPacketizer, OpusDepacketizer,
   JitterBuffer, parse as parseRtp,
 } from 'rtp-packet';
+import * as RtpManager from './rtp_transmission_manager.js';
 
 /**
  * Read the next sequence number a packetizer will emit, or null.
@@ -57,6 +58,143 @@ function _packetizerSeq(packetizer) {
   return null;
 }
 
+/**
+ * The VP8/VP9 PictureID the packetizer will put on its next frame, or null
+ * when it emits none. Private field like `_seq` above (no public accessor in
+ * rtp-packet).
+ */
+function _packetizerPictureId(packetizer) {
+  if (!packetizer || !packetizer._hasPid) return null;
+  return packetizer._pid & 0x7FFF;
+}
+
+/**
+ * Per-SSRC RTP send state that outlives any one pipeline.
+ *
+ * A send pipeline is rebuilt on replaceTrack(), on a codec change and on a
+ * restart after replaceTrack(null), but the SSRC — the stream the receiver
+ * sees — stays the same, and so must its timeline. libwebrtc keeps this in
+ * the RTP sender's RtpState; here it is keyed by (manager, ssrc) so every
+ * pipeline (single layer, simulcast layer, audio) finds it without the
+ * caller having to thread it through.
+ *
+ *   lastRtpTs     RTP timestamp of the last packet sent on the SSRC
+ *   lastSentAt    monotonic ms when it was sent (to carry wall time across
+ *                 a gap with no packets)
+ *   nextPictureId VP8/VP9 PictureID for the next frame
+ *
+ * The sequence number is carried by api.js (initialSequenceNumber), which
+ * sees DTMF too; it is not duplicated here.
+ */
+var _sendRtpStates = new WeakMap();   // manager -> { ssrc: state }
+
+function _sendRtpState(manager, ssrc) {
+  var bySsrc = _sendRtpStates.get(manager);
+  if (!bySsrc) {
+    bySsrc = Object.create(null);
+    _sendRtpStates.set(manager, bySsrc);
+  }
+  var key = String(ssrc >>> 0);
+  if (!bySsrc[key]) {
+    bySsrc[key] = { lastRtpTs: null, lastSentAt: 0, nextPictureId: null };
+  }
+  return bySsrc[key];
+}
+
+function _monotonicMs() {
+  return (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
+}
+
+/**
+ * Map one pipeline's packets onto the SSRC's RTP timeline.
+ *
+ * rtp-packet stamps each packet with the chunk's capture timestamp converted
+ * to ticks (usToRtp) and nothing else. That put two bugs on the wire:
+ *   - the first timestamp of a call was the source's clock (~0 for any fresh
+ *     source) instead of random (RFC 3550 §5.1);
+ *   - replaceTrack() to a track with its own clock made the timestamp jump
+ *     BACKWARDS on the same SSRC (video 282000 -> 0), and Chrome's jitter
+ *     buffer froze the video for seconds before it resynced.
+ *
+ * Like libwebrtc: the first packet on an SSRC gets a random base; a later
+ * pipeline on the same SSRC starts at the last sent timestamp plus the wall
+ * time since (never backwards, at least one tick). Within a pipeline the
+ * source's own timestamp deltas are kept exactly (a constant offset is
+ * added), so frame spacing and RED's in-packet timestamp offsets are
+ * untouched.
+ *
+ * @returns {function(Buffer[])}  rewrites the timestamps in place
+ */
+function _createRtpTimeline(rtpState, clockRate) {
+  var offset = null;   // ticks added to the packetizer's timestamps
+  return function stamp(pkts) {
+    if (!pkts || !pkts.length) return;
+    if (offset === null) {
+      var start;
+      if (rtpState.lastRtpTs == null) {
+        start = Math.floor(Math.random() * 0x100000000);
+      } else {
+        var gap = Math.max(1, Math.round(
+          (_monotonicMs() - rtpState.lastSentAt) * clockRate / 1000));
+        start = rtpState.lastRtpTs + gap;
+      }
+      offset = (start - pkts[0].readUInt32BE(4)) >>> 0;
+    }
+    var ts = 0;
+    for (var i = 0; i < pkts.length; i++) {
+      ts = (pkts[i].readUInt32BE(4) + offset) >>> 0;
+      pkts[i].writeUInt32BE(ts, 4);
+    }
+    rtpState.lastRtpTs  = ts;
+    rtpState.lastSentAt = _monotonicMs();
+  };
+}
+
+/**
+ * The transceiver whose sender owns `ssrc` (any simulcast layer), or null.
+ * Lets a send pipeline consult the negotiated direction without api.js
+ * passing the transceiver in (opts.transceiver wins when it does).
+ */
+function _findSendTransceiver(manager, ssrc) {
+  var list = manager && manager.state && manager.state.transceivers;
+  if (!list) return null;
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i] && list[i].sender;
+    if (!s) continue;
+    if (s.ssrc === ssrc) return list[i];
+    var layers = s.layers || [];
+    for (var j = 0; j < layers.length; j++) {
+      if (layers[j] && layers[j].ssrc === ssrc) return list[i];
+    }
+  }
+  return null;
+}
+
+/**
+ * Per-pipeline send gate on the negotiated direction (see
+ * rtp_transmission_manager.isSendingAllowed). Asked once per source frame,
+ * BEFORE the encoder, so a recvonly/inactive sender costs no encode CPU.
+ * `onResume` runs on the first allowed frame after a gated stretch (video
+ * uses it to force a keyframe: the receiver has nothing to decode from).
+ */
+function _createSendGate(manager, ssrc, transceiver, onResume) {
+  var t = transceiver || null;
+  var gated = false;
+  return function mayEncode() {
+    if (!t) t = _findSendTransceiver(manager, ssrc);
+    if (!RtpManager.isSendingAllowed(t)) {
+      gated = true;
+      return false;
+    }
+    if (gated) {
+      gated = false;
+      if (onResume) onResume();
+    }
+    return true;
+  };
+}
+
 // Debug logging gate (mirrors api.js / connection_manager.js). '[onRtp …]'
 // and '[mp-diag]' lines are per-packet / per-layer diagnostics that flood
 // stdout at video frame rates. Off by default — set WEBRTC_DEBUG=1.
@@ -79,6 +217,18 @@ var _DBG = (typeof process !== 'undefined' &&
  *       codedWidth/codedHeight up front.
  *   - requiresDescription    whether configure() needs a `description` blob
  *       (H264 AVCC format needs SPS/PPS; Annex-B does not)
+ *   - encoderBitstream       extra VideoEncoder.configure() fields (H264/H265)
+ *
+ * H.264 / H.265 are encoded as Annex-B ({avc|hevc}: {format: 'annexb'}).
+ * The W3C default is 'avc'/'hevc': length-prefixed NALUs with SPS/PPS (and
+ * VPS) OUT of band, in the decoder config's `description` — which
+ * media-processing follows since 0.6.0, and this pipeline never asked
+ * otherwise. RTP has no out-of-band channel for them (RFC 6184 / 7798: the
+ * parameter sets travel in-band, ahead of each IDR), and the output callback
+ * drops the metadata that carries the description: the peer got slices
+ * without a single SPS/PPS and could not decode one H264 frame (Chrome:
+ * framesDecoded 0). Annex-B keeps them in-band on every keyframe — what
+ * libwebrtc's encoders produce too.
  */
 var VIDEO_CODECS = {
   VP8: {
@@ -101,18 +251,15 @@ var VIDEO_CODECS = {
     decoderCodec:       'avc1.42E01F',   // baseline 3.1 — overridden by fmtp
     parseKeyframeDims:  parseH264KeyframeDimensions,
     requiresDescription: false,          // rtp-packet's depacketizer yields Annex-B
+    encoderBitstream:   { avc: { format: 'annexb' } },
   },
-  // AV1 — RFC 9798 RTP payload format. Like VP9, the bitstream carries
-  // its own sequence header (OBU_SEQUENCE_HEADER), so the decoder reconfigures
-  // itself; we don't need to parse keyframe dimensions out of the OBUs to
-  // call decoder.configure(). Default 1280x720 is a reasonable starter
-  // (matches what Chrome guesses for AV1 if no dims are supplied up-front).
   H265: {
     Packetizer:         H265Packetizer,
     Depacketizer:       H265Depacketizer,
     decoderCodec:       'h265',
     parseKeyframeDims:  parseH265KeyframeDimensions,
     requiresDescription: false,          // Annex-B end-to-end, like H264
+    encoderBitstream:   { hevc: { format: 'annexb' } },
   },
   AV1: {
     Packetizer:         AV1Packetizer,
@@ -144,19 +291,45 @@ function parseVp8KeyframeDimensions(data) {
 
 
 /**
- * VP9 keyframe header parse.
- * TODO Phase 1.5: real implementation. For now, returns a default so the
- * decoder gets configured; Chrome's VP9 decoder re-adapts from the bitstream
- * anyway. Users with non-default resolutions should request a reconfigure.
+ * VP9 keyframe header parse (VP9 bitstream spec §6.2 uncompressed_header):
+ * frame_marker, profile, show_existing_frame, frame_type, show_frame,
+ * error_resilient_mode, frame_sync_code 49 83 42, color_config, then
+ * frame_width_minus_1 / frame_height_minus_1 (16 bits each).
+ *
+ * This used to return a fixed 640x480 for every keyframe. Since MP-9 the
+ * VideoDecoder pins its OUTPUT to the configured size (an ffmpeg scale
+ * filter), so every VP9 stream was rescaled to 640x480 whatever it really
+ * was — a 1280x720 camera came out downscaled, and the stats reported the
+ * guess. It only looked right because the test camera was 640x480.
+ *
+ * In a superframe the first frame is the base layer, which is the one a
+ * keyframe starts with; that is the frame parsed here.
  */
 function parseVp9KeyframeDimensions(data) {
-  if (!data || data.length < 2) return null;
-  // frame_marker (2 bits) must be 0b10
-  if (((data[0] >> 6) & 0x03) !== 0x02) return null;
-  // TODO: proper VP9 uncompressed header parse — for now return defaults.
-  // Chrome's VP9 decoder sizes from the bitstream anyway, so 640x480 works
-  // until we add the real parser.
-  return { width: 640, height: 480 };
+  if (!data || data.length < 10) return null;
+  try {
+    var r = new _BitReader(data);
+    if (r.u(2) !== 2) return null;                  // frame_marker
+    var profile = r.u(1) | (r.u(1) << 1);           // low bit first
+    if (profile === 3) r.u(1);                      // reserved_zero
+    if (r.u(1)) return null;                        // show_existing_frame
+    if (r.u(1) !== 0) return null;                  // frame_type: 0 = KEY_FRAME
+    r.u(1); r.u(1);                                 // show_frame, error_resilient_mode
+    if (r.u(8) !== 0x49 || r.u(8) !== 0x83 || r.u(8) !== 0x42) return null;
+    // color_config (§6.2.2)
+    if (profile >= 2) r.u(1);                       // ten_or_twelve_bit
+    var colorSpace = r.u(3);
+    if (colorSpace !== 7) {                         // != CS_RGB
+      r.u(1);                                       // color_range
+      if (profile === 1 || profile === 3) r.u(3);   // subsampling_x/y, reserved_zero
+    } else if (profile === 1 || profile === 3) {
+      r.u(1);                                       // reserved_zero
+    }
+    var width  = r.u(16) + 1;
+    var height = r.u(16) + 1;
+    if (width > 16384 || height > 16384) return null;
+    return { width: width, height: height };
+  } catch (e) { return null; }
 }
 
 
@@ -324,20 +497,83 @@ function parseH265KeyframeDimensions(data) {
 
 
 /**
- * AV1 keyframe header parse — would walk OBUs to find OBU_SEQUENCE_HEADER
- * and decode max_frame_width_minus_1 / max_frame_height_minus_1.
- * TODO Phase 1.5: real implementation (LEB128 OBU sizes + Annex-B-like bit
- * decoding of the sequence header). Returns a sensible default until then.
- * Chrome's AV1 decoder reconfigures itself from OBU_SEQUENCE_HEADER in the
- * bitstream, so a 1280x720 default works as a bootstrap.
+ * AV1 keyframe dimensions — walk the Low Overhead OBU sequence the
+ * depacketizer emits (every OBU with obu_has_size_field set), find
+ * OBU_SEQUENCE_HEADER and read max_frame_width_minus_1 /
+ * max_frame_height_minus_1 (AV1 spec §5.5.1). No sequence header, no
+ * dimensions: wait for the next keyframe, which carries one.
+ *
+ * This used to return a fixed 1280x720. Since MP-9 the VideoDecoder pins
+ * its OUTPUT to the configured size, so a 640x480 AV1 stream was upscaled
+ * to 1280x720 — and the echo pipeline then re-encoded it at that size
+ * (outbound frameWidth 1280 for a 640x480 camera).
  */
 function parseAv1KeyframeDimensions(data) {
   if (!data || data.length < 2) return null;
-  // OBU header byte: forbidden_bit(0) | type(4) | extension(1) | has_size(1) | reserved(1)
-  // No structural validation here yet; the bitstream override handles the real size.
-  return { width: 1280, height: 720 };
+  try {
+    var off = 0;
+    while (off < data.length) {
+      var h = data[off];
+      if (h & 0x80) return null;                    // forbidden bit
+      var type = (h >> 3) & 0x0F;
+      var hdr = 1 + ((h & 0x04) ? 1 : 0);
+      if (!(h & 0x02)) return null;                 // no obu_size: cannot walk on
+      var size = 0, shift = 0, p = off + hdr, b;
+      do {
+        if (p >= data.length || shift > 49) return null;
+        b = data[p++];
+        size += (b & 0x7F) * Math.pow(2, shift);
+        shift += 7;
+      } while (b & 0x80);
+      if (p + size > data.length) return null;
+      if (type === 1) return _parseAv1SequenceHeader(data.subarray(p, p + size));
+      off = p + size;
+    }
+    return null;
+  } catch (e) { return null; }
 }
 
+function _parseAv1SequenceHeader(buf) {
+  var r = new _BitReader(buf);
+  r.u(3);                                           // seq_profile
+  r.u(1);                                           // still_picture
+  var reduced = r.u(1);                             // reduced_still_picture_header
+  if (reduced) {
+    r.u(5);                                         // seq_level_idx[0]
+  } else {
+    var decoderModelInfo = 0, bufferDelayLen = 0;
+    if (r.u(1)) {                                   // timing_info_present_flag
+      r.u(32); r.u(32);                             // num_units_in_display_tick, time_scale
+      if (r.u(1)) {                                 // equal_picture_interval
+        var lz = 0;                                 // uvlc() num_ticks_per_picture_minus_1
+        while (!r.u(1)) { if (++lz >= 32) break; }
+        if (lz < 32) r.u(lz);
+      }
+      decoderModelInfo = r.u(1);
+      if (decoderModelInfo) {
+        bufferDelayLen = r.u(5) + 1;                // buffer_delay_length_minus_1
+        r.u(32);                                    // num_units_in_decoding_tick
+        r.u(5); r.u(5);                             // buffer_removal_time / frame_presentation_time lengths
+      }
+    }
+    var initialDisplayDelay = r.u(1);
+    var opCount = r.u(5) + 1;                       // operating_points_cnt_minus_1
+    for (var i = 0; i < opCount; i++) {
+      r.u(12);                                      // operating_point_idc
+      if (r.u(5) > 7) r.u(1);                       // seq_level_idx, seq_tier
+      if (decoderModelInfo && r.u(1)) {             // decoder_model_present_for_this_op
+        r.u(bufferDelayLen); r.u(bufferDelayLen);   // decoder/encoder_buffer_delay
+        r.u(1);                                     // low_delay_mode_flag
+      }
+      if (initialDisplayDelay && r.u(1)) r.u(4);    // initial_display_delay_minus_1
+    }
+  }
+  var wBits = r.u(4) + 1, hBits = r.u(4) + 1;
+  var width  = r.u(wBits) + 1;
+  var height = r.u(hBits) + 1;
+  if (width > 65536 || height > 65536) return null;
+  return { width: width, height: height };
+}
 
 // Defaults for Phase 1. A future setParameters() will make these dynamic.
 var DEFAULT_BITRATE   = 1_000_000;
@@ -438,6 +674,7 @@ function createVideoSendPipeline(opts) {
   var width    = Math.max(2, Math.round(nativeW / scaleDown) & ~1);
   var height   = Math.max(2, Math.round(nativeH / scaleDown) & ~1);
 
+  var rtpState = _sendRtpState(manager, ssrc);
   var packetizer = new codecInfo.Packetizer({
     ssrc:        ssrc,
     payloadType: payloadType,
@@ -452,13 +689,16 @@ function createVideoSendPipeline(opts) {
     // 15-bit PictureID in the VP8/VP9 payload descriptor, incremented once
     // per frame. Purely payload-level — needs no SDP negotiation — and
     // libwebrtc receivers key frame-continuity tracking and simulcast
-    // layer switching on it. Codecs without the concept (H.264, Opus)
-    // ignore unknown options. Continuity across replaceTrack is NOT
-    // preserved (unlike the seq counter above): a PictureID jump after a
-    // track swap is tolerated by receivers, so carrying the extra state
-    // isn't worth it.
-    pictureId:   true,
+    // layer switching on it. Codecs without the concept (H.264, AV1)
+    // ignore unknown options. Carried across pipeline restarts like the
+    // timestamp (see _sendRtpState): it used to restart at a random value
+    // on every replaceTrack, which a receiver reads as a run of lost
+    // frames on the same SSRC. `true` = random start (first pipeline).
+    pictureId:   (rtpState.nextPictureId != null) ? rtpState.nextPictureId : true,
   });
+  // RTP timestamps continue the SSRC's timeline instead of restarting at
+  // the new source's clock (see _createRtpTimeline).
+  var stampRtpTimestamps = _createRtpTimeline(rtpState, 90000);   // every video payload format clocks at 90 kHz
 
   var frameCount = 0;   // counts frames fed to the encoder (for keyframe cadence)
   var stopped    = false;
@@ -512,7 +752,9 @@ function createVideoSendPipeline(opts) {
   var _packetsSent = 0;
 
   function _processChunkForSend(chunk) {
-    if (stopped || !active) return;
+    // mayEncode() again here: after takeStreams() the app can write chunks
+    // that never went through onFrame's gate.
+    if (stopped || !active || !mayEncode()) return;
     if (!manager.state.srtpSession) return;   // SRTP not ready — drop
 
     var o = manager.state.outboundStats[ssrc];
@@ -547,6 +789,9 @@ function createVideoSendPipeline(opts) {
       }
       return;
     }
+    stampRtpTimestamps(pkts);
+    var nextPid = _packetizerPictureId(packetizer);
+    if (nextPid != null) rtpState.nextPictureId = nextPid;
     for (var i = 0; i < pkts.length; i++) {
       manager.sendRtp(pkts[i]);
       _packetsSent++;
@@ -649,7 +894,7 @@ function createVideoSendPipeline(opts) {
   // Built in one place so the initial configure and the setParameters
   // reconfigure below cannot drift apart.
   function _encoderConfig() {
-    return {
+    var cfg = {
       codec:                codecInfo.decoderCodec,
       width:                width,
       height:               height,
@@ -658,6 +903,10 @@ function createVideoSendPipeline(opts) {
       latencyMode:          'realtime',
       hardwareAcceleration: 'prefer-software',
     };
+    // Annex-B for H264/H265 — see VIDEO_CODECS.
+    var bs = codecInfo.encoderBitstream;
+    if (bs) for (var k in bs) cfg[k] = bs[k];
+    return cfg;
   }
 
   encoder.configure(_encoderConfig());
@@ -669,6 +918,14 @@ function createVideoSendPipeline(opts) {
   // requestKeyFrame() in response to PLI/FIR from the remote receiver.
   var pendingKeyFrame = false;
 
+  // Negotiated-direction gate (recvonly / inactive / stopped send nothing).
+  // On resume the receiver has had no frames for a while — and the last
+  // reference it decoded is not the one the encoder would predict from —
+  // so the first frame back is a keyframe.
+  var mayEncode = _createSendGate(manager, ssrc, opts.transceiver, function () {
+    pendingKeyFrame = true;
+  });
+
   var onFrame = function (frame) {
     // QUICK-8: media-source.frames counts every frame originating from
     // the source, including ones we drop here (per W3C webrtc-stats:
@@ -677,7 +934,7 @@ function createVideoSendPipeline(opts) {
     if (opts.onSourceFrame) {
       try { opts.onSourceFrame(); } catch (e) { /* never let stats throw into the pipeline */ }
     }
-    if (stopped || !active) {
+    if (stopped || !active || !mayEncode()) {
       // Must close the VideoFrame we received even when dropping, otherwise
       // the source's VideoFrame buffer pool starves.
       try { if (frame && typeof frame.close === 'function') frame.close(); } catch (e) {}
@@ -734,7 +991,12 @@ function createVideoSendPipeline(opts) {
   };
 
   track.on('frame', onFrame);
+  // A track stopped by the application fires no 'ended' (mediacapture-
+  // main: 'ended' is for the source ending); media-processing signals
+  // every end of the track — stop() included — with '_stopped'. 'ended'
+  // stays for a media-processing without it.
   track.on('ended', onTrackEnded);
+  track.on('_stopped', onTrackEnded);
 
 
   /* ── Keyframe requests from the remote peer ─────────────────────────── */
@@ -759,6 +1021,7 @@ function createVideoSendPipeline(opts) {
     stopped = true;
     track.off('frame', onFrame);
     track.off('ended', onTrackEnded);
+    track.off('_stopped', onTrackEnded);
     if (manager.ev && typeof manager.ev.off === 'function') {
       manager.ev.off('keyframe:request', onKeyframeRequest);
     }
@@ -974,7 +1237,12 @@ function createVideoSendSimulcastPipeline(opts) {
     for (var i = 0; i < subEmitters.length; i++) subEmitters[i].emit('ended');
   };
   track.on('frame', mainOnFrame);
+  // A track stopped by the application fires no 'ended' (mediacapture-
+  // main: 'ended' is for the source ending); media-processing signals
+  // every end of the track — stop() included — with '_stopped'. 'ended'
+  // stays for a media-processing without it.
   track.on('ended', mainOnEnded);
+  track.on('_stopped', mainOnEnded);
 
   // Build one sub-pipeline per layer. Each gets a fake track that forwards
   // its sub-emitter's events.
@@ -1031,6 +1299,7 @@ function createVideoSendSimulcastPipeline(opts) {
     stopped = true;
     track.off('frame', mainOnFrame);
     track.off('ended', mainOnEnded);
+    track.off('_stopped', mainOnEnded);
     for (var i = 0; i < layerPipelines.length; i++) {
       try { layerPipelines[i].stop(); } catch (e) {}
     }
@@ -1166,6 +1435,7 @@ function createAudioSendPipeline(opts) {
   // frame(s) as redundancy, repairing single losses with zero RTT.
   // REDPacketizer is a drop-in for OpusPacketizer (same packetize(chunk)
   // shape); the opus PT rides inside as innerPayloadType.
+  var rtpState = _sendRtpState(manager, ssrc);
   var packetizer;
   if (opts.redPayloadType != null) {
     packetizer = new REDPacketizer({
@@ -1184,9 +1454,14 @@ function createAudioSendPipeline(opts) {
       initialSequenceNumber: opts.initialSequenceNumber,
     });
   }
+  // Same SSRC timeline continuity as video (see _createRtpTimeline):
+  // replaceTrack() to a fresh source used to send ts 144960 -> 0.
+  var stampRtpTimestamps = _createRtpTimeline(rtpState, codecInfo.clockRate);
 
   var stopped = false;
   var active  = true;
+  // Negotiated-direction gate; audio has no keyframes, nothing to do on resume.
+  var mayEncode = _createSendGate(manager, ssrc, opts.transceiver, null);
 
   // Encoded-streams state — same pattern as video send pipeline. See the
   // detailed comment there; for audio there are no keyframes, so the
@@ -1207,14 +1482,19 @@ function createAudioSendPipeline(opts) {
   // Tracks whether ANY packet has been emitted on this pipeline. Used to
   // gate getLastSequenceNumber() — see video send for rationale.
   var _packetsSent = 0;
-  var _lastRtpTs = null;
   var _dtmfActive = false;
   var _lastAudioDbov = null;
   var _lastVoiceActivity = false;
 
   function _processChunkForSend(chunk) {
-    if (stopped || !active) return;
+    if (stopped || !active || !mayEncode()) return;
     if (!manager.state.srtpSession) return;
+    // libwebrtc-style: a DTMF tone replaces the audio frames. Checked BEFORE
+    // packetize(): the tone shares this SSRC's sequence space, and
+    // packetizing a frame only to drop it consumed sequence numbers that
+    // never reached the wire — the receiver counted them as lost (30
+    // "lost" packets per two-digit tone on a lossless link).
+    if (_dtmfActive) return;
     var pkts;
     try {
       pkts = packetizer.packetize(chunk);
@@ -1226,12 +1506,11 @@ function createAudioSendPipeline(opts) {
       }
       return;
     }
-    if (_dtmfActive) return;   // libwebrtc-style: tone replaces audio frames
+    stampRtpTimestamps(pkts);
     var _alHints = (_lastAudioDbov != null)
       ? { audioLevel: _lastAudioDbov, voiceActivity: _lastVoiceActivity }
       : null;
     for (var i = 0; i < pkts.length; i++) {
-      _lastRtpTs = pkts[i].readUInt32BE(4);
       manager.sendRtp(pkts[i], _alHints);
       _packetsSent++;
     }
@@ -1356,7 +1635,7 @@ function createAudioSendPipeline(opts) {
   _configureEncoder(codecInfo.numberOfChannels);
 
   var onData = function (audioData) {
-    if (stopped || !active) {
+    if (stopped || !active || !mayEncode()) {
       try { if (audioData && typeof audioData.close === 'function') audioData.close(); } catch (e) {}
       return;
     }
@@ -1391,13 +1670,19 @@ function createAudioSendPipeline(opts) {
 
   var onTrackEnded = function () { stop(); };
   track.on('data', onData);
+  // A track stopped by the application fires no 'ended' (mediacapture-
+  // main: 'ended' is for the source ending); media-processing signals
+  // every end of the track — stop() included — with '_stopped'. 'ended'
+  // stays for a media-processing without it.
   track.on('ended', onTrackEnded);
+  track.on('_stopped', onTrackEnded);
 
   function stop() {
     if (stopped) return;
     stopped = true;
     track.off('data', onData);
     track.off('ended', onTrackEnded);
+    track.off('_stopped', onTrackEnded);
     try { encoder.close(); } catch (e) {}
     if (_readableController) {
       try { _readableController.close(); } catch (e) {}
@@ -1461,6 +1746,7 @@ function createAudioSendPipeline(opts) {
     sendDtmf: function (tone, durationMs, onDone) {
       if (opts.dtmfPayloadType == null) return false;
       if (_dtmfActive) return false;                 // one tone at a time
+      if (stopped || !mayEncode()) return false;     // not negotiated to send
       var dp = new DtmfPacketizer({
         ssrc: ssrc,
         payloadType: opts.dtmfPayloadType,
@@ -1479,7 +1765,15 @@ function createAudioSendPipeline(opts) {
         },
       });
       _dtmfActive = true;
-      var startTs = (_lastRtpTs != null) ? _lastRtpTs : 0;
+      // Anchor on the SSRC's timeline, not this pipeline's: right after a
+      // restart (replaceTrack) no audio has gone out on this pipeline yet,
+      // and the tone used to start at ts 0. A tone before any audio at all
+      // seeds the timeline so the audio that follows continues from it.
+      if (rtpState.lastRtpTs == null) {
+        rtpState.lastRtpTs  = Math.floor(Math.random() * 0x100000000);
+        rtpState.lastSentAt = _monotonicMs();
+      }
+      var startTs = rtpState.lastRtpTs;
       dp.startEvent(tone, startTs);
       var elapsed = 0, STEP = 20;
       var timer = setInterval(function () {
@@ -1775,7 +2069,13 @@ function createAudioReceivePipeline(opts) {
   }
 
   var onTrackEnded = function () { stop(); };
+  // This pipeline PRODUCES the track. It stops when the track's source
+  // has no live track left — '_sourceStopped' (media-processing): the
+  // application may have stop()ped this track and still use a clone of it,
+  // which is fed from here — or when the track ended ('ended', also the
+  // signal from a media-processing without sources).
   track.on('ended', onTrackEnded);
+  track.on('_sourceStopped', onTrackEnded);
 
 
   function stop() {
@@ -1786,6 +2086,7 @@ function createAudioReceivePipeline(opts) {
       manager.ev.off('rtt:update', onRttUpdate);
     }
     track.off('ended', onTrackEnded);
+    track.off('_sourceStopped', onTrackEnded);
     try { jitterBuffer.close(); } catch (e) {}
     try { depacketizer.close(); } catch (e) {}
     try { if (_readableController) _readableController.close(); } catch (e) {}
@@ -1879,6 +2180,7 @@ function createVideoReceivePipeline(opts) {
   var streamsTaken        = false;   // set true after createEncodedStreams()
   var autoDecodeActive    = false;   // true when we've wired readable→writable
   var decoderConfigured   = false;
+  var decoderDims         = null;    // {width,height} the decoder is configured at
   var decoder             = null;    // lazy — built on first write to writable
 
 
@@ -1892,7 +2194,8 @@ function createVideoReceivePipeline(opts) {
   //     into the readable. The app pipes readable to writable (via a
   //     transform or directly) to feed the decoder.
 
-  var depacketizer = new codecInfo.Depacketizer({
+  function _makeDepacketizer() {
+   return new codecInfo.Depacketizer({
     output: function (chunk) {
       if (stopped) return;
 
@@ -1931,7 +2234,43 @@ function createVideoReceivePipeline(opts) {
         console.error('[media_pipeline] depacketizer:', err && err.message || err);
       }
     },
-  });
+   });
+  }
+  var depacketizer = _makeDepacketizer();
+
+  // FOLLOW THE PAYLOAD TYPE OF THE PACKETS.
+  //
+  // The pipeline is built for one codec, the first negotiated — but a peer
+  // may send any codec both descriptions carry, and switch between them
+  // with no renegotiation (RFC 3264 §5.1; libwebrtc does on a
+  // setParameters() codec change, or when its encoder falls back). The
+  // packets of the new codec went into the old codec's depacketizer and
+  // decoder: nothing decoded until the next negotiation. libwebrtc's
+  // receiver picks the depacketizer and decoder by payload type, packet
+  // by packet. So does this: opts.codecForPt(pt) names the codec of a
+  // payload type in the CURRENT negotiation (a getter, so a renegotiation
+  // that remaps payload types is followed too), and a change rebuilds the
+  // depacketizer and drops the decoder, which is configured again from the
+  // new codec's first keyframe. A payload type the negotiation does not
+  // carry (null) is dropped, as libwebrtc does; undefined — the getter has
+  // no codec table — keeps the old behaviour and feeds everything.
+  function _followPayloadType(pt) {
+    if (typeof opts.codecForPt !== 'function') return true;
+    var name = opts.codecForPt(pt);
+    if (name === undefined) return true;
+    if (name === null) return false;
+    name = String(name).toUpperCase();
+    if (name === codecName) return true;
+    if (!VIDEO_CODECS[name]) return false;       // negotiated, but not one we can decode
+    codecName = name;
+    codecInfo = VIDEO_CODECS[name];
+    try { depacketizer.close(); } catch (e) {}
+    depacketizer = _makeDepacketizer();
+    if (decoder) { try { decoder.close(); } catch (e) {} decoder = null; }
+    decoderConfigured = false;
+    decoderDims = null;
+    return true;
+  }
 
 
   /* ── JitterBuffer ───────────────────────────────────────────────────── */
@@ -1940,6 +2279,7 @@ function createVideoReceivePipeline(opts) {
     latency: opts.jitterLatencyMs != null ? opts.jitterLatencyMs : 50,
     output:  function (parsedPacket) {
       if (stopped) return;
+      if (!_followPayloadType(parsedPacket.payloadType)) return;
       try { depacketizer.depacketize(parsedPacket); }
       catch (e) { /* depacketizer already reports via error callback */ }
     },
@@ -2075,9 +2415,29 @@ function createVideoReceivePipeline(opts) {
   function _feedDecoder(encoded) {
     var dec = _ensureDecoder();
 
+    // FOLLOW THE SENDER'S RESOLUTION.
+    //
+    // The decoder pins its output to the configured codedWidth/codedHeight
+    // (media-processing MP-9: an ffmpeg scale filter). This used to be set
+    // once, from the first keyframe, and never again — but a WebRTC sender
+    // starts small and climbs as its bandwidth estimate grows (Chrome, a
+    // 1280x720 camera: 320x180 first, then 480x270 / 960x540 a few seconds
+    // later, each with a new keyframe). Every later frame was scaled back
+    // down to the first keyframe's size: the track delivered 320x180 for a
+    // 960x540 stream for the whole call. libwebrtc's decoders follow the
+    // stream. So every keyframe is parsed, and a size change reconfigures
+    // the decoder (which restarts it on this very keyframe). Inter frames
+    // never change size here, so they are not parsed.
+    var dims = null;
+    if (!decoderConfigured || encoded.type === 'key') {
+      dims = codecInfo.parseKeyframeDims(encoded.data);
+    }
+    if (decoderConfigured && dims &&
+        (dims.width !== decoderDims.width || dims.height !== decoderDims.height)) {
+      decoderConfigured = false;
+    }
+
     if (!decoderConfigured) {
-      // Parse dimensions from the first keyframe.
-      var dims = codecInfo.parseKeyframeDims(encoded.data);
       if (!dims) return;  // wait for a keyframe
       try {
         dec.configure({
@@ -2087,6 +2447,7 @@ function createVideoReceivePipeline(opts) {
           hardwareAcceleration: 'prefer-software',
         });
         decoderConfigured = true;
+        decoderDims = dims;
       } catch (e) {
         if (typeof console !== 'undefined' && console.error) {
           console.error('[media_pipeline] decoder.configure failed:', e && e.message || e);
@@ -2120,6 +2481,12 @@ function createVideoReceivePipeline(opts) {
   // (when streamsTaken or opts.autoDecode === false). No pipeTo means
   // the readable is never locked, so a later takeStreams() works cleanly.
 
+  function _frameConsumers() {
+    if (typeof track._consumerCount === 'function') return track._consumerCount();
+    if (track._ee && typeof track._ee.listenerCount === 'function') return track._ee.listenerCount('frame');
+    return 1;
+  }
+
   function _decodeChunkDirect(chunk) {
     if (stopped) return;
     // Lazy decode (Chrome-symmetric): if no sink is attached to the track,
@@ -2132,8 +2499,7 @@ function createVideoReceivePipeline(opts) {
     // sink (VideoSink, MediaStreamTrackProcessor, MediaRecorder, ...) is
     // listening. Node's EventEmitter exposes this natively, so we don't
     // need any sink-tracking API in media-processing's MediaStreamTrack.
-    if (track._ee && typeof track._ee.listenerCount === 'function' &&
-        track._ee.listenerCount('frame') === 0) {
+    if (_frameConsumers() === 0) {
       return;   // No consumer — drop chunk, save CPU.
     }
     // Delegate to _feedDecoder, which owns the configure-on-first-keyframe
@@ -2149,7 +2515,30 @@ function createVideoReceivePipeline(opts) {
   // several seconds). When the last sink detaches, close the decoder to
   // free FFmpeg subprocess + buffers (it'll be lazily rebuilt if a sink
   // attaches again later).
-  if (track._ee && typeof track._ee.on === 'function') {
+  //
+  // media-processing with track sources: the consumers are counted over
+  // the track AND its clones (_consumerCount), and changes arrive as
+  // '_consumers' (count, previous) on every track of the source. Counting
+  // this track's own 'frame' listeners stopped decoding — and starved a
+  // clone — once the application stopped the original and kept the
+  // clone. The 'newListener' / 'removeListener' hooks below are Node
+  // EventEmitter events, which media-processing's EventEmitter never
+  // emits: with it, neither the keyframe request on the first sink nor
+  // the decoder release on the last one ever ran.
+  if (typeof track._consumerCount === 'function') {
+    track.on('_consumers', function (n, prev) {
+      if (stopped) return;
+      if (prev === 0 && n > 0) {
+        if (manager && typeof manager.requestKeyframe === 'function') {
+          try { manager.requestKeyframe(ssrc); } catch (e) {}
+        }
+      } else if (n === 0 && decoder) {
+        try { decoder.close(); } catch (e) {}
+        decoder = null;
+        decoderConfigured = false;
+      }
+    });
+  } else if (track._ee && typeof track._ee.on === 'function') {
     track._ee.on('newListener', function (event) {
       if (event !== 'frame') return;
       var hadConsumersBefore = track._ee.listenerCount('frame') > 0;
@@ -2230,7 +2619,13 @@ function createVideoReceivePipeline(opts) {
   }
 
   var onTrackEnded = function () { stop(); };
+  // This pipeline PRODUCES the track. It stops when the track's source
+  // has no live track left — '_sourceStopped' (media-processing): the
+  // application may have stop()ped this track and still use a clone of it,
+  // which is fed from here — or when the track ended ('ended', also the
+  // signal from a media-processing without sources).
   track.on('ended', onTrackEnded);
+  track.on('_sourceStopped', onTrackEnded);
 
 
   /* ── Cleanup ─────────────────────────────────────────────────────────── */
@@ -2243,6 +2638,7 @@ function createVideoReceivePipeline(opts) {
       manager.ev.off('rtt:update', onRttUpdate);
     }
     track.off('ended', onTrackEnded);
+    track.off('_sourceStopped', onTrackEnded);
     try { jitterBuffer.close(); } catch (e) {}
     try { depacketizer.close(); } catch (e) {}
     try { if (_readableController) _readableController.close(); } catch (e) {}
@@ -2469,6 +2865,7 @@ function createVideoReceiveSimulcastPipeline(opts) {
       manager:         opts.manager,
       ssrc:            ssrc,
       codec:           opts.codec,
+      codecForPt:      opts.codecForPt,
       jitterLatencyMs: opts.jitterLatencyMs,
       // autoDecode left at default (true). The lazy-decode in
       // createVideoReceivePipeline ensures the decoder doesn't actually

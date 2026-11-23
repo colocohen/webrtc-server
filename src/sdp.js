@@ -194,7 +194,12 @@ var DEFAULT_VIDEO_EXTENSIONS = [
   { id:  3, uri: 'http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01' },  // ← shared with audio
   { id:  4, uri: 'urn:ietf:params:rtp-hdrext:sdes:mid' },                                        // ← shared with audio
   { id:  5, uri: 'urn:ietf:params:rtp-hdrext:toffset' },                                         //   video-only (RFC 5450)
-  { id:  6, uri: 'urn:3gpp:video-orientation' },                                                 //   video-only (3GPP TS 26.114)
+  // id 6 was urn:3gpp:video-orientation (CVO, 3GPP TS 26.114). Removed: with
+  // CVO negotiated the SENDER stops rotating pixels and only tags packets
+  // with the rotation, leaving it to the receiver — and nothing on our
+  // receive path applies it, so frames from a rotated phone arrived sideways.
+  // Without CVO the sender rotates before encoding. It can come back once
+  // the decode path applies the rotation (see VIDEO_ORIENTATION_URI).
   { id:  7, uri: 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay' },
   { id:  8, uri: 'http://www.webrtc.org/experiments/rtp-hdrext/video-content-type' },
   { id:  9, uri: 'http://www.webrtc.org/experiments/rtp-hdrext/video-timing' },
@@ -202,6 +207,14 @@ var DEFAULT_VIDEO_EXTENSIONS = [
   { id: 11, uri: 'urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id' },                              //   video-only (RFC 8852 — simulcast)
   { id: 12, uri: 'urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id' },                     //   video-only (RFC 8852 — rid on RTX)
 ];
+
+
+// CVO is neither offered nor echoed in answers (see DEFAULT_VIDEO_EXTENSIONS).
+var VIDEO_ORIENTATION_URI = 'urn:3gpp:video-orientation';
+function _withoutUnappliedExtensions(exts) {
+  if (!exts) return exts;
+  return exts.filter(function (e) { return !(e && e.uri === VIDEO_ORIENTATION_URI); });
+}
 
 
 /* ========================= Parse helpers ========================= */
@@ -291,7 +304,12 @@ function extractCodecs(media) {
     if (!rtp) continue;
 
     var codecName = rtp.codec.toLowerCase();
-    if (codecName === 'rtx' || codecName === 'red' || codecName === 'ulpfec') continue;
+    // flexfec-03 is auxiliary too (attached as flexfecPayloadType in pass
+    // 2c). Listing it as a primary as well made a re-offer from parsed codecs
+    // carry it as a "codec", and writing flexfecPayloadType on top of that
+    // would emit the same PT twice.
+    if (codecName === 'rtx' || codecName === 'red' || codecName === 'ulpfec' ||
+        codecName === 'flexfec-03') continue;
 
     codecs.push({
       payloadType: pt,
@@ -550,7 +568,29 @@ function _msidsPerSection(sdpString) {
  * after the first fingerprint of each media section. Same class of
  * limitation as multi-msid, handled the same way: at the text level,
  * in one place, rather than by teaching every caller.
+ *
+ * The extras go BEFORE the written line, so the certificate we actually
+ * present in the handshake (fingerprints[0], see _primaryFingerprint) is
+ * the LAST a=fingerprint of each section. libwebrtc keeps only the last
+ * a=fingerprint it parses; with the extras after it, Chrome pinned the
+ * second certificate, ours did not match, and DTLS failed. Parsers that
+ * honour every line (RFC 8122) are unaffected by the order.
  */
+/**
+ * The fingerprint the SDP writer emits itself: fingerprints[0] when a list
+ * is configured — _appendExtraFingerprints adds [1..] after it, so the
+ * written one has to be [0] or one certificate would be missing — else the
+ * single dtls.fingerprint.
+ */
+function _primaryFingerprint(dtls) {
+  var f = (dtls && dtls.fingerprints && dtls.fingerprints.length)
+    ? dtls.fingerprints[0] : (dtls && dtls.fingerprint);
+  if (!f || !f.value) return null;
+  // Uppercase like the extra lines (_appendExtraFingerprints): the
+  // certificate list carries lowercase hex, the single fingerprint did not.
+  return { type: f.algorithm || 'sha-256', hash: String(f.value).toUpperCase() };
+}
+
 function _appendExtraFingerprints(sdpText, fingerprints) {
   if (!fingerprints || fingerprints.length < 2) return sdpText;
   var extra = [];
@@ -571,12 +611,19 @@ function _appendExtraFingerprints(sdpText, fingerprints) {
   var lines = sdpText.split(/\r?\n/);
   var out = [];
   for (var l = 0; l < lines.length; l++) {
-    out.push(lines[l]);
     if (lines[l].indexOf('a=fingerprint:') === 0) {
       for (var e = 0; e < extra.length; e++) out.push(extra[e]);
     }
+    out.push(lines[l]);
   }
   return out.join(eol);
+}
+
+function _inAnyGroup(groups, mid) {
+  for (var g = 0; g < groups.length; g++) {
+    if (groups[g].indexOf(mid) !== -1) return true;
+  }
+  return false;
 }
 
 function parseRemoteSdp(sdpString) {
@@ -654,7 +701,18 @@ function parseRemoteSdp(sdpString) {
       mid: String(m.mid != null ? m.mid : i),
       midDeclared: m.mid != null,
       type: m.type,          // 'audio' | 'video' | 'application'
-      port: m.port,
+      // BUNDLE-ONLY (RFC 8843 §6, §7.3): an offerer may send a bundled,
+      // non-tagged section with port 0 + a=bundle-only. That section is LIVE
+      // (it rides the tagged section's transport), not rejected. Every
+      // consumer reads "port 0" as "rejected", so the port is normalised
+      // here to the placeholder 9 — the value the section would carry
+      // without bundle-only — and the raw fact is kept in bundleOnly.
+      // Before, such a section was answered as rejected and its media
+      // never processed. Port 0 WITHOUT bundle-only, or outside any BUNDLE
+      // group, is still a rejection.
+      port: (m.port === 0 && m.bundleOnly && m.mid != null &&
+             _inAnyGroup(result.bundleGroups, String(m.mid))) ? 9 : m.port,
+      bundleOnly: !!m.bundleOnly,
       protocol: m.protocol,
       direction: m.direction || 'sendrecv',
 
@@ -785,11 +843,25 @@ function negotiateCodecs(remoteCodecs, localCodecs) {
         feedback: intersectFeedback(remote.feedback, local.feedback),
         rtxPayloadType: remote.rtxPayloadType,
         redPayloadType: remote.redPayloadType,
-        flexfecPayloadType: remote.flexfecPayloadType,
       });
       break;
     }
   }
+
+  // FlexFEC protects the whole stream, not one codec (pass 2c of the parse
+  // only parks its PT on the offer's FIRST codec, to carry it). It used to be
+  // copied with that codec alone, so it was answered only if the codec the
+  // offer listed first was one we accept: Chrome preferring an H264 profile
+  // we do not take (its 102, 42001f, with ours 42e01f matching its 108) lost
+  // flexfec from the answer — while state.flexfecPayloadType, read from the
+  // offer, still had us sending FEC packets on a payload type the answer had
+  // not accepted. Carried on the first NEGOTIATED codec, where the answer
+  // builder (and every reader of the negotiated list) looks for it.
+  var remoteFlexfecPt = null;
+  for (var fi = 0; fi < remoteCodecs.length; fi++) {
+    if (remoteCodecs[fi].flexfecPayloadType != null) { remoteFlexfecPt = remoteCodecs[fi].flexfecPayloadType; break; }
+  }
+  if (remoteFlexfecPt != null && matched.length) matched[0].flexfecPayloadType = remoteFlexfecPt;
 
   return matched;
 }
@@ -880,6 +952,8 @@ function createAnswer(parsedOffer, config) {
       // half-trickle is desired, pass the full candidate list here so it's
       // included in the answer SDP. The peer then needs no separate trickle.
       candidates: config.candidates || null,
+      maxMessageSize: config.maxMessageSize,
+      sctpPort: config.sctpPort,
       // When true, emit a=end-of-candidates (RFC 8838 §8). Tells the peer
       // "no more candidates will arrive — stop waiting". Use in ice-lite
       // mode where all candidates are known at answer time.
@@ -915,6 +989,152 @@ function createAnswer(parsedOffer, config) {
   }
 
   return _appendExtraFingerprints(sdpTransform.write(sdpObj), config.dtls && config.dtls.fingerprints);
+}
+
+/**
+ * The codecs an answer to this offered m-section carries, in the order it
+ * lists them — the local set restricted and ranked by the application's
+ * codec preferences, intersected with the offer (offer payload types).
+ *
+ * One function for both readers: buildAnswerMedia writes the answer from
+ * it, and connection_manager gives the transceiver its negotiated codecs
+ * from it when the offer is applied — the send pipeline can start before
+ * the answer exists. They used to differ: the transceiver took the OFFER's
+ * codec list, so the sender picked the offer's first codec of the name it
+ * wanted (Chrome preferring H264: PT 102, profile 42001f) while the answer
+ * accepted another one (PT 108, 42e01f) — sending on a payload type the
+ * answer never agreed to (RFC 3264 §6.1).
+ *
+ * @param {object}   offerMedia           parsed offer m-section (its .codecs)
+ * @param {object[]} localCodecs          our codecs for this kind
+ * @param {object[]} [userPreferredCodecs] setCodecPreferences() list, or null
+ * @returns {object[]} negotiated codecs (may be empty: reject the section)
+ */
+function answerCodecs(offerMedia, localCodecs, userPreferredCodecs) {
+  // setCodecPreferences ALSO GOVERNS THE ANSWER (W3C 5.4). Round 99
+  // wired the preference order into the OFFER builder only, so an
+  // answerer that had expressed preferences echoed the offerer's full
+  // codec list instead — both the order and the FILTERING were lost, and
+  // a codec the application had deliberately excluded still came back in
+  // the answer. Applying the preference here restricts the local set
+  // BEFORE negotiation, so the intersection with the offer is taken in
+  // the application's order and contains nothing it did not ask for.
+  var _prefs = userPreferredCodecs;
+  if (_prefs && _prefs.length) {
+    var _ranked = [];
+    for (var _pi = 0; _pi < _prefs.length; _pi++) {
+      var _wantName = codecName(_prefs[_pi]);
+      for (var _li = 0; _li < localCodecs.length; _li++) {
+        var _haveName = String(localCodecs[_li] && localCodecs[_li].name || '').toLowerCase();
+        if (_haveName && _haveName === _wantName && _ranked.indexOf(localCodecs[_li]) === -1) {
+          _ranked.push(localCodecs[_li]);
+        }
+      }
+    }
+    if (_ranked.length) localCodecs = _ranked;
+  }
+  var negotiated = negotiateCodecs(offerMedia.codecs, localCodecs);
+  // ORDER BY THE ANSWERER'S PREFERENCE, not the offer's. negotiateCodecs
+  // walks the OFFER to build the intersection, so its output inherits the
+  // offerer's ranking — but W3C 5.4 makes setCodecPreferences the local
+  // application's statement about which codec it wants USED, and the
+  // answer is where that gets expressed. Filtering alone (above) removes
+  // what the app excluded; this puts what remains in the order it asked
+  // for. Payload types stay as the offer assigned them, since those are
+  // the offerer's to choose.
+  if (_prefs && _prefs.length && negotiated && negotiated.length > 1) {
+    var _rank = {};
+    for (var _ri = 0; _ri < _prefs.length; _ri++) {
+      _rank[codecName(_prefs[_ri])] = _ri;
+    }
+    negotiated = negotiated.slice().sort(function (a, b) {
+      var ra = _rank[String(a.name || '').toLowerCase()];
+      var rb = _rank[String(b.name || '').toLowerCase()];
+      if (ra === undefined) ra = 1e6;
+      if (rb === undefined) rb = 1e6;
+      return ra - rb;
+    });
+  }
+  return negotiated;
+}
+
+/**
+ * Write a primary codec's auxiliary payloads — RTX (RFC 4588), RED
+ * (RFC 2198) and FlexFEC (flexfec-03) — into an m-section being built.
+ * Shared by the offer and answer writers: the offer writer used to know
+ * only RTX, so a re-offer silently dropped a RED/FlexFEC that the previous
+ * answer had negotiated (the peer then stopped sending RED).
+ */
+function _pushAuxPayloads(codec, payloadList, rtp, fmtp) {
+  if (codec.rtxPayloadType) {
+    payloadList.push(codec.rtxPayloadType);
+    rtp.push({ payload: codec.rtxPayloadType, codec: 'rtx', rate: codec.clockRate });
+    fmtp.push({ payload: codec.rtxPayloadType, config: 'apt=' + codec.payloadType });
+  }
+  // RED (audio) — rtpmap red/<rate>/<ch> + fmtp "<pt>/<pt>" naming the
+  // wrapped primary, matching Chrome's shape exactly.
+  if (codec.redPayloadType) {
+    payloadList.push(codec.redPayloadType);
+    rtp.push({
+      payload: codec.redPayloadType,
+      codec: 'red',
+      rate: codec.clockRate,
+      encoding: codec.channels || undefined,
+    });
+    fmtp.push({
+      payload: codec.redPayloadType,
+      config: codec.payloadType + '/' + codec.payloadType,
+    });
+  }
+  // FlexFEC (video) — repair-window mirrors Chrome.
+  if (codec.flexfecPayloadType) {
+    payloadList.push(codec.flexfecPayloadType);
+    rtp.push({ payload: codec.flexfecPayloadType, codec: 'flexfec-03', rate: 90000 });
+    fmtp.push({ payload: codec.flexfecPayloadType, config: 'repair-window=10000000' });
+  }
+}
+
+/**
+ * The rid ids of an a=simulcast list ("q;~h;f" or "h,m;l"), in order, with
+ * the paused marker dropped and only the first alternative of a slot kept.
+ */
+function _simulcastRidIds(listStr) {
+  return String(listStr || '').split(';').map(function (r) {
+    r = r.trim();
+    if (r.charAt(0) === '~') r = r.slice(1);
+    var comma = r.indexOf(',');
+    return comma >= 0 ? r.slice(0, comma).trim() : r;
+  }).filter(function (r) { return !!r; });
+}
+
+/**
+ * The rid ids a remote section declares it SENDS via a=simulcast, or null.
+ * Used by the answer (to mirror them as recv) and by a re-offer (to keep
+ * receiving them).
+ */
+function remoteSendSimulcastRids(media) {
+  if (!media || !media.simulcast) return null;
+  var sc = media.simulcast;
+  var list = (sc.dir1 === 'send') ? sc.list1 : (sc.dir2 === 'send') ? sc.list2 : null;
+  if (!list) return null;
+  var ids = _simulcastRidIds(list);
+  return ids.length ? ids : null;
+}
+
+/**
+ * Add a=rid:<id> recv lines and the a=simulcast recv list to an m-section
+ * object, next to any send-side simulcast already on it.
+ */
+function _addRecvSimulcast(m, rids) {
+  if (!rids || !rids.length) return;
+  if (!m.rids) m.rids = [];
+  for (var i = 0; i < rids.length; i++) m.rids.push({ id: rids[i], direction: 'recv' });
+  if (m.simulcast) {
+    m.simulcast.dir2 = 'recv';
+    m.simulcast.list2 = rids.join(';');
+  } else {
+    m.simulcast = { dir1: 'recv', list1: rids.join(';') };
+  }
 }
 
 function buildAnswerMedia(offerMedia, config) {
@@ -972,14 +1192,12 @@ function buildAnswerMedia(offerMedia, config) {
     // means a peer validating strictly would reject the handshake if the
     // second certificate was used — the extra certificates were
     // effectively unusable.
-    fingerprint: (config.dtls.fingerprints && config.dtls.fingerprints.length)
-      ? config.dtls.fingerprints.map(function (f) {
-          return { type: f.algorithm || 'sha-256', hash: f.value };
-        })
-      : (config.dtls.fingerprint ? {
-          type: config.dtls.fingerprint.algorithm || 'sha-256',
-          hash: config.dtls.fingerprint.value,
-        } : null),
+    //
+    // sdp-transform's fingerprint field is SINGLE-valued: the array that was
+    // passed here was written as "a=fingerprint:undefined undefined". The
+    // writer gets the FIRST certificate's fingerprint; createAnswer adds the
+    // others as text (_appendExtraFingerprints), the same as the offer.
+    fingerprint: _primaryFingerprint(config.dtls),
     // Prefer the caller-pinned DTLS role (config.dtls.setup) when present —
     // this is the role negotiated/decided in connection_manager.js (e.g.
     // 'passive' for an ICE-lite peer, which must be the DTLS server and let
@@ -1050,8 +1268,12 @@ function buildAnswerMedia(offerMedia, config) {
   // DataChannel + BUNDLE during renegotiation.
   if (offerMedia.type === 'application') {
     m.payloads = 'webrtc-datachannel';
-    m.sctpPort = offerMedia.sctpPort || 5000;
-    m.maxMessageSize = offerMedia.maxMessageSize || 262144;
+    // Ours, not the offer's: the port our association uses (RFC 8841 §5);
+    // the peer addresses its packets to it.
+    m.sctpPort = config.sctpPort || 5000;
+    // Ours, not the offer's: it is the largest message we accept (RFC 8841
+    // §6), and the association enforces it on receive.
+    m.maxMessageSize = config.maxMessageSize || 262144;
     delete m.direction;
     return m;
   }
@@ -1059,52 +1281,10 @@ function buildAnswerMedia(offerMedia, config) {
   // rtcp-rsize — RFC 5506 — only for RTP m-sections (not application/SCTP).
   m.rtcpRsize = 'rtcp-rsize';
 
-  // Codec negotiation
-  var localCodecs = (offerMedia.type === 'audio') ? config.localAudioCodecs : config.localVideoCodecs;
-  // setCodecPreferences ALSO GOVERNS THE ANSWER (W3C 5.4). Round 99
-  // wired the preference order into the OFFER builder only, so an
-  // answerer that had expressed preferences echoed the offerer's full
-  // codec list instead — both the order and the FILTERING were lost, and
-  // a codec the application had deliberately excluded still came back in
-  // the answer. Applying the preference here restricts the local set
-  // BEFORE negotiation, so the intersection with the offer is taken in
-  // the application's order and contains nothing it did not ask for.
-  var _prefs = config.userPreferredCodecs;
-  if (_prefs && _prefs.length) {
-    var _ranked = [];
-    for (var _pi = 0; _pi < _prefs.length; _pi++) {
-      var _wantName = codecName(_prefs[_pi]);
-      for (var _li = 0; _li < localCodecs.length; _li++) {
-        var _haveName = String(localCodecs[_li] && localCodecs[_li].name || '').toLowerCase();
-        if (_haveName && _haveName === _wantName && _ranked.indexOf(localCodecs[_li]) === -1) {
-          _ranked.push(localCodecs[_li]);
-        }
-      }
-    }
-    if (_ranked.length) localCodecs = _ranked;
-  }
-  var negotiated = negotiateCodecs(offerMedia.codecs, localCodecs);
-  // ORDER BY THE ANSWERER'S PREFERENCE, not the offer's. negotiateCodecs
-  // walks the OFFER to build the intersection, so its output inherits the
-  // offerer's ranking — but W3C 5.4 makes setCodecPreferences the local
-  // application's statement about which codec it wants USED, and the
-  // answer is where that gets expressed. Filtering alone (above) removes
-  // what the app excluded; this puts what remains in the order it asked
-  // for. Payload types stay as the offer assigned them, since those are
-  // the offerer's to choose.
-  if (_prefs && _prefs.length && negotiated && negotiated.length > 1) {
-    var _rank = {};
-    for (var _ri = 0; _ri < _prefs.length; _ri++) {
-      _rank[codecName(_prefs[_ri])] = _ri;
-    }
-    negotiated = negotiated.slice().sort(function (a, b) {
-      var ra = _rank[String(a.name || '').toLowerCase()];
-      var rb = _rank[String(b.name || '').toLowerCase()];
-      if (ra === undefined) ra = 1e6;
-      if (rb === undefined) rb = 1e6;
-      return ra - rb;
-    });
-  }
+  // Codec negotiation (answerCodecs, shared with connection_manager).
+  var negotiated = answerCodecs(offerMedia,
+    (offerMedia.type === 'audio') ? config.localAudioCodecs : config.localVideoCodecs,
+    config.userPreferredCodecs);
 
   // RFC 3264 §6: when codec negotiation yields nothing in common, the
   // stream MUST be rejected by setting the port to zero — never answered
@@ -1175,51 +1355,9 @@ function buildAnswerMedia(offerMedia, config) {
       });
     }
 
-    // RTX
-    if (codec.rtxPayloadType) {
-      payloadList.push(codec.rtxPayloadType);
-      rtp.push({
-        payload: codec.rtxPayloadType,
-        codec: 'rtx',
-        rate: codec.clockRate,
-      });
-      fmtp.push({
-        payload: codec.rtxPayloadType,
-        config: 'apt=' + codec.payloadType,
-      });
-    }
-
-    // RED (RFC 2198, audio) — rtpmap red/<rate>/<ch> + fmtp "<pt>/<pt>"
-    // naming the wrapped primary, matching Chrome's shape exactly.
-    if (codec.redPayloadType) {
-      payloadList.push(codec.redPayloadType);
-      rtp.push({
-        payload: codec.redPayloadType,
-        codec: 'red',
-        rate: codec.clockRate,
-        encoding: codec.channels || undefined,
-      });
-      fmtp.push({
-        payload: codec.redPayloadType,
-        config: codec.payloadType + '/' + codec.payloadType,
-      });
-    }
-
-    // FlexFEC (flexfec-03, video) — answered only when the peer offered
-    // it (flexfecPayloadType is only ever attached from a remote offer;
-    // our defaults don't set it). repair-window mirrors Chrome.
-    if (codec.flexfecPayloadType) {
-      payloadList.push(codec.flexfecPayloadType);
-      rtp.push({
-        payload: codec.flexfecPayloadType,
-        codec: 'flexfec-03',
-        rate: 90000,
-      });
-      fmtp.push({
-        payload: codec.flexfecPayloadType,
-        config: 'repair-window=10000000',
-      });
-    }
+    // RTX / RED / FlexFEC — FlexFEC is answered only when the peer offered
+    // it (flexfecPayloadType is only ever attached from a remote offer).
+    _pushAuxPayloads(codec, payloadList, rtp, fmtp);
   }
 
   m.rtp = rtp;
@@ -1238,7 +1376,9 @@ function buildAnswerMedia(offerMedia, config) {
   if (config.localExtensions) {
     extsToDeclare = config.localExtensions;
   } else if (offerMedia.extensions && offerMedia.extensions.length > 0) {
-    extsToDeclare = offerMedia.extensions;
+    // Echoing CVO told the peer we would rotate its frames; we do not (see
+    // DEFAULT_VIDEO_EXTENSIONS), so it is left out of the answer.
+    extsToDeclare = _withoutUnappliedExtensions(offerMedia.extensions);
   } else {
     extsToDeclare = (offerMedia.type === 'audio') ? DEFAULT_AUDIO_EXTENSIONS : DEFAULT_VIDEO_EXTENSIONS;
   }
@@ -1363,37 +1503,7 @@ function buildAnswerMedia(offerMedia, config) {
   // (the send path above emits dir1=send; we stack dir2=recv). The
   // common case here is we're a pure receiver (SFU publish scenario),
   // so no send-side simulcast was emitted and we populate dir1=recv.
-  if (offerMedia.simulcast &&
-      (offerMedia.simulcast.dir1 === 'send' || offerMedia.simulcast.dir2 === 'send')) {
-    var offeredList = (offerMedia.simulcast.dir1 === 'send')
-      ? (offerMedia.simulcast.list1 || '')
-      : (offerMedia.simulcast.list2 || '');
-    if (offeredList) {
-      // Parse the offered RID list and emit a=rid:<id> recv per RID.
-      var offeredRids = offeredList.split(';').map(function (r) {
-        r = r.trim();
-        if (r.charAt(0) === '~') r = r.slice(1);
-        var comma = r.indexOf(',');
-        return comma >= 0 ? r.slice(0, comma).trim() : r;
-      }).filter(function (r) { return !!r; });
-
-      if (offeredRids.length) {
-        // Merge with any existing m.rids (if we also sent simulcast above).
-        if (!m.rids) m.rids = [];
-        for (var ori = 0; ori < offeredRids.length; ori++) {
-          m.rids.push({ id: offeredRids[ori], direction: 'recv' });
-        }
-        // Emit simulcast block. If send-side simulcast already populated
-        // dir1, use dir2 for the recv side; otherwise populate dir1.
-        if (m.simulcast) {
-          m.simulcast.dir2 = 'recv';
-          m.simulcast.list2 = offeredRids.join(';');
-        } else {
-          m.simulcast = { dir1: 'recv', list1: offeredRids.join(';') };
-        }
-      }
-    }
-  }
+  _addRecvSimulcast(m, remoteSendSimulcastRids(offerMedia));
 
   return m;
 }
@@ -1458,10 +1568,7 @@ function createOffer(config) {
       iceUfrag: ice.ufrag || null,
       icePwd: ice.pwd || null,
       iceOptions: 'trickle',  // RFC 8840 — tell peer we support trickle on this m-section
-      fingerprint: dtls.fingerprint ? {
-        type: dtls.fingerprint.algorithm || 'sha-256',
-        hash: dtls.fingerprint.value,
-      } : null,
+      fingerprint: _primaryFingerprint(dtls),
       setup: dtls.setup || 'actpass',
       mid: mid,
       direction: spec.direction || 'sendrecv',
@@ -1544,17 +1651,16 @@ function createOffer(config) {
           }
         }
 
-        if (codec.rtxPayloadType) {
-          payloadList.push(codec.rtxPayloadType);
-          rtp.push({ payload: codec.rtxPayloadType, codec: 'rtx', rate: codec.clockRate });
-          fmtpArr.push({ payload: codec.rtxPayloadType, config: 'apt=' + codec.payloadType });
-        }
+        _pushAuxPayloads(codec, payloadList, rtp, fmtpArr);
       }
 
       m.rtp = rtp;
       m.fmtp = fmtpArr;
       m.rtcpFb = rtcpFb;
-      m.payloads = payloadList.join(' ');
+      // An m= line needs at least one format even when rejected (RFC 4566
+      // §5.14); a rejected section built without codecs wrote an empty list.
+      // Same placeholder the answer's rejected sections use.
+      m.payloads = payloadList.length ? payloadList.join(' ') : '0';
 
       // Header extensions — use caller-provided set if present, otherwise our
       // Chrome-aligned defaults. Declaring extmap doesn't obligate us to USE
@@ -1563,6 +1669,9 @@ function createOffer(config) {
       if (exts == null) {
         exts = (spec.type === 'audio') ? DEFAULT_AUDIO_EXTENSIONS : DEFAULT_VIDEO_EXTENSIONS;
       }
+      // A re-offer pins the extensions of the previous local description,
+      // which may have echoed CVO before it was dropped — never re-offer it.
+      exts = _withoutUnappliedExtensions(exts);
       if (exts && exts.length > 0) {
         m.ext = [];
         for (var e = 0; e < exts.length; e++) {
@@ -1673,14 +1782,29 @@ function createOffer(config) {
         // drop the field so the writer doesn't emit an empty line.
         if (m.ssrcGroups.length === 0) delete m.ssrcGroups;
       }
+
+      // RECEIVE simulcast already negotiated (RFC 8853): spec.recvRids are
+      // the rids the peer sends us on this section. A re-offer that left
+      // them out told the peer we no longer take simulcast here, and Chrome
+      // answered "a=simulcast:send q;~h;~f" — pausing every layer but one.
+      if (spec.recvRids && spec.recvRids.length && m.port !== 0) {
+        _addRecvSimulcast(m, spec.recvRids);
+      }
     }
 
     sdpObj.media.push(m);
   }
 
-  // BUNDLE group
-  if (mids.length > 0) {
-    sdpObj.groups.push({ type: 'BUNDLE', mids: mids.join(' ') });
+  // BUNDLE group — live sections only. RFC 8843 §7.2: a rejected (port 0)
+  // section must not be listed in a=group:BUNDLE. A retiring offer used to
+  // list every mid, including the ones it was rejecting. When nothing is
+  // live there is no group at all.
+  var bundleMids = [];
+  for (var bi = 0; bi < sdpObj.media.length; bi++) {
+    if (sdpObj.media[bi].port !== 0) bundleMids.push(mids[bi]);
+  }
+  if (bundleMids.length > 0) {
+    sdpObj.groups.push({ type: 'BUNDLE', mids: bundleMids.join(' ') });
   }
 
   return _appendExtraFingerprints(sdpTransform.write(sdpObj), config.dtls && config.dtls.fingerprints);
@@ -1689,50 +1813,88 @@ function createOffer(config) {
 
 /* ========================= ICE candidates ========================= */
 
+/*
+ * Line-level view of an SDP for the two in-place edits below (addCandidate,
+ * finalizeCandidates). Both used to parse the whole description with
+ * sdp-transform and write it back, and that round trip is lossy: its
+ * grammar keeps ONE a=fingerprint (with two certificates the result
+ * advertised only the last one, so DTLS with the other failed) and the
+ * same single-value limitation applies to other repeated lines. Editing
+ * the text touches only the lines being changed.
+ *
+ * Returns { eol, session: [lines], sections: [[lines]] } — each section
+ * starts with its m= line.
+ */
+function _splitSdpSections(sdpString) {
+  var eol = /\r\n/.test(sdpString) ? '\r\n' : '\n';
+  var lines = String(sdpString).split(/\r?\n/);
+  // A trailing EOL yields one empty last element; keep it out of the last
+  // section and restore it on join.
+  var trailing = lines.length && lines[lines.length - 1] === '';
+  if (trailing) lines.pop();
+  var out = { eol: eol, trailing: trailing, session: [], sections: [] };
+  var cur = out.session;
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf('m=') === 0) { cur = []; out.sections.push(cur); }
+    cur.push(lines[i]);
+  }
+  return out;
+}
+
+function _joinSdpSections(v) {
+  var all = v.session.slice();
+  for (var i = 0; i < v.sections.length; i++) all = all.concat(v.sections[i]);
+  return all.join(v.eol) + (v.trailing ? v.eol : '');
+}
+
+function _sectionMid(lines) {
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf('a=mid:') === 0) return lines[i].slice(6).trim();
+  }
+  return null;
+}
+
+function _sectionPort(lines) {
+  return parseInt(String(lines[0]).split(' ')[1], 10);
+}
+
 // Add trickle ICE candidate to an SDP string
 function addCandidate(sdpString, candidate, mid) {
-  var raw = sdpTransform.parse(sdpString);
+  var v = _splitSdpSections(sdpString);
 
-  for (var i = 0; i < raw.media.length; i++) {
-    var m = raw.media[i];
-    if (String(m.mid) === String(mid)) {
-      if (!m.candidates) m.candidates = [];
-      // Idempotence: a candidate is identified by its transport address
-      // (RFC 8839 §5.1 — foundation/component/transport/address/port).
-      // Re-adding an existing one returns the SDP unchanged, so callers
-      // may apply a full gathered-candidate roster at any time (JSEP
-      // §4.1.13/14 view maintenance) without producing duplicate lines —
-      // the caller detects the no-op via string identity, exactly like
-      // the mid-not-found path below.
-      for (var d = 0; d < m.candidates.length; d++) {
-        var ex = m.candidates[d];
-        if (ex.foundation === candidate.foundation &&
+  for (var i = 0; i < v.sections.length; i++) {
+    var sec = v.sections[i];
+    if (_sectionMid(sec) !== String(mid)) continue;
+
+    // Idempotence: a candidate is identified by its transport address
+    // (RFC 8839 §5.1 — foundation/component/transport/address/port).
+    // Re-adding an existing one returns the SDP unchanged, so callers
+    // may apply a full gathered-candidate roster at any time (JSEP
+    // §4.1.13/14 view maintenance) without producing duplicate lines —
+    // the caller detects the no-op via string identity, exactly like
+    // the mid-not-found path below.
+    var lastCand = -1, eocAt = -1;
+    for (var l = 0; l < sec.length; l++) {
+      if (sec[l].indexOf('a=candidate:') === 0) {
+        lastCand = l;
+        var ex = parseCandidate(sec[l]);
+        if (ex && String(ex.foundation) === String(candidate.foundation) &&
             (ex.component || 1) === (candidate.component || 1) &&
-            ex.transport === candidate.protocol &&
+            String(ex.protocol).toLowerCase() === String(candidate.protocol).toLowerCase() &&
             ex.ip === candidate.ip &&
             ex.port === candidate.port &&
             ex.type === candidate.type) {
           return sdpString;
         }
+      } else if (sec[l] === 'a=end-of-candidates' && eocAt < 0) {
+        eocAt = l;
       }
-      m.candidates.push({
-        foundation: candidate.foundation,
-        component: candidate.component || 1,
-        transport: candidate.protocol,
-        priority: candidate.priority,
-        ip: candidate.ip,
-        port: candidate.port,
-        type: candidate.type,
-        raddr: candidate.relatedAddress || undefined,
-        // Use `!= null` (not `||`) so port 0 (legitimate for some
-        // candidate types) isn't silently dropped to undefined. Mirrors
-        // the same check in buildAnswerMedia / createOffer's candidate
-        // emission path.
-        rport: candidate.relatedPort != null ? candidate.relatedPort : undefined,
-        tcptype: candidate.tcpType || undefined,
-      });
-      return sdpTransform.write(raw);
     }
+    // After the last candidate; else before a=end-of-candidates; else at
+    // the end of the section.
+    var at = (lastCand >= 0) ? lastCand + 1 : (eocAt >= 0 ? eocAt : sec.length);
+    sec.splice(at, 0, 'a=' + buildCandidateString(candidate));
+    return _joinSdpSections(v);
   }
 
   // mid not found — log a warning rather than silently no-op, since this
@@ -1790,29 +1952,39 @@ function selectDefaultCandidate(candidates) {
 // Idempotent: re-running on an already-finalized SDP is a no-op. Rejected
 // (port=0) m-sections are never touched (RFC 3264 §6).
 function finalizeCandidates(sdpString, gatheredCandidates) {
-  var raw = sdpTransform.parse(sdpString);
+  // Text-level edit, not a parse/write round trip — see _splitSdpSections.
+  var v = _splitSdpSections(sdpString);
   var def = selectDefaultCandidate(gatheredCandidates);
   var ipVer = (def && String(def.ip).indexOf(':') >= 0) ? 6 : 4;
 
-  for (var i = 0; i < raw.media.length; i++) {
-    var m = raw.media[i];
-    if (m.port === 0) continue;   // rejected slot — must stay untouched
+  for (var i = 0; i < v.sections.length; i++) {
+    var sec = v.sections[i];
+    if (_sectionPort(sec) === 0) continue;   // rejected slot — must stay untouched
 
-    if (m.candidates && m.candidates.length > 0 && !m.endOfCandidates) {
-      m.endOfCandidates = 'end-of-candidates';
+    var hasCand = false, hasEoc = false, lastCand = -1, cAt = -1;
+    for (var l = 0; l < sec.length; l++) {
+      if (sec[l].indexOf('a=candidate:') === 0) { hasCand = true; lastCand = l; }
+      else if (sec[l] === 'a=end-of-candidates') hasEoc = true;
+      else if (sec[l].indexOf('c=') === 0 && cAt < 0) cAt = l;
     }
+    if (hasCand && !hasEoc) sec.splice(lastCand + 1, 0, 'a=end-of-candidates');
 
     if (def) {
-      m.port = def.port;
-      m.connection = { version: ipVer, ip: def.ip };
-      if (m.rtcp) {
-        m.rtcp.port    = def.port;
-        m.rtcp.ipVer   = ipVer;
-        m.rtcp.address = def.ip;
+      var mParts = sec[0].split(' ');
+      mParts[1] = String(def.port);
+      sec[0] = mParts.join(' ');
+      var cLine = 'c=IN IP' + ipVer + ' ' + def.ip;
+      if (cAt >= 0) sec[cAt] = cLine;
+      else sec.splice(1, 0, cLine);
+      for (var r = 0; r < sec.length; r++) {
+        // rtcp-mux ⇒ RTCP on the same port and address (RFC 5761 §5.1.3).
+        if (sec[r].indexOf('a=rtcp:') === 0) {
+          sec[r] = 'a=rtcp:' + def.port + ' IN IP' + ipVer + ' ' + def.ip;
+        }
       }
     }
   }
-  return sdpTransform.write(raw);
+  return _joinSdpSections(v);
 }
 
 // Parse a candidate string "candidate:..." → object
@@ -2129,12 +2301,13 @@ export {
 
   // Negotiation
   negotiateCodecs,
+  answerCodecs,
 
   // Utilities
   generateIceCredentials, generateSsrc, resolveSetup,
   getBundleMids, isBundled, getMediaByMid,
   firstMediaByKind, hasMediaApplication, isRejected,
-  getSimulcastStructure, cloneParsedSdp,
+  getSimulcastStructure, remoteSendSimulcastRids, cloneParsedSdp,
   assignExtensionIds,
 
   // Direction helpers

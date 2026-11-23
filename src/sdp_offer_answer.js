@@ -134,6 +134,19 @@ class SdpOfferAnswer extends EventEmitter {
 
   chainOperation(op, done) {
     var entry = { op: op, done: done || noop };
+    // W3C 4.4.1.2 step 1: chaining onto a CLOSED connection returns a
+    // promise rejected with InvalidStateError; the operation never enters
+    // the chain. Before, it was queued, and since _advanceChain stopped
+    // shifting once closed, only the first such operation ever settled and
+    // every later one stayed pending forever.
+    if (this._deps.getClosed()) {
+      queueMicrotask(function () {
+        try {
+          entry.done(new DOMException('peer connection is closed', 'InvalidStateError'));
+        } catch (e) { /* swallow user-cb errors, as _runHead does */ }
+      });
+      return;
+    }
     this._operations.push(entry);
     if (this._operations.length === 1) {
       this._runHead();
@@ -278,12 +291,16 @@ class SdpOfferAnswer extends EventEmitter {
    * and a deferred negotiation-needed evaluation is pending, re-run it.
    */
   _advanceChain() {
-    if (this._deps.getClosed()) return;
+    // The finished entry ALWAYS leaves the queue, closed or not. Returning
+    // early when closed left it at the head forever, so anything behind it
+    // never ran (and never settled). A head that runs after close rejects
+    // with InvalidStateError in _runHead.
     this._operations.shift();
     if (this._operations.length > 0) {
       this._runHead();
       return;
     }
+    if (this._deps.getClosed()) return;
     // Chain drained.
     if (this._updateNegOnEmpty) {
       this._updateNegOnEmpty = false;
@@ -613,6 +630,12 @@ class SdpOfferAnswer extends EventEmitter {
       // hardcoded defaults. Without this sync our outgoing RTP stamps
       // extensions with IDs the peer won't recognize.
       _selfL._deps.syncStamperExtMap(commit.parsed);
+      // Our ANSWER is what was agreed: the transceivers' negotiated codecs
+      // follow it (setCodecPreferences may have changed the outcome since
+      // the offer was applied).
+      if ((desc.type === 'answer' || desc.type === 'pranswer') && _selfL._deps.applyLocalAnswerCodecs) {
+        _selfL._deps.applyLocalAnswerCodecs(commit.parsed);
+      }
 
       // AN APPLIED DESCRIPTION ENDS THE BURST.
       //
@@ -697,6 +720,14 @@ class SdpOfferAnswer extends EventEmitter {
       // the current-description slots are promoted by now, which is what
       // the sweep needs and what setState alone could not guarantee.
       if (_selfL._deps.retireStoppedNow) _selfL._deps.retireStoppedNow();
+      // A FINAL ANSWER MAY MOVE THE TRANSPORT. When the m-section that owned
+      // it (the BUNDLE tag) is gone, the peer brings up a new DTLS
+      // association for the new tag; cm re-runs DTLS/SRTP to follow it. Last,
+      // so it sees the description fully applied. Offers, pranswers and
+      // rollbacks never get here.
+      if (desc.type === 'answer' && _selfL._deps.onAnswerCommitted) {
+        _selfL._deps.onAnswerCommitted(commit.parsed);
+      }
       if (_heldSigL) _selfL._deps.flushSignalingEvent();
       cb(null);
     } catch (e) {
@@ -880,7 +911,15 @@ class SdpOfferAnswer extends EventEmitter {
         _selfR._deps.getIceAgent());
 
       // Process remote media tracks.
-      _selfR._deps.processRemoteMedia(commit.parsed);
+      _selfR._deps.processRemoteMedia(commit.parsed, desc.type);
+      // A FINAL ANSWER MAY MOVE THE TRANSPORT. When the m-section that owned
+      // it (the BUNDLE tag) is gone, the peer brings up a new DTLS
+      // association for the new tag; cm re-runs DTLS/SRTP to follow it. Last,
+      // so it sees the description fully applied. Offers, pranswers and
+      // rollbacks never get here.
+      if (desc.type === 'answer' && _selfR._deps.onAnswerCommitted) {
+        _selfR._deps.onAnswerCommitted(commit.parsed);
+      }
       if (_heldSig) _selfR._deps.flushSignalingEvent();
 
       cb(null);
@@ -920,38 +959,6 @@ class SdpOfferAnswer extends EventEmitter {
    *     update.
    */
   _commitDescription(desc, source) {
-    // Capture peer-learned SCTP state BEFORE parsing overwrites it.
-    //
-    // The rollback snapshot is taken further down, after the SDP has already
-    // been parsed — so by then these fields hold the NEW values and rolling
-    // back restores the description's own values rather than the ones that
-    // preceded it. Everything else in the snapshot is written after that
-    // point, which is why only these two needed the earlier capture.
-    var _st0 = this._sharedState;
-    this._preParseSctp = {
-      remoteMaxMessageSize: _st0.remoteMaxMessageSize,
-      remoteSctpPort:       _st0.remoteSctpPort,
-      // Header-extension ids are learned from the peer's extmap the same way,
-      // and they are read on the RTP hot path — remoteAudioLevelExtId decides
-      // whether an inbound audio level is found at all (fix 53), and the rid
-      // ids drive simulcast layer identification (fix 55). An id left behind
-      // by an undone description makes us look for extensions at offsets the
-      // next peer never agreed to.
-      remoteAudioLevelExtId:  _st0.remoteAudioLevelExtId,
-      remoteTransportCcExtId: _st0.remoteTransportCcExtId,
-      remoteRidExtId:         _st0.remoteRidExtId,
-      remoteRepairedRidExtId: _st0.remoteRepairedRidExtId,
-      remoteIceLite:          _st0.remoteIceLite,
-      // The peer's IDENTITY and the DTLS role derived from its a=setup.
-      //
-      // remoteFingerprint is what the handshake is verified against — a
-      // fingerprint left behind by an UNDONE offer means we would still trust
-      // a certificate the peer never actually offered us in the negotiation
-      // that stands. dtlsRole comes from the same description, and a stale one
-      // can leave both ends picking the same role on the next round.
-      remoteFingerprint:      _st0.remoteFingerprint,
-      dtlsRole:               _st0.dtlsRole,
-    };
     var state = this._sharedState;
     var isLocal = source === 'local';
 
@@ -960,14 +967,20 @@ class SdpOfferAnswer extends EventEmitter {
       : SDP.parseAnswer(desc.sdp);
     // RFC 8841: capture the peer's a=max-message-size (session or media
     // level). Absent attribute leaves null (getter assumes 65536).
+    //
+    // Only PARSED here; the value is written to state after the rollback
+    // snapshot (step 1b), so the snapshot sees the value that preceded this
+    // description. It used to be written right here, before the snapshot,
+    // which is why a separate pre-parse copy of the peer state existed.
+    var _remoteMms;
     if (source === 'remote' && desc && desc.sdp) {
       var _mmsM = desc.sdp.match(/a=max-message-size:\s*(\d+)/);
       // ZERO IS A VALUE, not an absence: max-message-size:0 means the
       // peer imposes NO limit (RFC 8841), which is very different from
       // the attribute being missing (where 65536 is assumed). Both used
       // to collapse to the same null.
-      state.remoteMaxMessageSize = _mmsM ? parseInt(_mmsM[1], 10) : null;
-      if (_mmsM && isNaN(state.remoteMaxMessageSize)) state.remoteMaxMessageSize = null;
+      _remoteMms = _mmsM ? parseInt(_mmsM[1], 10) : null;
+      if (_mmsM && isNaN(_remoteMms)) _remoteMms = null;
     }
     // A REMOTE DESCRIPTION WITHOUT A FINGERPRINT CANNOT BE USED.
     //
@@ -1150,6 +1163,7 @@ class SdpOfferAnswer extends EventEmitter {
       // restorable (its semantic anchor is gone). Discard.
       this._preCommitSnapshot = null;
     }
+    if (_remoteMms !== undefined) state.remoteMaxMessageSize = _remoteMms;
 
     // ── 2. Update description slots. ──
     if (desc.type === 'offer' || desc.type === 'pranswer') {
@@ -1187,6 +1201,21 @@ class SdpOfferAnswer extends EventEmitter {
       }
       state.pendingLocalDescription  = null;
       state.pendingRemoteDescription = null;
+    }
+
+    // ── 2b. Remember every mid this session has used. ──
+    // JSEP 5.2.2: a recycled or newly added m-section gets a mid never used
+    // before — a mid the peer saw rejected must not come back meaning
+    // something else. Once a retired section is recycled out of the
+    // description nothing else remembers its mid, and allocation handed it
+    // out again (a late data channel got the mid of a stopped video).
+    // Recorded once the description is committed; a rolled-back offer's
+    // mids stay recorded, which only makes allocation more conservative.
+    if (!state.usedMids) state.usedMids = {};
+    for (var _um = 0; _um < parsed.media.length; _um++) {
+      if (parsed.media[_um] && parsed.media[_um].mid != null) {
+        state.usedMids[String(parsed.media[_um].mid)] = true;
+      }
     }
 
     // ── 3. Cache parsed view (local side; remote is passed through cascade). ──
@@ -1308,7 +1337,33 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       // negotiation that never completed. Same shape as every other
       // peer-learned field that already rolls back; these two were simply
       // never added to the snapshot.
-      preParsePeerState:         this._preParseSctp || null,
+      //
+      // Read from the CURRENT state. It used to come from a copy
+      // (_preParseSctp) refreshed only inside _commitDescription, so the
+      // atomicity snapshot taken at the start of SLD/SRD held the values from
+      // the PREVIOUS commit — two rounds back — and any failed SLD/SRD (even
+      // a plain InvalidStateError) restored null/stale ext ids, fingerprint
+      // and DTLS role. Nothing peer-learned is written before a snapshot is
+      // taken anymore (see remoteMaxMessageSize in _commitDescription), so
+      // the live state is the right source for both snapshot users.
+      preParsePeerState: {
+        remoteMaxMessageSize:   state.remoteMaxMessageSize,
+        remoteSctpPort:         state.remoteSctpPort,
+        // Header-extension ids are read on the RTP hot path (audio level,
+        // transport-cc, rid ids for simulcast layer identification); an id
+        // left behind by an undone description makes us look for extensions
+        // at ids the next peer never agreed to.
+        remoteAudioLevelExtId:  state.remoteAudioLevelExtId,
+        remoteTransportCcExtId: state.remoteTransportCcExtId,
+        remoteRidExtId:         state.remoteRidExtId,
+        remoteRepairedRidExtId: state.remoteRepairedRidExtId,
+        remoteExtensions:       state.remoteExtensions,
+        remoteIceLite:          state.remoteIceLite,
+        // The peer's identity and the DTLS role derived from its a=setup: a
+        // fingerprint left behind by an undone offer would still be trusted.
+        remoteFingerprint:      state.remoteFingerprint,
+        dtlsRole:               state.dtlsRole,
+      },
       preCommitSnapshot:         this._preCommitSnapshot,
     };
   }
@@ -1388,6 +1443,7 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       state.remoteTransportCcExtId = _pp.remoteTransportCcExtId;
       state.remoteRidExtId        = _pp.remoteRidExtId;
       state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
+      state.remoteExtensions      = _pp.remoteExtensions;
       state.remoteIceLite         = _pp.remoteIceLite;
       state.remoteFingerprint     = _pp.remoteFingerprint;
       state.dtlsRole              = _pp.dtlsRole;
@@ -2023,10 +2079,15 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
             }
           }
 
-          if (_rbTrack && _rbTrack.readyState !== 'ended') {
+          // The remote source ended: _endSource ends every track of it (the
+          // application's clones too) with 'ended' — also when the application
+          // already stop()ped this one, so readyState is not the test. stop()
+          // is the fallback for a media-processing without track sources.
+          if (_rbTrack && (typeof _rbTrack._endSource === 'function' || _rbTrack.readyState !== 'ended')) {
             // On a task, for the same reason as transceiver.stop() (fix 25).
             setTimeout(function () {
               try {
+                if (typeof _rbTrack._endSource === 'function') { _rbTrack._endSource(); return; }
                 if (_rbTrack.readyState === 'ended') return;
                 if (typeof _rbTrack.stop === 'function') _rbTrack.stop();
                 else _rbTrack.readyState = 'ended';
@@ -2087,6 +2148,7 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       state.remoteTransportCcExtId = _pp.remoteTransportCcExtId;
       state.remoteRidExtId        = _pp.remoteRidExtId;
       state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
+      state.remoteExtensions      = _pp.remoteExtensions;
       state.remoteIceLite         = _pp.remoteIceLite;
       state.remoteFingerprint     = _pp.remoteFingerprint;
       state.dtlsRole              = _pp.dtlsRole;

@@ -54,6 +54,7 @@ var PPID_STRING        = 51;
 var PPID_BINARY        = 53;
 var PPID_STRING_EMPTY  = 56;
 var PPID_BINARY_EMPTY  = 57;
+var EMPTY_MESSAGE_BYTE = Buffer.from([0]);
 
 // DCEP message types (RFC 8832).
 var DCEP_OPEN = 0x03;
@@ -197,7 +198,16 @@ class RTCDataChannel {
    */
   send(data) {
     var sctp = this._controller._sctp;
-    if (this.readyState !== 'open' || !sctp) {
+    // The transport is moving to a new BUNDLE tag (see
+    // DataChannelController.moveToNewTransport): no association for a
+    // moment, but the channel is open and stays open. The message waits
+    // for the new association instead of being dropped.
+    // Until that association is OPEN — it may exist already, still in its
+    // handshake, where sctp.send() throws.
+    var queueForNewTransport = this.readyState === 'open' &&
+                               this._controller._awaitingTransport;
+    if (queueForNewTransport) sctp = null;
+    if (this.readyState !== 'open' || (!sctp && !queueForNewTransport)) {
       if (this._controller._dbgOn) this._controller._diag('DC send SKIPPED — readyState=' + this.readyState +
         ' sctpAssoc=' + !!sctp);
       return false;
@@ -212,7 +222,12 @@ class RTCDataChannel {
     else if (ArrayBuffer.isView(data)) buf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
     else buf = Buffer.from(data);   // ArrayBuffer: a view over it
     var ppid = typeof data === 'string' ? PPID_STRING : PPID_BINARY;
-    if (buf.length === 0) ppid = typeof data === 'string' ? PPID_STRING_EMPTY : PPID_BINARY_EMPTY;
+    var empty = buf.length === 0;
+    // An empty message is one zero byte under PPID 56/57 (RFC 8831 §6.6): a
+    // DATA chunk with no user data is a protocol violation the peer answers
+    // with ABORT (RFC 9260 §6.2, "No User Data"). The byte is not the
+    // application's, so neither the stats nor bufferedAmount count it.
+    if (empty) { ppid = typeof data === 'string' ? PPID_STRING_EMPTY : PPID_BINARY_EMPTY; buf = EMPTY_MESSAGE_BYTE; }
 
     // ── Backpressure guard (mirrors Chrome/libwebrtc's 16 MB cap) ──
     // The SCTP send queue is unbounded; without this, a send-loop that
@@ -253,7 +268,7 @@ class RTCDataChannel {
     // Update stats before send — send may fail silently but spec expects
     // counters to reflect the API call.
     this._stats.messagesSent++;
-    this._stats.bytesSent += buf.length;
+    if (!empty) this._stats.bytesSent += buf.length;
     if (this._controller._dbgOn) this._controller._diag('DC send id=' + this.id + ' ppid=' + ppid +
       ' len=' + buf.length + ' readyState=' + this.readyState);
 
@@ -265,13 +280,21 @@ class RTCDataChannel {
     // through to sctp.send so each message gets the right per-message
     // limit. Note the field-name remap: W3C calls it maxPacketLifeTime,
     // sctp.js uses maxLifetime — both are ms.
+    var sendOpts = {
+      ppid:           ppid,
+      unordered:      this.ordered === false,
+      maxRetransmits: this.maxRetransmits,         // null OK; sctp.js treats null as "no limit"
+      maxLifetime:    this.maxPacketLifeTime,      // ms; null = no deadline
+    };
+    if (queueForNewTransport) {
+      // A copy: the caller may reuse its buffer before the new association
+      // is up. bufferedAmount keeps counting it until the new association
+      // puts it on the wire (chunkUnbuffered).
+      this._controller._pendingSends.push({ dc: this, buf: Buffer.from(buf), opts: sendOpts });
+      return true;
+    }
     try {
-      sctp.send(this.id, buf, {
-        ppid:           ppid,
-        unordered:      this.ordered === false,
-        maxRetransmits: this.maxRetransmits,         // null OK; sctp.js treats null as "no limit"
-        maxLifetime:    this.maxPacketLifeTime,      // ms; null = no deadline
-      });
+      sctp.send(this.id, buf, sendOpts);
     } catch (sendErr) {
       try {
         this._ev.emit('error', {
@@ -317,25 +340,36 @@ class RTCDataChannel {
       self._controller._forgetChannel(self);
     };
 
+    if (this._controller._awaitingTransport && this.id != null) {
+      // The transport is moving: the stream reset goes out on the new
+      // association, after any message this channel queued meanwhile
+      // (send(); close(); still delivers). Closing locally only would
+      // leave the peer's channel open for good.
+      this._finalizeClose = finalize;
+      this._controller._pendingResets.push(this);
+      return;
+    }
+
     if (sctp && sctp.peerSupportsReconfig && this.id != null) {
-      // Tell peer to reset (close) the stream. The callback fires when
-      // peer responds. We finalize on any terminal response — the goal
-      // is local visibility of 'closed', not strict-correct error
-      // propagation. If the round-trip silently fails (association
-      // died), the sctp.on('close') handler tears down all DCs.
-      // (id == null means the channel never got a stream ID assigned —
-      // DCEP_OPEN never went out — so there's nothing to reset at the
-      // peer; fall through to the local-only close.)
-      // NOTE (round 114): "send() then close()" currently LOSES the
-      // message. The data is queued (bufferedAmount rises) and send()
-      // passes its guard, but the stream reset still beats it onto the
-      // wire. Deferring the reset by a task was tried and did NOT help,
-      // so the drop is below this layer — the sctp send path itself.
-      // W3C 6.2.5 requires close() to flush what is already queued
-      // before resetting; fixing it means teaching sctp.resetStreams to
-      // wait for the stream's outstanding data, which is where the next
-      // attempt should start rather than in this file.
-      sctp.resetStreams([this.id], function (err, res) { finalize(); });
+      // Tell peer to reset (close) the stream (RFC 8831 §6.7); 'closed'
+      // follows its answer. sctp.resetStreams waits for the data already
+      // sent on the stream to be acknowledged first, so "send(); close();"
+      // delivers. (id == null means the channel never got a stream ID
+      // assigned — DCEP_OPEN never went out — so there's nothing to reset
+      // at the peer; fall through to the local-only close.)
+      //
+      // A REFUSED reset (err.code 'ERR_SCTP_STREAM_RESET': Denied, Bad
+      // Sequence Number, ...) leaves the peer's channel open: it is reported
+      // as an 'error' (sctp-failure) before 'close' instead of passing for a
+      // clean close as it used to. The channel still closes here — close()
+      // cannot be refused. If the association dies first, the callback never
+      // fires and sctp 'close' finalizes the channel.
+      sctp.resetStreams([this.id], function (err) {
+        if (err && err.code === 'ERR_SCTP_STREAM_RESET' && self.readyState === 'closing') {
+          try { self._ev.emit('error', self._controller._buildSctpFailure('Stream reset refused by the peer (' + err.message + ')', null)); } catch (e) {}
+        }
+        finalize();
+      });
     } else {
       // Peer doesn't support RECONFIG — local-only close. Peer will see
       // this channel as still open from its side until SCTP itself tears
@@ -388,6 +422,15 @@ class DataChannelController extends EventEmitter {
 
     this._sctp = null;
     this._sctpState = 'new';
+    // Transport move (moveToNewTransport): waiting for the association on
+    // the new DTLS session, with the channels kept open; what they send or
+    // close meanwhile waits here. _parkedFailure: the old association was
+    // ABORTed while our offer moving the transport was pending — see
+    // _parkOnAbort.
+    this._awaitingTransport = false;
+    this._pendingSends = [];
+    this._pendingResets = [];
+    this._parkedFailure = null;
     this._dataChannels = [];
     this._dataChannelMap = {};
     this._nextDataChannelId = null;
@@ -443,10 +486,13 @@ class DataChannelController extends EventEmitter {
    * @param {string} params.dtlsRole         'client' | 'server'
    * @param {number} params.localPort
    * @param {number} params.remotePort
-   * @param {number} params.maxMessageSize
+   * @param {number} params.maxMessageSize      largest message we send (the peer's limit and ours)
+   * @param {number} params.maxRecvMessageSize  largest message we accept (the one our SDP advertises)
    */
   start(params) {
     if (this._sctp) return;
+    // After a transport move the parameters stay the session's (same
+    // ports, same role); a caller passing new ones wins.
 
     this._diag('startSctp called — role=' + params.dtlsRole +
       ' sctpPort=' + params.localPort + ' remoteSctpPort=' + params.remotePort);
@@ -466,6 +512,72 @@ class DataChannelController extends EventEmitter {
     // collision handling. The existing 'open' listener wired above
     // transitions sctpState to 'connected' when the handshake completes.
     sctp.connect();
+  }
+
+  /**
+   * The transport moved to a new BUNDLE tag (cm.js migrateTransport): the
+   * peer brings up a NEW SCTP association over the new DTLS session and
+   * keeps its data channels open across it — Chrome does (seen in its
+   * logs: the old association aborted, a data channel transport created
+   * anew, the RTCDataChannel still 'open', messages sent across the move
+   * delivered). We used to keep the old association: the peer's INIT on
+   * the new DTLS looked like a restart, or its ABORT on the old one like
+   * the end, and either way every channel closed while the peer's stayed
+   * open.
+   *
+   * Here the old association is dropped without a word (sctp.destroy —
+   * the peer has already left it, and our old DTLS session is gone), the
+   * channels stay as they are, and sctpState goes back to 'connecting'.
+   * cm's cascade starts the new association once the new DTLS session is
+   * up (start()); its 'open' brings the channels back: open channels keep
+   * their stream ids and send nothing new (no DCEP — their streams are
+   * already known to both sides), channels still 'connecting' send their
+   * DCEP_OPEN, and the messages and closes that waited go out in order.
+   *
+   * Nothing to move when no association was ever started, or after it
+   * ended for good.
+   */
+  moveToNewTransport() {
+    if (this._sctpState === 'new') return;
+    if (this._sctpState === 'closed' && !this._awaitingTransport) return;
+    this._diag('transport moved — the SCTP association is replaced; channels stay open');
+    var old = this._sctp;
+    this._sctp = null;
+    if (old) {
+      this._salvageUnsent(old);
+      try { old.destroy(); } catch (e) {}
+      this._recountBuffered();
+    }
+    this._parkedFailure = null;
+    this._sctpEndedAbruptly = false;
+    this._sctpFailure = null;
+    this._awaitingTransport = true;
+    this._setSctpState('connecting');
+  }
+
+  /**
+   * The offer that was moving the transport did not (rolled back, or the
+   * answer kept the BUNDLE tag): an ABORT parked by _parkOnAbort was the
+   * end of the association after all. The channels end now, the way a
+   * remote ABORT ends them.
+   */
+  abandonParked() {
+    if (!this._parkedFailure) return;
+    var f = this._parkedFailure;
+    this._parkedFailure = null;
+    this._awaitingTransport = false;
+    this._pendingSends.length = 0;
+    this._pendingResets.length = 0;
+    this._recountBuffered();
+    this._sctpEndedAbruptly = true;
+    this._sctpFailure = f;
+    this._endAllChannels();
+    this._setSctpState('closed');
+  }
+
+  /** True while channels wait for the association of a new transport. */
+  get awaitingTransport() {
+    return this._awaitingTransport;
   }
 
   /**
@@ -672,6 +784,7 @@ class DataChannelController extends EventEmitter {
       remotePort:     params.remotePort,
       role:           params.dtlsRole,   // 'client' or 'server' — same as DTLS
       maxMessageSize: params.maxMessageSize,
+      maxRecvMessageSize: params.maxRecvMessageSize,
     };
     if (cookieSecret) config.cookieSecret = cookieSecret;
     return new this._SctpAssociation(config);
@@ -741,8 +854,13 @@ class DataChannelController extends EventEmitter {
     // wire concerns out of cm.js entirely.
     sctp.on('packet', function (data) {
       if (self._debug) self._diag('sctp→dtls len=' + (data && data.length));   // per packet: no string unless debugging
+      // Only over a DTLS session whose handshake is done. When the
+      // transport moves to a new BUNDLE tag a new session replaces the old
+      // one and is still handshaking; lemon-tls answers a send() there with
+      // an 'error' event, which cm turns into connectionState 'failed'.
+      // SCTP retransmits what is dropped here.
       var dtls = self._deps.getDtlsSession();
-      if (dtls) dtls.send(data);
+      if (dtls && dtls.connected) dtls.send(data);
     });
 
     sctp.on('data', function (streamId, ppid, data) {
@@ -755,7 +873,9 @@ class DataChannelController extends EventEmitter {
         if (dc) {
           var text = ppid === PPID_STRING_EMPTY ? '' : data.toString('utf-8');
           dc._stats.messagesReceived++;
-          dc._stats.bytesReceived += text.length;
+          // Bytes, not UTF-16 code units: text.length undercounted any
+          // non-ASCII text (W3C RTCDataChannelStats.bytesReceived).
+          dc._stats.bytesReceived += ppid === PPID_STRING_EMPTY ? 0 : data.length;
           dc._ev.emit('message', { data: text });
         } else {
           self._diag('NO DataChannel for streamId=' + streamId + ' (dropped)');
@@ -797,16 +917,31 @@ class DataChannelController extends EventEmitter {
           self._sendDcepOpen(dc);
         }
       }
+      if (self._awaitingTransport) self._resumeAfterMove(sctp);
     });
 
-    sctp.on('pathFailure', function () {
+    sctp.on('pathFailure', function (info) {
       // An ABORT from the peer, or a path that gave up: the association did
       // NOT end by agreement. Recorded so the close handler below reports it
       // as a transport failure rather than a clean shutdown — a graceful
       // SHUTDOWN is not an error, and 'close' alone describes it correctly.
+      // The ABORT's cause (the peer's, or the one we sent: 4, 13) is the
+      // sctpCauseCode the application reads; a path that stopped answering
+      // has none.
       self._sctpEndedAbruptly = true;
+      self._sctpFailure = info || {};
+      // An ABORT that is our transport move (see _parkOnAbort): keep what was
+      // not sent yet for the new association. Here, not in 'close' — the
+      // association empties its queues between the two events.
+      if (info && info.source === 'abort' && self._sctp === sctp &&
+          typeof self._deps.isTransportMoveExpected === 'function' &&
+          self._deps.isTransportMoveExpected()) {
+        self._salvageUnsent(sctp);
+      }
     });
     sctp.on('close', function () {
+      if (self._sctp !== sctp) return;   // replaced (transport move): not ours to end
+      if (self._parkOnAbort(sctp)) return;
       // The association is gone — graceful SHUTDOWN completed, remote
       // ABORT, or path failure. W3C webrtc-pc §6.2: every channel riding
       // a closed transport transitions to 'closed' and fires 'close'.
@@ -816,21 +951,7 @@ class DataChannelController extends EventEmitter {
       // channels 'open' forever and pc.close() left them 'closing'
       // forever — dc.close()'s own finalize closure is a no-op once we
       // move the state here, so the paths stay idempotent.
-      for (var i = 0; i < self._dataChannels.length; i++) {
-        var dc = self._dataChannels[i];
-        if (!dc || dc.readyState === 'closed') continue;
-        if (dc.readyState !== 'closing') {
-          dc.readyState = 'closing';
-          try { dc._ev.emit('closing'); } catch (e) {}
-        }
-        dc.readyState = 'closed';
-        // Same rule as the local terminal close: an abrupt end is a
-        // transport failure and is reported as one, in front of the close.
-        if (self._sctpEndedAbruptly) {
-          try { dc._ev.emit('error', self._buildSctpFailure()); } catch (e) {}
-        }
-        try { dc._ev.emit('close'); } catch (e) {}
-      }
+      self._endAllChannels();
       self._setSctpState('closed');
     });
 
@@ -915,7 +1036,8 @@ class DataChannelController extends EventEmitter {
       });
     };
     sctp.on('chunkUnbuffered', function (info) {
-      if (info.ppid === PPID_DCEP) return;
+      // An empty message's zero byte was never in bufferedAmount (send()).
+      if (info.ppid === PPID_DCEP || info.ppid === PPID_STRING_EMPTY || info.ppid === PPID_BINARY_EMPTY) return;
       // The channel is resolved now, not when the microtask runs: by then
       // its stream id may already carry a new channel.
       var dc = self._dataChannelMap[info.streamId];
@@ -971,6 +1093,144 @@ class DataChannelController extends EventEmitter {
       try { return new EvtCtor('error', { error: err }); } catch (e) {}
     }
     return { type: 'error', error: err };
+  }
+
+  // Every channel ends the way a dead association ends it: 'closing',
+  // 'closed', and an 'error' first when the end was abrupt (remote ABORT,
+  // path failure). The sctp 'close' handler and abandonParked share it.
+  _endAllChannels() {
+    var self = this;
+    for (var i = 0; i < self._dataChannels.length; i++) {
+      var dc = self._dataChannels[i];
+      if (!dc || dc.readyState === 'closed') continue;
+      if (dc.readyState !== 'closing') {
+        dc.readyState = 'closing';
+        try { dc._ev.emit('closing'); } catch (e) {}
+      }
+      dc.readyState = 'closed';
+      // Same rule as the local terminal close: an abrupt end is a
+      // transport failure and is reported as one, in front of the close.
+      if (self._sctpEndedAbruptly) {
+        var f = self._sctpFailure || {};
+        var msg = f.source === 'abort' ? 'The peer aborted the SCTP association'
+          : (f.source === 'protocol' || f.source === 'resource') ? 'The SCTP association was aborted: the peer broke its limits'
+          : 'The SCTP association failed: the peer stopped answering';
+        try { dc._ev.emit('error', self._buildSctpFailure(msg, typeof f.cause === 'number' ? f.cause : null)); } catch (e) {}
+      }
+      try { dc._ev.emit('close'); } catch (e) {}
+    }
+  }
+
+  // An ABORT from the peer while OUR offer that moves the transport is
+  // pending: Chrome applies the offer first, tears its old transport down —
+  // ABORT on the old association, close_notify on the old DTLS — and only
+  // then sends the answer that moves us too. That ABORT is the move, not
+  // the end: the channels are kept ('parked') and the answer decides —
+  // moveToNewTransport takes over, or abandonParked ends them after all.
+  _parkOnAbort(sctp) {
+    if (!this._sctpEndedAbruptly) return false;
+    var f = this._sctpFailure || {};
+    if (f.source !== 'abort') return false;
+    if (typeof this._deps.isTransportMoveExpected !== 'function' || !this._deps.isTransportMoveExpected()) return false;
+    this._diag('sctp ABORT while our offer moves the transport — channels kept until the answer');
+    this._sctp = null;
+    try { sctp.destroy(); } catch (e) {}
+    this._parkedFailure = f;
+    this._sctpEndedAbruptly = false;
+    this._sctpFailure = null;
+    this._awaitingTransport = true;
+    this._recountBuffered();
+    this._setSctpState('connecting');
+    return true;
+  }
+
+  // Messages the old association had accepted but not put on the wire at
+  // all — the peer cannot have them — wait for the new association, ahead
+  // of anything sent after the move. A send() just before the move was
+  // otherwise lost with the association (seen: three messages sent right
+  // before our answer moved the transport never reached Chrome). Messages
+  // with a fragment already sent are not repeated: the peer may have them.
+  // A queued DCEP_OPEN is left out — the new association's 'open' sends one
+  // for every channel still 'connecting'.
+  _salvageUnsent(old) {
+    if (typeof old.unsentMessages !== 'function') return;
+    var msgs;
+    try { msgs = old.unsentMessages(); } catch (e) { return; }
+    var salvaged = [];
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i];
+      if (m.ppid === PPID_DCEP && m.payload.length && m.payload[0] === DCEP_OPEN) continue;
+      var dc = this._dataChannelMap[m.streamId];
+      if (!dc) continue;
+      salvaged.push({ dc: dc, buf: m.payload, opts: {
+        ppid: m.ppid, unordered: m.unordered,
+        maxRetransmits: m.maxRetransmits, maxLifetime: m.maxLifetime,
+      } });
+    }
+    if (salvaged.length) {
+      this._diag('transport moved — ' + salvaged.length + ' unsent message(s) go out on the new association');
+      this._pendingSends = salvaged.concat(this._pendingSends);
+    }
+  }
+
+  // bufferedAmount after the old association is gone: what still waits to
+  // be sent — the messages queued for the new association, and those still
+  // in api.js's own queue (_sendQBytes). The bytes of a message that died
+  // with the old association (a fragment of it already sent) were never
+  // given back: its chunkUnbuffered events went with the association, and
+  // a sender pacing on 'bufferedamountlow' waited for them for good.
+  _recountBuffered() {
+    var queued = new Map();
+    for (var i = 0; i < this._pendingSends.length; i++) {
+      var q = this._pendingSends[i];
+      var p = q.opts && q.opts.ppid;
+      if (p === PPID_DCEP || p === PPID_STRING_EMPTY || p === PPID_BINARY_EMPTY) continue;
+      queued.set(q.dc, (queued.get(q.dc) || 0) + q.buf.length);
+    }
+    var low = [];
+    for (var j = 0; j < this._dataChannels.length; j++) {
+      var dc = this._dataChannels[j];
+      if (!dc) continue;
+      var want = (queued.get(dc) || 0) + (dc._sendQBytes || 0);
+      if (dc.bufferedAmount <= want) continue;
+      var before = dc.bufferedAmount;
+      dc.bufferedAmount = want;
+      if (before > dc.bufferedAmountLowThreshold && want <= dc.bufferedAmountLowThreshold) low.push(dc);
+    }
+    // Asynchronously, as every bufferedamountlow is (never inside the call
+    // that changed the transport).
+    if (low.length) {
+      queueMicrotask(function () {
+        for (var k = 0; k < low.length; k++) {
+          try { low[k]._ev.emit('bufferedamountlow', { type: 'bufferedamountlow' }); } catch (e) {}
+        }
+      });
+    }
+  }
+
+  // The new association after a transport move is open: what waited for it
+  // goes out — queued messages first, in the order they were sent, then the
+  // stream resets of channels closed meanwhile (their reset waits for the
+  // data to be acknowledged, so send(); close(); still delivers).
+  _resumeAfterMove(sctp) {
+    this._awaitingTransport = false;
+    var sends = this._pendingSends.splice(0);
+    for (var i = 0; i < sends.length; i++) {
+      var q = sends[i];
+      if (q.dc.readyState !== 'open' && q.dc.readyState !== 'closing') continue;
+      try { sctp.send(q.dc.id, q.buf, q.opts); } catch (e) {
+        try { q.dc._ev.emit('error', this._buildSctpFailure('RTCDataChannel.send: SCTP transport error: ' + (e && e.message || e), null)); } catch (e2) {}
+      }
+    }
+    var resets = this._pendingResets.splice(0);
+    for (var j = 0; j < resets.length; j++) {
+      var dc = resets[j];
+      var fin = dc._finalizeClose;
+      dc._finalizeClose = null;
+      if (typeof fin !== 'function') continue;
+      if (sctp.peerSupportsReconfig) sctp.resetStreams([dc.id], fin);
+      else queueMicrotask(fin);
+    }
   }
 
   _setSctpState(newState) {

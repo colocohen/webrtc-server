@@ -213,6 +213,11 @@ function applyRemoteDescription(state, parsed) {
   state.remoteRidExtId         = null;
   state.remoteRepairedRidExtId = null;
   state.remoteAudioLevelExtId  = null;
+  // Every negotiated id → uri of the peer's, for a consumer that needs more
+  // than the ids latched above: the FlexFEC decoder zeroes the peer's MUTABLE
+  // extensions (transport-cc, abs-send-time, …) before its XOR, as the
+  // peer's sender protected them while they were still zero.
+  state.remoteExtensions       = {};
   var AUDIO_LEVEL_URI = 'urn:ietf:params:rtp-hdrext:ssrc-audio-level';
 
   function _latchExtId(uri, id, msMid) {
@@ -249,22 +254,16 @@ function applyRemoteDescription(state, parsed) {
     if (ms.type === 'application' || !ms.extensions) continue;
     for (var ei = 0; ei < ms.extensions.length; ei++) {
       _latchExtId(ms.extensions[ei].uri, ms.extensions[ei].id, ms.mid);
+      if (state.remoteExtensions[ms.extensions[ei].id] == null) {
+        state.remoteExtensions[ms.extensions[ei].id] = ms.extensions[ei].uri;
+      }
     }
   }
 
   // ── ICE creds + DTLS fingerprint + role. ──
-  // BUNDLE (RFC 8843 §9.2) means ICE creds, fingerprint, and setup are
-  // identical across all bundled m-sections — so reading from the first
-  // section that *has* them is sufficient. Critically: media[0] may be a
-  // rejected (port=0) or recycled section that didn't carry these
-  // attributes. Scan until we find a section with iceUfrag — the
-  // canonical signal that this section participates in transport — and
-  // read the rest from there.
-  var firstWithCreds = null;
-  for (var fmi = 0; fmi < parsed.media.length; fmi++) {
-    if (parsed.media[fmi].iceUfrag) { firstWithCreds = parsed.media[fmi]; break; }
-  }
-  if (firstWithCreds) {
+  // From the m-section that owns the transport — see transportSection.
+  var tSec = transportSection(parsed);
+  if (tSec) {
     // Detect ICE restart: peer ufrag (or pwd) changed since the last
     // applied remote description. Per RFC 8839 §5, an ICE restart is
     // signaled by changing ufrag and/or pwd. The previously-collected
@@ -274,16 +273,16 @@ function applyRemoteDescription(state, parsed) {
     // will populate cleanly. (iceAgent's own restart handling is driven
     // separately via the cascade in cm.js.)
     var iceRestart = state.remoteIceUfrag != null &&
-                     (firstWithCreds.iceUfrag !== state.remoteIceUfrag ||
-                      (firstWithCreds.icePwd && firstWithCreds.icePwd !== state.remoteIcePwd));
+                     (tSec.iceUfrag !== state.remoteIceUfrag ||
+                      (tSec.icePwd && tSec.icePwd !== state.remoteIcePwd));
     if (iceRestart) {
       state.remoteCandidates.length = 0;
     }
-    state.remoteIceUfrag = firstWithCreds.iceUfrag;
-    if (firstWithCreds.icePwd)      state.remoteIcePwd      = firstWithCreds.icePwd;
-    if (firstWithCreds.fingerprint) state.remoteFingerprint = firstWithCreds.fingerprint;
-    if (firstWithCreds.setup && !state.dtlsRole) {
-      _diag('[tc] setup decision — mode:', state.mode, 'remote setup:', firstWithCreds.setup);
+    state.remoteIceUfrag = tSec.iceUfrag;
+    if (tSec.icePwd)      state.remoteIcePwd      = tSec.icePwd;
+    if (tSec.fingerprint) state.remoteFingerprint = tSec.fingerprint;
+    if (tSec.setup && !state.dtlsRole) {
+      _diag('[tc] setup decision — mode:', state.mode, 'remote setup:', tSec.setup);
       // An ICE-lite peer is always the ICE-controlled agent: it never
       // initiates connectivity checks, it only responds. It must therefore
       // also be the DTLS *server* (a=setup:passive) and let the full,
@@ -299,7 +298,7 @@ function applyRemoteDescription(state, parsed) {
       if (state.mode === 'lite') {
         state.dtlsRole = 'server';
       } else {
-        state.dtlsRole = SDP.resolveSetup(firstWithCreds.setup) === 'active' ? 'client' : 'server';
+        state.dtlsRole = SDP.resolveSetup(tSec.setup) === 'active' ? 'client' : 'server';
       }
       _diag('[tc] → dtlsRole set to:', state.dtlsRole);
     }
@@ -312,8 +311,11 @@ function applyRemoteDescription(state, parsed) {
   // candidates. (Trickled candidates arrive via addTrickleCandidate.)
   for (var k = 0; k < parsed.media.length; k++) {
     var m = parsed.media[k];
-    for (var c = 0; c < m.candidates.length; c++) {
-      state.remoteCandidates.push(m.candidates[c]);
+    // A rejected section's candidates belong to a transport that is gone
+    // (Chrome keeps listing its old ones there) — not checked.
+    var _mCands = SDP.isRejected(m) ? [] : m.candidates;
+    for (var c = 0; c < _mCands.length; c++) {
+      state.remoteCandidates.push(_mCands[c]);
     }
     if (m.type === 'application' && m.sctpPort) {
       state.remoteSctpPort = m.sctpPort;
@@ -353,6 +355,8 @@ function applyRemoteDescription(state, parsed) {
 function pushCandidatesToIceAgent(state, parsed, iceAgent) {
   if (!iceAgent) return;
   for (var i = 0; i < parsed.media.length; i++) {
+    // Rejected sections: see applyRemoteDescription.
+    if (SDP.isRejected(parsed.media[i])) continue;
     var cands = parsed.media[i].candidates;
     for (var c = 0; c < cands.length; c++) {
       iceAgent.addRemoteCandidate(cands[c]);
@@ -376,6 +380,118 @@ function addTrickleCandidate(state, candidate, iceAgent) {
 }
 
 
+/* ========================= Transport ownership (BUNDLE tag) ========================= */
+
+/**
+ * The mid whose m-section owns the session's transport (ICE pair, DTLS
+ * association, SRTP context, SCTP association) under a completed
+ * negotiation: the BUNDLE-tagged m-section — the first live mid of the
+ * description's first BUNDLE group (RFC 8843 §7). Without a group, the
+ * first live m-section (a lone m-section is its own transport). null when
+ * every m-section is rejected.
+ *
+ * SDP.isRejected (port 0) is safe for bundle-only sections: the parser
+ * already gave a live a=bundle-only section a non-zero port.
+ *
+ * @param {Object} parsed  — SDP.parseOffer/parseAnswer output of the ANSWER that
+ *                           completed the negotiation
+ * @returns {string|null}
+ */
+function bundleTransportMid(parsed) {
+  if (!parsed || !parsed.media) return null;
+  var live = {};
+  var firstLive = null;
+  for (var i = 0; i < parsed.media.length; i++) {
+    var m = parsed.media[i];
+    if (!m || SDP.isRejected(m) || m.mid == null) continue;
+    live[String(m.mid)] = true;
+    if (firstLive === null) firstLive = String(m.mid);
+  }
+  var group = parsed.bundleGroups ? SDP.getBundleMids(parsed) : [];
+  if (group.length) {
+    for (var g = 0; g < group.length; g++) {
+      if (live[String(group[g])]) return String(group[g]);
+    }
+    return null;
+  }
+  return firstLive;
+}
+
+/**
+ * The m-section to read the session's transport parameters from — ICE
+ * ufrag/pwd, DTLS fingerprint and setup. BUNDLE (RFC 8843 §9.2) makes them
+ * one transport's, so one section is read: the one that owns the transport
+ * (bundleTransportMid), else the first live section carrying them; only
+ * when every section is rejected, any section that carries them.
+ *
+ * Not simply the first section that carries them: Chrome keeps a rejected
+ * (port 0) m-section in every later description WITH its attributes,
+ * frozen at their old values. After the first m-section was stopped and an
+ * ICE restart followed, its ufrag/pwd were the pre-restart ones: we checked
+ * with stale credentials, every check was refused and ICE never came back,
+ * while the restart itself went undetected (seen with Chrome: a restart
+ * offer carrying m=video 0 ... a=ice-ufrag:<old> next to m=audio ...
+ * a=ice-ufrag:<new>).
+ *
+ * @param {Object} parsed — SDP.parseOffer/parseAnswer output
+ * @returns {Object|null} the media section, or null
+ */
+function transportSection(parsed) {
+  if (!parsed || !parsed.media) return null;
+  var media = parsed.media;
+  var owner = bundleTransportMid(parsed);
+  var i;
+  if (owner != null) {
+    for (i = 0; i < media.length; i++) {
+      if (media[i] && media[i].iceUfrag && String(media[i].mid) === owner) return media[i];
+    }
+  }
+  for (i = 0; i < media.length; i++) {
+    if (media[i] && media[i].iceUfrag && !SDP.isRejected(media[i])) return media[i];
+  }
+  for (i = 0; i < media.length; i++) {
+    if (media[i] && media[i].iceUfrag) return media[i];
+  }
+  return null;
+}
+
+/**
+ * Does the negotiation that just completed move the transport to another
+ * m-section?
+ *
+ * Chrome (libwebrtc) ties a transport to the m-section that owns it. When
+ * that m-section is rejected — a stopped transceiver at the BUNDLE tag —
+ * the group gets a new tag and Chrome brings up a NEW transport for it:
+ * new sockets, a new DTLS handshake (same certificate and roles), new SRTP
+ * keys and a new SCTP association, with ICE checks on the new candidates
+ * under the same credentials. The old transport is closed. Seen in
+ * Chrome-to-Chrome: transport T01 → T11, the old RTCDtlsTransport
+ * 'closed', a data channel kept open across it. We kept using the old DTLS
+ * association, which Chrome had closed, and the connection never came back.
+ *
+ * Returns { from, to } when the owner changed (the caller brings up the
+ * new transport), null otherwise:
+ *   - first negotiation (no previous owner): nothing to move;
+ *   - every m-section rejected (no new owner): nothing to move to yet. The
+ *     previous owner is kept, so the first live m-section added later —
+ *     necessarily a new mid (JSEP 5.2.2) — still counts as a change, as
+ *     Chrome builds a new transport for it too.
+ *
+ * Only a final answer completes a negotiation; offers, pranswers and
+ * rollbacks never reach this.
+ *
+ * @param {string|null} prevMid — the owner before this negotiation
+ * @param {Object} answerParsed — SDP.parseAnswer output of the final answer
+ * @returns {{from: string, to: string}|null}
+ */
+function transportOwnerChange(prevMid, answerParsed) {
+  var next = bundleTransportMid(answerParsed);
+  if (prevMid == null || next == null) return null;
+  if (String(prevMid) === next) return null;
+  return { from: String(prevMid), to: next };
+}
+
+
 /* ========================= Exports ========================= */
 
 export {
@@ -388,4 +504,9 @@ export {
   applyRemoteDescription,
   pushCandidatesToIceAgent,
   addTrickleCandidate,
+
+  // Transport ownership
+  bundleTransportMid,
+  transportOwnerChange,
+  transportSection,
 };

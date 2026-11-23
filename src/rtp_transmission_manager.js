@@ -75,14 +75,21 @@ function ensureSendSsrc(state, transceiver) {
 
   var ssrc    = SDP.generateSsrc();
   var rtxSsrc = SDP.generateSsrc();
+  // FlexFEC SSRC too, as createTransceiver gives every video stream (only
+  // emitted when flexfec is negotiated). It was null here, so a transceiver
+  // created by setRemoteDescription — the answerer flow — never had one:
+  // the answer accepted flexfec-03 with no a=ssrc-group:FEC-FR for our
+  // stream, localFecSsrcs had no entry, and not one FEC packet was sent.
+  var fecSsrc = (transceiver.kind === 'video') ? SDP.generateSsrc() : null;
 
   transceiver.sender.ssrc    = ssrc;
   transceiver.sender.rtxSsrc = rtxSsrc;
   if (transceiver.sender.layers && transceiver.sender.layers.length) {
     transceiver.sender.layers[0].ssrc    = ssrc;
     transceiver.sender.layers[0].rtxSsrc = rtxSsrc;
+    transceiver.sender.layers[0].fecSsrc = fecSsrc;
   } else {
-    transceiver.sender.layers = [{ rid: null, ssrc: ssrc, rtxSsrc: rtxSsrc, fecSsrc: null }];
+    transceiver.sender.layers = [{ rid: null, ssrc: ssrc, rtxSsrc: rtxSsrc, fecSsrc: fecSsrc }];
   }
 
   // Mirror the routing slot createTransceiver would have written, so the SDP
@@ -96,13 +103,18 @@ function ensureSendSsrc(state, transceiver) {
     state.localSsrcs[transceiver.mid] = {
       id:     ssrc,
       rtxId:  rtxSsrc,
-      fecId:  null,
+      fecId:  fecSsrc,
       msid:   ((streamIds && streamIds[0]) || '-') + ' ' + trackId,
       msids:  (streamIds && streamIds.length > 1)
                 ? streamIds.map(function (id) { return id + ' ' + trackId; })
                 : null,
       layers: transceiver.sender.layers,
     };
+  }
+  // Data-plane lookup, as in createTransceiver.
+  if (fecSsrc) {
+    if (!state.localFecSsrcs) state.localFecSsrcs = {};
+    state.localFecSsrcs[ssrc] = fecSsrc;
   }
   return true;
 }
@@ -192,8 +204,13 @@ function getNextMid(state) {
       usedMids[state.parsedRemoteSdp.media[k].mid] = true;
     }
   }
+  // Also every mid ever committed (state.usedMids, kept by
+  // sdp_offer_answer's _commitDescription). JSEP 5.2.2 forbids reusing
+  // a retired mid; the current descriptions alone no longer list a mid
+  // whose m-line was recycled, so a new transceiver could take it.
+  var retired = state.usedMids || {};
   var next = 0;
-  while (usedMids[String(next)]) next++;
+  while (usedMids[String(next)] || retired[String(next)]) next++;
   return next;
 }
 
@@ -514,6 +531,33 @@ function isFullyStopped(t) {
   return !!(t._stopped || t.currentDirection === 'stopped');
 }
 
+/**
+ * May this transceiver's sender put media on the wire right now?
+ *
+ * applyDirectionsFromAnswer used to record currentDirection and nothing
+ * consulted it on the send side: a transceiver negotiated to recvonly or
+ * inactive kept encoding and sending RTP. 'inactive' is how an app turns
+ * the camera off without tearing the sender down, so the media leaking out
+ * anyway was a privacy problem, not just wasted bandwidth.
+ *
+ * The send pipelines (media_pipeline.js) ask this before feeding each frame
+ * to the encoder, so the answer follows every applied offer/answer (and
+ * stop()) without an event: the gate is the negotiated state itself.
+ *
+ *   stopping / stopped          no  (W3C 5.4 stop(): stop sending at once)
+ *   currentDirection null       yes (nothing negotiated yet; SRTP is not up
+ *                                    either, so nothing reaches the wire)
+ *   sendrecv / sendonly         yes
+ *   recvonly / inactive         no
+ */
+function isSendingAllowed(t) {
+  if (!t) return true;
+  if (isStopped(t)) return false;
+  var cd = t.currentDirection;
+  if (cd == null) return true;
+  return cd === 'sendrecv' || cd === 'sendonly';
+}
+
 
 /**
  * JSEP legitimate-owner test — the single source of truth for "may this
@@ -575,7 +619,7 @@ function findRemoteSsrcForMid(state, mid) {
   var keys = Object.keys(state.remoteSsrcMap);
   for (var k = 0; k < keys.length; k++) {
     var entry = state.remoteSsrcMap[keys[k]];
-    if (entry.mid === mid && !entry.isRtx) return parseInt(keys[k], 10);
+    if (entry.mid === mid && !entry.isRtx && !entry.isFec) return parseInt(keys[k], 10);
   }
   return null;
 }
@@ -626,7 +670,7 @@ function findPrimaryForRtx(state, rtxMapping) {
     // disambiguates.
     for (var i = 0; i < keys.length; i++) {
       var entry = state.remoteSsrcMap[keys[i]];
-      if (!entry.isRtx &&
+      if (!entry.isRtx && !entry.isFec &&
           entry.mid === rtxMapping.mid &&
           entry.rid === rtxMapping.rid) {
         return parseInt(keys[i], 10);
@@ -642,7 +686,7 @@ function findPrimaryForRtx(state, rtxMapping) {
   var matches = [];
   for (var j = 0; j < keys.length; j++) {
     var e2 = state.remoteSsrcMap[keys[j]];
-    if (!e2.isRtx && e2.mid === rtxMapping.mid && e2.rid == null) {
+    if (!e2.isRtx && !e2.isFec && e2.mid === rtxMapping.mid && e2.rid == null) {
       matches.push(parseInt(keys[j], 10));
       if (matches.length > 1) return null;   // ambiguous, give up
     }
@@ -1007,6 +1051,7 @@ export {
   createTransceiver,
   ensureSendSsrc,
   isFullyStopped,
+  isSendingAllowed,
 
   // Lookups
   findByMid,

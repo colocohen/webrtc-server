@@ -87,11 +87,12 @@ function buildMediaForTransceiver(state, t) {
         fmtp:           c.fmtp,
         feedback:       c.feedback,
         rtxPayloadType: c.rtx ? (97 + idx * 2) : undefined,
-        // FlexFEC (flexfec-03): offered once per video m-section, on the
-        // first codec entry, at PT 118 (outside the 96..10x primary/rtx
-        // range). Send path lives in media_transport.sendRtp; receive
-        // path in _handleIncomingRtpInner.
-        flexfecPayloadType: (idx === 0) ? 118 : undefined,
+        // FlexFEC (flexfec-03) is NOT offered by default. A PT 118 used to
+        // sit here, but the offer writer ignored it, so it never reached the
+        // wire; now that the writer emits FlexFEC, keeping it would start
+        // offering FEC on every call. It is offered only when negotiated
+        // before — the re-offer keeps the previous section's codecs, which
+        // carry the peer's flexfecPayloadType (see reconcileOfferCodecs).
       };
     });
   }
@@ -227,6 +228,126 @@ function buildMediaForTransceiver(state, t) {
 }
 
 
+/* ========================= Re-offer codecs ========================= */
+
+// fmtp parameters that tell two configurations of one codec name apart
+// (H264 packetization mode, VP9 profile-id, AV1 profile), with the value an
+// absent parameter means.
+var _FMTP_IDENTITY = {
+  'packetization-mode': '0',
+  'profile-id': '0',
+  'profile': '0',
+};
+
+function _sameCodecConfig(a, b) {
+  if (SDP.codecName(a.name) !== SDP.codecName(b.name)) return false;
+  if ((a.clockRate || 0) !== (b.clockRate || 0)) return false;
+  // channels: parsed codecs carry 0 when the rtpmap omits it (= 1).
+  if ((a.channels || 1) !== (b.channels || 1)) return false;
+  var fa = a.fmtp || {}, fb = b.fmtp || {};
+  for (var k in _FMTP_IDENTITY) {
+    var va = (fa[k] != null) ? String(fa[k]) : _FMTP_IDENTITY[k];
+    var vb = (fb[k] != null) ? String(fb[k]) : _FMTP_IDENTITY[k];
+    if (va !== vb) return false;
+  }
+  // H264: profile_idc + constraint byte decide decodability; the level
+  // (last byte) is negotiable.
+  var pa = fa['profile-level-id'], pb = fb['profile-level-id'];
+  if (pa != null && pb != null &&
+      String(pa).slice(0, 4).toLowerCase() !== String(pb).slice(0, 4).toLowerCase()) return false;
+  return true;
+}
+
+function _codecPts(c) {
+  return [c.payloadType, c.rtxPayloadType, c.redPayloadType, c.flexfecPayloadType]
+    .filter(function (pt) { return pt != null; });
+}
+
+// Dynamic PT range (RFC 3551 96-127), then the low range JSEP also allows
+// (35-63, RFC 8829 §5.1.4) once the first is exhausted.
+function _freePt(used, preferred) {
+  if (preferred != null && !used[preferred]) return preferred;
+  for (var pt = 96; pt <= 127; pt++) if (!used[pt]) return pt;
+  for (var lo = 35; lo <= 63; lo++) if (!used[lo]) return lo;
+  return null;
+}
+
+/**
+ * The codec list of a RE-OFFER for a section that was negotiated before.
+ *
+ * PTs that were negotiated are kept (a PT that changes meaning across a
+ * renegotiation is a reassignment Chrome rejects), but WHICH codecs and in
+ * WHAT ORDER is the transceiver's codec preferences' call (W3C 5.4).
+ * Before, the previous section's codec list replaced the spec's wholesale,
+ * so setCodecPreferences after the first negotiation had no effect on any
+ * later offer.
+ *
+ * @param {Object}   t           transceiver
+ * @param {Object[]} wanted      buildMediaForTransceiver's codecs (default
+ *                               PTs, already filtered/ordered by prefs)
+ * @param {Object[]} negotiated  the previous local section's codecs
+ * @returns {Object[]}
+ */
+function reconcileOfferCodecs(t, wanted, negotiated) {
+  var prefs = t && t._codecPreferences;
+  if (!negotiated || !negotiated.length) return wanted;
+  // No preferences: the negotiated list as it stands (unchanged behaviour).
+  if (!prefs || !prefs.length) return negotiated;
+
+  var used = {};
+  for (var n = 0; n < negotiated.length; n++) {
+    var ptsN = _codecPts(negotiated[n]);
+    for (var pn = 0; pn < ptsN.length; pn++) used[ptsN[pn]] = true;
+  }
+
+  var out = [], taken = [];
+  for (var w = 0; w < wanted.length; w++) {
+    var want = wanted[w];
+    // Every negotiated entry of this configuration, in its existing order
+    // (an answer to Chrome can hold several H264 entries of one profile).
+    var hit = false;
+    for (var k = 0; k < negotiated.length; k++) {
+      if (taken.indexOf(k) !== -1) continue;
+      if (!_sameCodecConfig(want, negotiated[k])) continue;
+      taken.push(k);
+      out.push(negotiated[k]);
+      hit = true;
+    }
+    if (hit) continue;
+    // Preferred but never negotiated: offer it on PTs nothing else in this
+    // section uses (its default PTs when free).
+    var fresh = Object.assign({}, want);
+    var auxKeys = ['payloadType', 'rtxPayloadType', 'redPayloadType', 'flexfecPayloadType'];
+    for (var a = 0; a < auxKeys.length; a++) {
+      if (fresh[auxKeys[a]] == null) continue;
+      var pt = _freePt(used, fresh[auxKeys[a]]);
+      if (pt == null) { fresh = null; break; }    // PT space exhausted
+      fresh[auxKeys[a]] = pt;
+      used[pt] = true;
+    }
+    if (fresh) out.push(fresh);
+  }
+  // Preferences that match nothing we can offer leave the section as it was
+  // rather than emitting an m-line with no formats.
+  return out.length ? out : negotiated;
+}
+
+
+/**
+ * A mid for a section this offer adds: not used by any section placed so
+ * far, by any transceiver, nor by any description this session committed
+ * (state.usedMids, kept by sdp_offer_answer). JSEP 5.2.2 forbids reusing a
+ * retired mid; getNextMid alone only sees the current descriptions and the
+ * live transceivers, so a mid recycled out of both was handed out again.
+ */
+function _freshMid(state, existingMids) {
+  var mid = parseInt(RtpManager.getNextMid(state), 10);
+  var used = state.usedMids || {};
+  while (existingMids[String(mid)] || used[String(mid)]) mid++;
+  return String(mid);
+}
+
+
 /* ========================= Offer ========================= */
 
 /**
@@ -294,6 +415,9 @@ function buildOffer(state, options) {
   // loop below.
   var _placedTransceivers = [];
 
+  // Whether this offer already carries a live m=application (data channels).
+  var hasLiveApplication = false;
+
   // Renegotiation: preserve existing m-sections.
   // We pin from state.parsedCurrentLocalSdp (the parsed view of the most
   // recently *completed* round). Using state.parsedLocalSdp here would be
@@ -317,10 +441,16 @@ function buildOffer(state, options) {
 
       if (em.type === 'application') {
         existingMids[em.mid] = true;
-        mediaSections.push({
+        // A rejected application section stays rejected: re-offering it live
+        // would revive a mid the session already retired. If data channels
+        // need one, a fresh section is appended below.
+        var _appSpec = {
           type: 'application', mid: em.mid,
           sctpPort: state.sctpPort, maxMessageSize: state.maxMessageSize,
-        });
+        };
+        if (em.port === 0) _appSpec.port = 0;
+        else hasLiveApplication = true;
+        mediaSections.push(_appSpec);
         continue;
       }
 
@@ -349,7 +479,15 @@ function buildOffer(state, options) {
         existingMids[em.mid] = true;
         var spec = buildMediaForTransceiver(state, tr);
         if (em.extensions && em.extensions.length) spec.extensions = em.extensions;
-        if (em.codecs     && em.codecs.length)     spec.codecs     = em.codecs;
+        spec.codecs = reconcileOfferCodecs(tr, spec.codecs, em.codecs);
+        // Keep RECEIVING the simulcast the peer negotiated on this section
+        // (RFC 8853): its rids, as recv, in its order. Without them our
+        // re-offer read as "no simulcast here" and Chrome paused every layer
+        // but the first (a=simulcast:send q;~h;~f).
+        var _remSec = state.parsedCurrentRemoteSdp
+          ? SDP.getMediaByMid(state.parsedCurrentRemoteSdp, em.mid) : null;
+        var _recvRids = SDP.remoteSendSimulcastRids(_remSec);
+        if (_recvRids) spec.recvRids = _recvRids;
         mediaSections.push(spec);
         if (em.extensions) {
           for (var ex = 0; ex < em.extensions.length; ex++) {
@@ -424,10 +562,7 @@ function buildOffer(state, options) {
         // retired, and it was what let two sections claim one mid: the
         // recycled transceiver brought the slot's mid with it while its own
         // section was emitted later with the same value.
-        var _slotMid = String(RtpManager.getNextMid(state));
-        while (existingMids[_slotMid]) {
-          _slotMid = String(parseInt(_slotMid, 10) + 1);
-        }
+        var _slotMid = _freshMid(state, existingMids);
         var _oldMid = recycle.mid;
         if (String(_oldMid) !== _slotMid) {
           RtpManager.rebindMid(state, recycle, _slotMid);
@@ -440,7 +575,7 @@ function buildOffer(state, options) {
         // side has no extension-ID/codec-PT churn across the recycle —
         // Chrome rejects extmap reassignment.
         if (em.extensions && em.extensions.length) rspec.extensions = em.extensions;
-        if (em.codecs     && em.codecs.length)     rspec.codecs     = em.codecs;
+        rspec.codecs = reconcileOfferCodecs(recycle, rspec.codecs, em.codecs);
         mediaSections.push(rspec);
         if (em.extensions) {
           for (var ex2 = 0; ex2 < em.extensions.length; ex2++) {
@@ -466,17 +601,6 @@ function buildOffer(state, options) {
           }
         }
       }
-    }
-  } else {
-    // First offer: if there are DCs, allocate an m=application slot
-    // with a mid that doesn't collide with any transceiver's mid.
-    if (state.dataChannels.length > 0) {
-      var dcMid = String(RtpManager.getNextMid(state));
-      mediaSections.push({
-        type: 'application', mid: dcMid,
-        sctpPort: state.sctpPort, maxMessageSize: state.maxMessageSize,
-      });
-      existingMids[dcMid] = true;
     }
   }
 
@@ -529,6 +653,39 @@ function buildOffer(state, options) {
       }
       mediaSections.push(newSpec);
     }
+  }
+
+  // DATA CHANNELS NEED AN m=application (JSEP 5.2.1/5.2.2). On the first
+  // offer it is allocated here; on a RENEGOTIATION too, when the session so
+  // far had none (a media-only call that later calls createDataChannel), or
+  // only a rejected one. This used to run for the first offer only, so a
+  // channel created after a media-only negotiation never got a section: the
+  // SCTP association never started, the channel stayed 'connecting', and
+  // negotiationneeded fired on every round.
+  //
+  // The mid is fresh: it must not collide with any section placed above nor
+  // with a transceiver's mid.
+  //
+  // AFTER the new transceivers' sections: JSEP 5.2.1 builds the transceivers'
+  // m-sections first, in the order they were added, and "lastly, if a data
+  // channel has been created, an m= section MUST be generated for data";
+  // 5.2.2 appends new sections at the end the same way. This block used to
+  // run before the transceiver loop, so every first offer with a data
+  // channel put m=application first (application,video,audio — Chrome
+  // offers video,audio,application for the same calls, wherever
+  // createDataChannel came among them), and a renegotiation adding a channel
+  // and a track put it before the new track. Besides differing from Chrome,
+  // that made the application section the BUNDLE tag — the section that
+  // owns the transport — so stopping the first media section moved nothing
+  // on our side while it does in a Chrome-built session.
+  if (!hasLiveApplication && state.dataChannels.length > 0) {
+    var dcMid = _freshMid(state, existingMids);
+    mediaSections.push({
+      type: 'application', mid: dcMid,
+      sctpPort: state.sctpPort, maxMessageSize: state.maxMessageSize,
+    });
+    existingMids[dcMid] = true;
+    hasLiveApplication = true;
   }
 
   // RFC 3264 §8: bump o= session version on every generated description.
@@ -653,6 +810,8 @@ function buildAnswer(state, options) {
     directions:      directions,
     cname:           state.localCname,
     candidates:      options.liteCandidates,
+    maxMessageSize:  state.maxMessageSize,
+    sctpPort:        state.sctpPort,
     // Same rule as buildOffer — see comment there.
     endOfCandidates: (state.mode === 'lite') ||
                      (state.iceGatheringState === 'complete' &&

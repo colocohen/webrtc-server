@@ -44,7 +44,10 @@ var PARAM_FORWARD_TSN         = 0xC000;
 // RECONFIG parameter types — RFC 6525 §3.1, §4.1
 var PARAM_OUTGOING_SSN_RESET   = 0x000D;
 var PARAM_INCOMING_SSN_RESET   = 0x000E;
+var PARAM_SSN_TSN_RESET        = 0x000F;
 var PARAM_RECONFIG_RESPONSE    = 0x0010;
+var PARAM_ADD_OUT_STREAMS      = 0x0011;
+var PARAM_ADD_IN_STREAMS       = 0x0012;
 
 // RECONFIG response result codes — RFC 6525 §4.4
 var RECONFIG_RESULT_SUCCESS_NOTHING_TO_DO = 0;
@@ -81,6 +84,7 @@ var COOKIE_MAC_LEN            = 32;
 var EXT_FORWARD_TSN           = 1;
 var EXT_RECONFIG              = 2;
 var EXT_I_DATA                = 4;
+var EXT_I_FORWARD_TSN         = 8;
 
 var STATE_CLOSED              = 0;
 var STATE_COOKIE_WAIT         = 1;
@@ -145,6 +149,13 @@ var RTO_MIN_MS          = 400;
 var RTO_MAX_MS          = 60000;
 var ASSOC_MAX_RETRANS   = 10;
 var FAST_RETRANSMIT_THRESHOLD = 3;        // RFC 4960 §7.2.4
+// The least time past the round trip a chunk may arrive before its miss
+// reports may resend it (see lossTimeThreshold; a quarter of the least RTT
+// when that is more): reordering on the path.
+var REORDER_WINDOW_MS = 5;
+// The least a chunk costs the peer's receive window (see creditOutstanding):
+// what usrsctp, and our own receiver, store per chunk beyond its payload.
+var PEER_CHUNK_COST = 256;
 // Max.Burst (RFC 9260 §16, §6.1): packets sent at once, in answer to a SACK
 // or a send. A whole window in one go — a hundred datagrams on a fast link —
 // overruns the receiver's socket buffer (Chrome's, on loopback: hundreds of
@@ -152,6 +163,20 @@ var FAST_RETRANSMIT_THRESHOLD = 3;        // RFC 4960 §7.2.4
 var MAX_BURST = 4;
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HEARTBEAT_MAX_RETRANS = 5;
+
+// What receive-side storage costs in memory, measured on Node 26 (heap +
+// external after GC, design R3.1): a stored fragment is its payload plus the
+// Map entry, object and unpooled copy; a partially received I-DATA message
+// also has its completion-hint entry; a complete message waiting (for its
+// predecessor, or for its delivery task) is its payload plus its record.
+var RX_FRAG_CHARGE    = 256;
+var RX_PARTIAL_CHARGE = 320;
+var RX_MSG_CHARGE     = 208;
+// One full chunk: its payload at PMTU 1200 (I-DATA), and what storing it costs.
+// The advertised window is in payload bytes, converted at this rate, so a
+// sender counting payload fills the window exactly.
+var RX_FULL_PAYLOAD   = 1172;
+var RX_FULL_CHARGE    = RX_FULL_PAYLOAD + RX_FRAG_CHARGE;
 
 /* ─── SCTP-3: PMTU fragmentation constants ───
  *
@@ -183,12 +208,11 @@ var DATA_CHUNK_OVERHEAD      = 16;   // chunk header (4) + DATA metadata (12)
 var I_DATA_CHUNK_OVERHEAD    = 20;   // chunk header (4) + I-DATA metadata (16)
 var DEFAULT_MAX_MESSAGE_SIZE = 262144;
 
-// SCTP-8: receive-window accounting. We advertise a dynamic a_rwnd equal
-// to (maxReceiveBufferSize − bytes currently held in reassembly/reorder),
-// matching pion's getMyReceiverWindowCredit() and usrsctp/Linux. 1 MB is
-// pion's default and lifts the receive-direction throughput ceiling far
-// above the old fixed 64 KB (which capped browser→server to ~64KB/RTT —
-// crippling on high-RTT/TURN paths). Overridable via config.maxReceiveBufferSize.
+// SCTP-8: the receive window, in payload bytes, on top of the room one
+// maximum-size message needs (see rxWindow). 1 MB is pion's default and lifts
+// the receive-direction throughput ceiling far above the old fixed 64 KB
+// (which capped browser→server to ~64KB/RTT — crippling on high-RTT/TURN
+// paths). Overridable via config.maxReceiveBufferSize.
 var DEFAULT_MAX_RECEIVE_BUFFER = 1024 * 1024;
 
 
@@ -291,14 +315,20 @@ function SctpAssociation(config) {
   var maxInitRetransmits      = config.maxInitRetransmits      || 8;
   var assocMaxRetrans         = config.assocMaxRetrans         || ASSOC_MAX_RETRANS;
   var fastRetransmitThreshold = config.fastRetransmitThreshold || FAST_RETRANSMIT_THRESHOLD;
+  var reorderWindowMs         = config.reorderWindowMs !== undefined ? config.reorderWindowMs : REORDER_WINDOW_MS;
   var maxBurst                = config.maxBurst                || MAX_BURST;
   var heartbeatIntervalMs     = config.heartbeatIntervalMs     || HEARTBEAT_INTERVAL_MS;
   var heartbeatMaxRetrans     = config.heartbeatMaxRetrans     || HEARTBEAT_MAX_RETRANS;
 
-  // SCTP-3: per-instance PMTU + maxMessageSize. PMTU governs fragmentation
-  // on send; maxMessageSize is the hard upper bound on user payload size.
+  // SCTP-3: per-instance PMTU + message size limits. PMTU governs
+  // fragmentation on send. maxMessageSize bounds what send() accepts (the
+  // smaller of the peer's limit and ours); maxRecvMessageSize bounds what we
+  // accept from the peer, the a=max-message-size our own SDP advertises
+  // (RFC 8841 §6). A peer that sends past it breaks the protocol, and the
+  // association ends with ABORT cause 13.
   var pmtu                    = config.pmtu                    || DEFAULT_PMTU;
   var maxMessageSize          = config.maxMessageSize          || DEFAULT_MAX_MESSAGE_SIZE;
+  var maxRecvMessageSize      = config.maxRecvMessageSize      || maxMessageSize;
 
   // SCTP-8: receive buffer size that backs the advertised a_rwnd. See
   // myReceiverWindowCredit(). Matches pion's Config.MaxReceiveBufferSize.
@@ -336,6 +366,9 @@ function SctpAssociation(config) {
   if (fastRetransmitThreshold < 1) {
     throw new RangeError('SctpAssociation: fastRetransmitThreshold must be >= 1');
   }
+  if (typeof reorderWindowMs !== 'number' || !(reorderWindowMs >= 0 && reorderWindowMs <= 1000)) {
+    throw new RangeError('SctpAssociation: reorderWindowMs must be a number of ms in [0, 1000]');
+  }
   if (heartbeatMaxRetrans < 1) {
     throw new RangeError('SctpAssociation: heartbeatMaxRetrans must be >= 1');
   }
@@ -351,6 +384,9 @@ function SctpAssociation(config) {
   }
   if (maxMessageSize < 1) {
     throw new RangeError('SctpAssociation: maxMessageSize must be >= 1');
+  }
+  if (maxRecvMessageSize < 1) {
+    throw new RangeError('SctpAssociation: maxRecvMessageSize must be >= 1');
   }
   // pion + RFC 4960: the advertised receive window must be at least one
   // MTU (pion enforces a_rwnd >= 1500). A tiny buffer would stall the
@@ -420,48 +456,49 @@ function SctpAssociation(config) {
   // Per-stream ordered-delivery hold buffer. Maps streamId → Map<ssn, msg>
   // where msg is { ppid, payload }. When a complete message assembles with
   // an SSN above what we're waiting for (recvSSN[streamId]), we hold it
-  // here until the gap fills. Capped per stream to defend against held-
-  // back-forever streams (peer-bug or attack).
+  // here until the gap fills. Bounded by the receive rule, like every store.
   var pendingMsgs = {};
-  var MAX_PENDING_MSGS_PER_STREAM = 1000;
-  // SCTP-11 N4: max fragment-store entries per stream. Defends against
-  // BEGIN-only floods that fill memory.
+
+  // rxHeld: the memory the receive side holds, in RX_*_CHARGE terms, kept
+  // by the stores themselves: the per-stream maps of fragStore, iDataHint
+  // and pendingMsgs are rxMaps, which charge on set and release on delete
+  // and clear, and the delivery queue charges on push and releases on take.
+  // The receive rule (admitChunk) bounds it, and the advertised window is
+  // what is left of rxWindow (myReceiverWindowCredit).
   //
-  // SCTP-14: the old value (256) was sized for ONE max-size DataChannel
-  // message in flight per stream — 262144B at ~1180B/fragment is ~222
-  // fragments, "so this cap never affects legit flows". Interleaving breaks
-  // that assumption: under RFC 8260 several messages on the same stream are
-  // partially reassembled AT THE SAME TIME, and they all live in this one
-  // store. Two 200KB messages interleaved on one stream overflow it, the
-  // eviction drops the oldest fragment, and BOTH messages become
-  // unassemblable — a silent stall that looks exactly like "nothing
-  // arrives".
-  //
-  // The real bound on this buffer is byte-based and already enforced:
-  // myReceiverWindowCredit() advertises (maxReceiveBufferSize − held), so
-  // the peer's window closes before memory runs away. This count cap is a
-  // secondary guard, so it is sized for the worst legitimate case —
-  // maxReceiveBufferSize entirely full of minimum-size fragments — and
-  // clamped to a sane range.
-  // Sizing must admit BOTH legitimate worst cases at once:
-  //   (a) buffer-bound: maxReceiveBufferSize of minimum-size fragments;
-  //   (b) message-bound: ONE maxMessageSize message, whose fragment count is
-  //       message bytes over the smallest real fragment payload. This can
-  //       EXCEED (a): the peer's a_rwnd check admits a fragment while the
-  //       buffer is merely not-yet-full, so a 1MB message against a 1MB
-  //       buffer needs ~907 slots while (a) alone allows only ~889 — and the
-  //       silent oldest-first eviction then discards fragments of a message
-  //       that is still assembling. Audit finding: a single maxMessageSize
-  //       transfer completed on the wire (fully SACKed) yet never delivered,
-  //       with the receiver pinning the remainder in fragStore forever.
-  // The true byte-bound remains the advertised-rwnd flow control; this count
-  // cap is a secondary DoS guard and must never bind before flow control.
-  var _minFragPayload = Math.max(1, pmtu - SCTP_HEADER_OVERHEAD - I_DATA_CHUNK_OVERHEAD);
-  var MAX_FRAGS_PER_STREAM = (config.maxFragsPerStream != null)
-    ? config.maxFragsPerStream
-    : Math.max(256,
-               Math.ceil(maxReceiveBufferSize / 1180),
-               Math.ceil(maxMessageSize / _minFragPayload) + 8);
+  // rxWindow, the budget, holds one maximum-size message (rxLane, below)
+  // plus maxReceiveBufferSize of payload in full-chunk charges. rxLane is
+  // the room past it for the chunk at cum + 1 only: the one chunk that moves
+  // the front, so a partial message beyond the window still completes.
+  // Design R3.2: a sender keeping more than one maximum-size message
+  // partially sent beyond the window is outside what a receiver can promise,
+  // and is aborted (dcsctp does the same).
+  var rxHeld = 0;
+  var rxLane = Math.ceil(maxRecvMessageSize / RX_FULL_PAYLOAD) * RX_FRAG_CHARGE +
+               maxRecvMessageSize + RX_PARTIAL_CHARGE + RX_FULL_CHARGE;
+  var rxWindow = rxLane + Math.ceil(maxReceiveBufferSize * RX_FULL_CHARGE / RX_FULL_PAYLOAD);
+  function rxMap(charge) {
+    var m = new Map();
+    var mHas = Map.prototype.has, mGet = Map.prototype.get;
+    m.set = function (k, v) {
+      if (mHas.call(m, k)) rxHeld -= charge(mGet.call(m, k));
+      rxHeld += charge(v);
+      return Map.prototype.set.call(m, k, v);
+    };
+    m.delete = function (k) {
+      if (!mHas.call(m, k)) return false;
+      rxHeld -= charge(mGet.call(m, k));
+      return Map.prototype.delete.call(m, k);
+    };
+    m.clear = function () {
+      m.forEach(function (v) { rxHeld -= charge(v); });
+      Map.prototype.clear.call(m);
+    };
+    return m;
+  }
+  function fragCharge(f) { return f.payload.length + RX_FRAG_CHARGE; }
+  function partialCharge() { return RX_PARTIAL_CHARGE; }
+  function msgCharge(m) { return m.payload.length + RX_MSG_CHARGE; }
 
   // Receive tracking
   var lastCumulativeTsn = 0;  // highest contiguous TSN we've acked
@@ -497,7 +534,8 @@ function SctpAssociation(config) {
    *                   declared dead and the association tears down.
    *   missingReports  count of SACKs that reported this TSN as missing
    *                   (i.e., a higher TSN was acked but this one wasn't).
-   *                   At >= 3 we fast-retransmit per RFC 9260 §7.2.4
+   *                   At >= 3, and once out longer than lossTimeThreshold,
+   *                   we fast-retransmit per RFC 9260 §7.2.4
    *                   (counted as markMissing says: HTNA, retxFence).
    *   retxFence       fast-retransmitted: the highest TSN sent at the time.
    *                   Reports count again only once something above it is
@@ -506,32 +544,50 @@ function SctpAssociation(config) {
    * Queue invariants:
    *   - Strictly TSN-ordered: sendData appends with the next-monotonic TSN.
    *     Wraparound is fine because we use tsnLeq for comparisons.
-   *   - Each entry is either inFlight=true (transmitted, awaiting SACK) or
-   *     inFlight=false (rwnd/cwnd-deferred — see SCTP-8/9). Pendings always
-   *     follow inFlights in queue order; transmitPending() never reorders.
+   *   - Sent chunks (everSent) form a prefix, followed by chunks never sent
+   *     (rwnd/cwnd-deferred — see SCTP-8/9); see sentCount below.
    */
   var sendQueue = [];
 
   /* SCTP-8: rwnd enforcement state.
    *
-   * outstandingBytes — running sum of payloadLen across sendQueue entries
-   * with inFlight=true. Compared against remoteRwnd before transmitting
-   * a new chunk. When SACK arrives and chunks drain, this drops; if
-   * pending entries are sitting in sendQueue with inFlight=false, they
-   * become eligible to transmit.
+   * outstandingBytes — the flight in wire bytes: the serialized chunks
+   * (header and padding included) of entries in flight and not gap-acked.
+   * cwnd is measured against it (RFC 9260 §7.2: flightsize counts DATA
+   * chunks). Counting payload alone let a sender of 1-byte messages put
+   * twenty times its cwnd on the wire and overflow the bottleneck queue.
    *
-   * inFlightCount — count of sendQueue entries with inFlight=true. Used
-   * to drive T3 lifecycle (timer covers the oldest in-flight, not the
-   * oldest queued). When inFlightCount → 0 we clear T3 even if pending
-   * entries remain (no point timing-out a chunk we never sent).
+   * creditOutstanding — the same chunks at their cost to the peer's window:
+   * each at least PEER_CHUNK_COST. A receiver stores every chunk with a
+   * fixed overhead on top of its payload (usrsctp and this file: ~256
+   * bytes), so a flight of tiny chunks fills its memory long before their
+   * payload reaches the a_rwnd it advertised; it then drops what does not
+   * fit, and we send it again. Full chunks cost their size, so bulk is not
+   * held back. Compared against remoteRwnd (RFC 9260 §6.1 B).
    *
-   * Queue layout invariant: sendQueue is FIFO. The prefix is in-flight
-   * (inFlight=true) chunks; any pending (inFlight=false) suffix follows
-   * in order. transmitPending() always promotes the front of the pending
-   * suffix, never re-orders.
+   * inFlightCount — count of sendQueue entries with inFlight=true,
+   * gap-acked ones included.
    */
   var outstandingBytes = 0;
+  var creditOutstanding = 0;
   var inFlightCount    = 0;
+  function flightAdd(e) { outstandingBytes += e.wireLen; creditOutstanding += e.creditLen; }
+  function flightSub(e) { outstandingBytes -= e.wireLen; creditOutstanding -= e.creditLen; }
+  // Every queued chunk sent at least once (everSent) comes before every
+  // chunk never sent: new data goes out in queue order, and removals keep
+  // the order. sentCount is that prefix. Inside it each chunk is in the
+  // flight (inFlight, possibly gap-acked) or waits to be sent again
+  // (needsRetx, retxCount of them); never both. In-flight chunks are not a
+  // prefix: a T3 expiry takes the unacknowledged ones out of the flight and
+  // leaves the gap-acked ones in it (RFC 9260 §6.3.3 E3).
+  var sentCount = 0;
+  var retxCount = 0;
+  var highestTsnSent = null;   // highest DATA TSN ever sent; bounds a valid SACK
+  var sackCumSeen = null;      // highest cumulative TSN ack accepted (RFC 9260 §6.2.1 D)
+  // RFC 9260 §8.1: consecutive T3 expiries without the peer acknowledging
+  // anything new. Fast retransmits are not errors: the SACKs that cause
+  // them prove the peer is alive.
+  var assocErrorCount = 0;
   // Whether any message of this association was ever sent with a maxLifetime.
   // Until one is, no queued chunk can carry one, and handleSack's lifetime
   // sweep (a walk of the whole sendQueue on every SACK) has nothing to find.
@@ -580,6 +636,8 @@ function SctpAssociation(config) {
   // (SRTT=R, RTTVAR=R/2) and updated exponentially (α=1/8, β=1/4).
   var srtt   = null;
   var rttvar = null;
+  var minRtt = null;    // the least RTT seen, from any sample (lossTimeThreshold)
+  var ackRtt = null;    // the RTT the last SACK with gap blocks measured (lossTimeThreshold)
   var rto    = rtoInitialMs;
 
   // T3-rtx timer — one per association. Started when sendQueue becomes
@@ -608,6 +666,12 @@ function SctpAssociation(config) {
     chunksAbandoned:            0,   // SCTP-6: chunks dropped due to PR-SCTP limits
     chunksBundled:              0,   // SCTP-13: DATA chunks packed into multi-chunk packets
     bundledPackets:             0,   // SCTP-13: packets that carried >1 chunk
+    sacksDiscarded:             0,   // stale (cum below one seen) or impossible (acks a TSN never sent)
+    dupTsnsReported:            0,
+    repliesBundled:             0,   // P11: SACK (and other replies) sent inside a DATA packet   // TSNs the peer got twice (its SACKs' duplicate list): mostly resent needlessly
+    rxLane:                     0,   // chunks at cum + 1 taken past the receive window
+    rxDropped: { far: 0, zero: 0, window: 0, waiting: 0 },   // chunks left unmarked, by reason (admitChunk)
+    txHeldBy: { cwnd: 0, rwnd: 0 },   // transmit passes stopped by each window
   };
 
   // SCTP-13: set while a coalesced transmit pass is queued on the microtask
@@ -764,12 +828,18 @@ function SctpAssociation(config) {
   // report whether interleaving was negotiated, as Pion does through
   // getStats().
   var peerSupportsIData = false;
+  // The peer lists I-FORWARD-TSN (RFC 8260 §2.3.1). With I-DATA, partial
+  // reliability needs it: a classic FORWARD-TSN cannot name MIDs.
+  var peerSupportsIForwardTsn = false;
   var nextMessageSeq         = 0;
   var lastForwardTsnSent;     // undefined until first FORWARD-TSN sent
   var lastForwardTsnSentAt = 0;   // when it was sent — see handleSack's re-send
-  // SCTP-6: highest abandoned SSN per ordered stream since last FORWARD-TSN.
-  // Cleared after each emit. Pairs added to FORWARD-TSN body so peer can
-  // advance recvSSN past abandoned ordered messages without waiting.
+  // SCTP-6: abandoned ordered messages per stream, for the FORWARD-TSN body's
+  // stream/SSN pairs (so the peer advances recvSSN past them without
+  // waiting): streamId → [{ ssn, lo, hi }], lo/hi the message's lowest and
+  // highest abandoned TSN. Kept until the peer's cumulative ack passes hi,
+  // like abandonedMidPerStream: a FORWARD-TSN sent again (its first was
+  // lost) must carry the pairs again, or the peer's stream stays stuck.
   var abandonedSSNPerStream  = {};
   // SCTP-14: I-FORWARD-TSN skip tracker — streamId+('o'|'u') → highest
   // abandoned 32-bit MID in that stream's ordered/unordered space.
@@ -779,33 +849,46 @@ function SctpAssociation(config) {
    *
    * peerSupportsReconfig — set during INIT/INIT-ACK when peer advertises
    * RECONFIG (chunk type 130) in PARAM_SUPPORTED_EXTENSIONS. Without it,
-   * resetStreams() is a no-op (we mark our local state but the peer keeps
-   * the streams open from its side).
+   * resetStreams() reports 'peer-no-reconfig' and the upper layer closes
+   * locally only.
    *
-   * reconfigReqSeq — 32-bit monotonic counter for OUR outgoing requests.
-   * Each RECONFIG we send carries this in the param's "Reconfig Request
-   * Sequence Number"; peer echoes it back in the response.
+   * reconfigReqSeq — the Re-configuration Request Sequence Number our next
+   * request takes. RFC 6525 §4.1: the first one is our INITIAL TSN, then +1
+   * per request. It used to start at 0, and every conforming peer (Chrome's
+   * dcSCTP, usrsctp) answered each of our resets with "Bad Sequence Number":
+   * our side closed, theirs never did. Re-seeded from the cookie in
+   * handleCookieEcho, where localTsn is restored.
    *
-   * lastReconfigPeerReqSeen — peer's request seq from the last incoming
-   * RECONFIG we accepted. Used for dup detection (RFC 6525 §5.2.1: if we
-   * receive a duplicate request, repeat the previous response).
+   * lastReconfigPeerReqSeen — the peer's last request sequence number we
+   * accepted. Seeded at the handshake to the peer's initial TSN - 1, so its
+   * first request (= its initial TSN) is "last + 1" (RFC 6525 §5.2.1). Also
+   * what our requests carry as Re-configuration Response Sequence Number
+   * ("the next expected request sequence number of the peer minus 1",
+   * §5.1.2 A4).
    *
-   * lastReconfigResponseResult — cache of our
-   * most recent response so we can replay it on dup.
+   * lastReconfigResponseResult — our CURRENT answer to that request, sent
+   * again when the peer retransmits it. For a deferred reset it moves from
+   * "In progress" to "Performed" once the reset is done, so a retransmitted
+   * request learns the outcome (it used to replay "In progress" forever).
+   * undefined until the first request.
    *
-   * pendingResetRequests — Map<reqSeq, { streamIds, callback, attempts }>
-   * tracks outgoing requests awaiting a response from peer. We don't
-   * actively retransmit reset requests — they ride on top of SCTP's
-   * reliable channel (RECONFIG is sent in DATA chunks? no, control chunks
-   * — but they go through sendChunk which doesn't retransmit). For now
-   * the upper layer can re-call resetStreams if no response arrives in
-   * a reasonable timeout. SCTP-9 / SCTP-13 may revisit.
+   * deferredPeerReset — an incoming Outgoing SSN Reset Request whose
+   * Sender's Last Assigned TSN was above our cumulative ack (RFC 6525 §5.2.2
+   * E2): { reqSeq, lastTsn, streams }. Performed by _performDeferredReset
+   * when the cumulative ack reaches lastTsn. It used to get "In progress"
+   * once and then be forgotten — the peer's channel stayed 'closing'.
+   *
+   * Our own requests: reconfigOut is the one request in flight (RFC 6525
+   * §5.1.1: "there MUST NOT be more than one request in flight"), the rest
+   * wait in reconfigQueue. See resetStreams.
    */
   var peerSupportsReconfig         = false;
-  var reconfigReqSeq               = 0;
-  var lastReconfigPeerReqSeen;     // undefined until first peer request seen — both as dup-key and replay trigger
-  var lastReconfigResponseResult;  // cached result code for dup replay
-  var pendingResetRequests         = new Map();
+  var reconfigReqSeq               = localTsn;
+  var lastReconfigPeerReqSeen;     // peer's last accepted request seq (seeded at the handshake)
+  var lastReconfigResponseResult;  // our current answer to it, replayed on a retransmission
+  var deferredPeerReset            = null;
+  var reconfigOut                  = null;   // { reqSeq, users: [{ streamIds, callback }], streamIds, body, timer, timeout, inProgress }
+  var reconfigQueue                = [];     // requests released (stream drained), waiting for reconfigOut
 
   // Receive-side TSN tracking — RFC 4960 §6.7.
   //
@@ -862,7 +945,7 @@ function SctpAssociation(config) {
     if (!Buffer.isBuffer(buf)) {
       throw new TypeError('SctpAssociation.handlePacket: buf must be a Buffer');
     }
-    if (closed) return;
+    if (closed || closeAfterDelivery) return;
     if (buf.length < 12) {
       try { ev.emit('protocolViolation', { code: 'short-packet', length: buf.length }); } catch (e) {}
       return;
@@ -938,29 +1021,38 @@ function SctpAssociation(config) {
         offset += chunkLen;
         if (offset % 4 !== 0) offset += 4 - (offset % 4);
       }
+      // A peer stream reset deferred until our cumulative ack reached its
+      // last TSN (RFC 6525 §5.2.2): checked once the whole packet is in, so
+      // the DATA that completed it has been handed up ahead of the reset.
+      if (deferredPeerReset) _performDeferredReset();
     } finally {
-      packetDepth--;
-      if (packetDepth === 0) {
+      if (packetDepth === 1) {
         // SCTP-2: decide whether to SACK now or defer per RFC 4960 §6.2.
         //   - SACK every-other packet (sackUnackedPackets >= 1 means this
         //     is the second one — emit).
         //   - SACK immediately on dup or gap.
         //   - delayedAckMs <= 0 disables deferral (every packet SACKs).
         //   - Otherwise defer with a 200ms timer.
+        // Still inside the packet: the SACK is queued with the other
+        // replies, and may ride in this pass's first DATA packet.
         if (sackPendingThisPacket) {
           sackPendingThisPacket = false;
           sackUnackedPackets++;
           if (sackImmediateRequired ||
               sackUnackedPackets >= 2 ||
-              delayedAckMs <= 0) {
+              delayedAckMs <= 0 ||
+              heldData.length > 0) {   // DATA leaves now: the SACK rides in it
             sackImmediateRequired = false;
             sendSackAndReset();
           } else {
             scheduleDelayedSack();
           }
+        } else if (heldData.length > 0 && delayedSackTimer) {
+          sendSackAndReset();   // owed by an earlier packet, and DATA leaves now
         }
-        flushOutChunks();
       }
+      packetDepth--;
+      if (packetDepth === 0) flushPacketOutput();
       curPacket = null;
     }
 
@@ -1027,15 +1119,25 @@ function SctpAssociation(config) {
       handleCookieEcho(data);
     } else if (type === CHUNK_COOKIE_ACK) {
       handleCookieAck();
-    } else if (type === CHUNK_I_DATA) {
-      // RECEIVE-ONLY for now: we parse and reassemble interleaved messages a
-      // peer sends us, but do not advertise the extension and never send
-      // I-DATA ourselves. A peer only uses I-DATA when BOTH sides negotiated
-      // it (RFC 8260 3.1), so nothing reaches this path unless a future
-      // change starts advertising — at which point receive is already proven.
-      handleIData(flags, data);
-    } else if (type === CHUNK_DATA) {
-      handleData(flags, data);
+    } else if (type === CHUNK_I_DATA || type === CHUNK_DATA ||
+               type === CHUNK_FORWARD_TSN || type === CHUNK_I_FORWARD_TSN) {
+      // RFC 8260 §2.1 and §2.3.1: once the format is negotiated, the other
+      // one is a protocol violation, and the receiver MUST abort. I-FORWARD-TSN
+      // is the skip of an I-DATA association even when the peer did not list
+      // it: our own 0.x releases send it so, and it only frees what the peer
+      // has abandoned.
+      var interleaved = type === CHUNK_I_DATA || type === CHUNK_I_FORWARD_TSN;
+      if (state >= STATE_ESTABLISHED && interleaved !== peerSupportsIData) {
+        abortProtocolViolation({ code: 'wrong-chunk-format', chunkType: type });
+      } else if (type === CHUNK_I_DATA) {
+        handleIData(flags, data);
+      } else if (type === CHUNK_DATA) {
+        handleData(flags, data);
+      } else if (type === CHUNK_FORWARD_TSN) {
+        handleForwardTsn(data);
+      } else {
+        handleIForwardTsn(data);            // SCTP-14 / RFC 8260 §2.3.1
+      }
     } else if (type === CHUNK_SACK) {
       handleSack(data);
     } else if (type === CHUNK_HEARTBEAT) {
@@ -1048,10 +1150,6 @@ function SctpAssociation(config) {
       handleShutdownAck();
     } else if (type === CHUNK_SHUTDOWN_COMPLETE) {
       handleShutdownComplete();
-    } else if (type === CHUNK_FORWARD_TSN) {
-      handleForwardTsn(data);
-    } else if (type === CHUNK_I_FORWARD_TSN) {
-      handleIForwardTsn(data);              // SCTP-14 / RFC 8260 §2.3.1
     } else if (type === CHUNK_RECONFIG) {
       handleReconfig(data);                 // SCTP-7
     } else if (type === CHUNK_ABORT) {
@@ -1120,6 +1218,7 @@ function SctpAssociation(config) {
     remoteVerificationTag = initiateTag;
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
+    lastReconfigPeerReqSeen = lastCumulativeTsn;   // RFC 6525 §4.1: peer's first request = its initial TSN
     remoteRwnd = aRwnd; ssthresh = aRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
 
     // SCTP-6: detect PR-SCTP support. Params start after the fixed 16-byte
@@ -1172,37 +1271,41 @@ function SctpAssociation(config) {
   }
 
   function sendInitAck(peerTag, myTag, myTsn, cookie) {
-    // Send INIT-ACK
-    var initAckBody = Buffer.alloc(20 + 4 + cookie.length);
-    initAckBody.writeUInt32BE(myTag, 0);
-    initAckBody.writeUInt32BE(maxReceiveBufferSize, 4);
-    initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
-    initAckBody.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
-    initAckBody.writeUInt32BE(myTsn, 12);
+    sendChunk(CHUNK_INIT_ACK, 0, initBody(myTag, myTsn, cookie), peerTag);
+  }
 
-    // Supported Extensions parameter (RFC 5061 §4.2.7).
-    // Format: type(2) + length(2) + chunk-type-bytes(N).
-    // We list two: FORWARD-TSN (PR-SCTP, RFC 3758) and RECONFIG (stream
-    // reset, RFC 6525). length = 4 (header) + 2 (bytes) = 6; padded to
-    // 4-byte boundary so the next param starts aligned.
-    initAckBody.writeUInt16BE(PARAM_SUPPORTED_EXTENSIONS, 16);
-    initAckBody.writeUInt16BE(7, 18);
-    initAckBody[20] = CHUNK_FORWARD_TSN;
-    initAckBody[21] = CHUNK_RECONFIG;
-    initAckBody[22] = CHUNK_I_DATA;   // RFC 8260 — see the note on INIT
-    // bytes 22-23: padding (Buffer.alloc gives zeros)
-
-    // Pad supported extensions to 4 bytes
-    var padded = Buffer.alloc(24 + 4 + cookie.length);
-    initAckBody.copy(padded, 0, 0, 22);
-
-    // State Cookie parameter
-    var cookieParamOff = 24;
-    padded.writeUInt16BE(PARAM_STATE_COOKIE, cookieParamOff);
-    padded.writeUInt16BE(4 + cookie.length, cookieParamOff + 2);
-    cookie.copy(padded, cookieParamOff + 4);
-
-    sendChunk(CHUNK_INIT_ACK, 0, padded, peerTag);
+  // The body of our INIT and INIT ACK (RFC 9260 §3.3.2-3): one builder, so
+  // both list the same extensions. They used to be written separately, and
+  // the INIT ACK's copy dropped I-DATA: a peer that read only our INIT ACK
+  // (Firefox) chose DATA while we sent it I-DATA.
+  //
+  // We list every extension we support, so an extension is in use exactly
+  // when the peer lists it too (see usesIData / prNegotiated):
+  //   Supported Extensions (RFC 5061 §4.2.7): FORWARD-TSN, RECONFIG (RFC
+  //   6525), I-DATA and I-FORWARD-TSN (RFC 8260);
+  //   Forward-TSN-Supported (RFC 3758 §3.3.1), the older way to offer PR-SCTP.
+  function initBody(myTag, myTsn, cookie) {
+    var len = 16 + 12 + (cookie ? 4 + cookie.length : 0);
+    var body = Buffer.alloc((len + 3) & ~3);
+    body.writeUInt32BE(myTag, 0);
+    body.writeUInt32BE(myReceiverWindowCredit(), 4);
+    body.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
+    body.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
+    body.writeUInt32BE(myTsn, 12);
+    body.writeUInt16BE(PARAM_SUPPORTED_EXTENSIONS, 16);
+    body.writeUInt16BE(8, 18);
+    body[20] = CHUNK_FORWARD_TSN;
+    body[21] = CHUNK_RECONFIG;
+    body[22] = CHUNK_I_DATA;
+    body[23] = CHUNK_I_FORWARD_TSN;
+    body.writeUInt16BE(PARAM_FORWARD_TSN, 24);
+    body.writeUInt16BE(4, 26);
+    if (cookie) {
+      body.writeUInt16BE(PARAM_STATE_COOKIE, 28);
+      body.writeUInt16BE(4 + cookie.length, 30);
+      cookie.copy(body, 32);
+    }
+    return body;
   }
 
 
@@ -1218,6 +1321,7 @@ function SctpAssociation(config) {
 
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
+    lastReconfigPeerReqSeen = lastCumulativeTsn;   // RFC 6525 §4.1: peer's first request = its initial TSN
     remoteRwnd = aRwnd; ssthresh = aRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
 
     // SCTP-6: detect PR-SCTP support.
@@ -1322,6 +1426,10 @@ function SctpAssociation(config) {
     localTsn              = cookieData.readUInt32BE(8);
     remoteTsn             = cookieData.readUInt32BE(12);
     lastCumulativeTsn     = (remoteTsn - 1) >>> 0;
+    // RFC 6525 §4.1: both request sequence spaces start at the initial TSNs
+    // the cookie carries (ours may differ from the one at construction).
+    reconfigReqSeq          = localTsn;
+    lastReconfigPeerReqSeen = lastCumulativeTsn;
     remoteRwnd = cookieData.readUInt32BE(16); ssthresh = remoteRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
     // The peer's extensions, from the cookie: the association taking over a
     // restart never saw the INIT they came in (for the one that did, this
@@ -1433,6 +1541,8 @@ function SctpAssociation(config) {
     var isEnd       = !!(flags & DATA_FLAG_END);
     var isUnordered = !!(flags & DATA_FLAG_UNORDERED);
 
+    if (!admitChunk(tsn, streamId, payload.length, isBegin && isEnd, iMid, isUnordered)) return;
+
     // Record the TSN. This handles cumulative-ack advance (fix for B2,
     // including the out-of-order case the old code couldn't handle) and
     // duplicate detection (fix for B4 — duplicates no longer cause double
@@ -1476,14 +1586,6 @@ function SctpAssociation(config) {
     // mangled bytes when MIDDLE arrived before BEGIN). assembleClassic /
     // assembleInterleaved look for the complete BEGIN→END chain.
     //
-    // SCTP-11 N4: per-stream fragment-store cap. Without it a malicious
-    // peer could open a stream and send unlimited BEGIN-only fragments
-    // (no END), filling our memory. The global MAX_RECEIVED_TSNS cap
-    // implicitly bounds total receive memory but it doesn't stop a
-    // single attacker stream from monopolising buffer until that limit
-    // hits. We cap each stream at MAX_FRAGS_PER_STREAM entries; once
-    // exceeded we drop the OLDEST entry (lowest TSN) and the now-orphaned
-    // fragment becomes unrecoverable, but the association keeps running.
     // A whole message in one chunk (BEGIN+END) — the common case for
     // messaging. It completes nothing else (a chain cannot run through a
     // BEGIN), so it goes straight to delivery instead of through the store.
@@ -1492,26 +1594,17 @@ function SctpAssociation(config) {
     if (isBegin && isEnd) {
       deliverAssembled(streamId, {
         ssn: ssn, ppid: ppid, unordered: isUnordered,
-        payload: Buffer.from(payload),
+        payload: ownCopy(payload),
         wide: (typeof iMid === 'number'),
       });
       return;
     }
 
-    if (!fragStore[streamId]) fragStore[streamId] = new Map();
-    var streamFrags = fragStore[streamId];
-    if (streamFrags.size >= MAX_FRAGS_PER_STREAM) {
-      // Drop oldest. Map preserves insertion order; first key is oldest.
-      var oldestKey = streamFrags.keys().next().value;
-      var oldestFrag = streamFrags.get(oldestKey);
-      streamFrags.delete(oldestKey);
-      if (oldestFrag && oldestFrag.mid != null) hintForget(streamId, oldestFrag.mid, oldestFrag.isUnordered, oldestFrag.fsn);
-      try { ev.emit('protocolViolation', { code: 'fragstore-overflow', streamId: streamId }); } catch (e) {}
-    }
-    streamFrags.set(tsn, {
+    if (!fragStore[streamId]) fragStore[streamId] = rxMap(fragCharge);
+    fragStore[streamId].set(tsn, {
       ssn: ssn, ppid: ppid,
       isBegin: isBegin, isEnd: isEnd, isUnordered: isUnordered,
-      payload: Buffer.from(payload),
+      payload: ownCopy(payload),
       // Interleaving identity (RFC 8260). Null on classic DATA, where the
       // TSN run itself carries the ordering; set on I-DATA, where fragments
       // of one message are found by mid and ordered by fsn no matter what
@@ -1526,7 +1619,7 @@ function SctpAssociation(config) {
     var msg;
     if (typeof iMid === 'number') {
       var hk = isUnordered ? iMid + 4294967296 : iMid;
-      var hints = iDataHint[streamId] || (iDataHint[streamId] = new Map());
+      var hints = iDataHint[streamId] || (iDataHint[streamId] = rxMap(partialCharge));
       var h = hints.get(hk);
       if (!h) { h = { have: new Map(), end: -1 }; hints.set(hk, h); }
       h.have.set(iFsn, (h.have.get(iFsn) || 0) + 1);   // count: a peer may repeat an fsn
@@ -1538,6 +1631,74 @@ function SctpAssociation(config) {
       msg = assembleClassic(streamId, tsn);
     }
     if (msg) deliverAssembled(streamId, msg);
+  }
+
+  // The receive rule (design R3.2), decided before the chunk's TSN is
+  // marked. Returns true to take the chunk. A chunk dropped here stays
+  // unmarked: the SACK sent at once does not acknowledge it, and the peer
+  // sends it again. Nothing marked is ever dropped, so what we acknowledge
+  // is always delivered (or abandoned by the peer).
+  function admitChunk(tsn, streamId, len, whole, iMid, unordered) {
+    var off = (tsn - lastCumulativeTsn) >>> 0;
+    if (off === 0 || off >= 0x80000000 || tsnMarked(off)) return true;   // a duplicate: recordReceivedTsn reports it
+    var cost = len + (whole ? RX_MSG_CHARGE : RX_FRAG_CHARGE);
+    if (typeof iMid === 'number' && !whole) {
+      var hints = iDataHint[streamId];
+      if (!hints || !hints.has(unordered ? iMid + 4294967296 : iMid)) cost += RX_PARTIAL_CHARGE;
+    }
+    var next = off === 1;
+    var drop;
+    if (off > 65535) drop = 'far';                       // past what a SACK gap block can name
+    else if (_lastAdvertisedRwnd === 0 && !next && off > highestReceivedOffset()) drop = 'zero';   // RFC 9260 §6.2
+    else if (rxHeld + cost <= rxWindow) return true;
+    else if (next && rxHeld + cost <= rxWindow + rxLane) { sctpStats.rxLane++; return true; }
+    else if (next && _deliverHead < _deliverQueue.length) drop = 'waiting';   // the delivery task frees room by itself
+    else if (next) { abortOutOfResource(); return false; }
+    else drop = 'window';
+    sctpStats.rxDropped[drop]++;
+    sackPendingThisPacket = true;
+    sackImmediateRequired = true;
+    if (packetDepth === 0) sendSackAndReset();
+    return false;
+  }
+
+  // Is the TSN at this offset above cum already received?
+  function tsnMarked(off) {
+    for (var i = 0; i < receivedRanges.length; i += 2) {
+      if (off < receivedRanges[i]) return false;
+      if (off < receivedRanges[i + 1]) return true;
+    }
+    return false;
+  }
+  function highestReceivedOffset() {
+    return receivedRanges.length ? receivedRanges[receivedRanges.length - 1] - 1 : 0;
+  }
+
+  // The chunk at cum + 1 does not fit even past the window, and nothing
+  // waiting for delivery will free room: the peer keeps more partial
+  // messages beyond our window than we can hold. ABORT cause 4, Out of
+  // Resource (design R3.2 rule 7).
+  function abortOutOfResource() {
+    sctpStats.pathFailures++;
+    try { ev.emit('pathFailure', { source: 'resource', cause: 4 }); } catch (e) {}
+    sendAbort(4);
+    finalizeClose();
+  }
+
+  // A copy with its own memory. Buffer.from() takes small copies out of the
+  // shared 8 KiB pool, so one held fragment kept a whole pool slab alive,
+  // and a message's ArrayBuffer was the pool's.
+  function ownCopy(b) {
+    var c = Buffer.allocUnsafeSlow(b.length);
+    b.copy(c);
+    return c;
+  }
+  function ownConcat(parts) {
+    var n = 0;
+    for (var i = 0; i < parts.length; i++) n += parts[i].length;
+    var c = Buffer.allocUnsafeSlow(n);
+    for (var j = 0, o = 0; j < parts.length; j++) { parts[j].copy(c, o); o += parts[j].length; }
+    return c;
   }
 
   // Remove one fragment from the I-DATA hint (it left fragStore).
@@ -1566,8 +1727,9 @@ function SctpAssociation(config) {
    *   2. Walk gap blocks. Any chunk whose TSN sits in a gap (i.e., is
    *      below the highest-acked TSN but missing from the gap-block
    *      coverage) gets its missingReports counter bumped. At >= 3 we
-   *      fast-retransmit (RFC 9260 §7.2.4) — every such TSN, lowest
-   *      first, up to Max.Burst per SACK.
+   *      fast-retransmit (RFC 9260 §7.2.4) — every such TSN out longer
+   *      than lossTimeThreshold (the loss timer takes the others when it
+   *      passes), lowest first, up to Max.Burst per SACK.
    *   3. Manage T3 lifecycle. Empty queue → clear timer; otherwise
    *      restart (covering the new oldest chunk).
    *   4. If we're in SHUTDOWN_PENDING and the queue just drained,
@@ -1591,8 +1753,9 @@ function SctpAssociation(config) {
    * Done by difference, not by walking the window each SACK: gapCoverage
    * keeps the blocks of the previous SACK (absolute TSNs, merged, above its
    * cumTsn); a SACK visits only the TSNs that became covered (mark) or
-   * stopped being covered (a renege: back into the flight). Only chunks in
-   * flight are marked — a chunk sent again later is unmarked when sent.
+   * stopped being covered (a renege: back into the flight). Only chunks
+   * already sent are marked; one waiting to be sent again is marked too,
+   * which cancels the retry. A chunk sent again is unmarked when sent.
    */
   var gapCoverage = [];   // [[startTsn, endTsn], ...] covered by the last SACK's gap blocks
 
@@ -1657,10 +1820,28 @@ function SctpAssociation(config) {
     for (var k = a; k < sendQueue.length; k++) {
       var e = sendQueue[k];
       if (((e.tsn - cumTsn) >>> 0) > hi) break;
-      if (!e.inFlight || !!e.gapAcked === acked) continue;
-      e.gapAcked = acked;
-      outstandingBytes += acked ? -e.payloadLen : e.payloadLen;
-      if (acked && (sackHtna === null || tsnGt(e.tsn, sackHtna))) sackHtna = e.tsn;
+      if (!!e.gapAcked === acked) continue;
+      if (!acked) {
+        // A renege (RFC 9260 §6.2.1): back into the flight, under T3.
+        e.gapAcked = false;
+        flightAdd(e);
+        continue;
+      }
+      if (e.inFlight) {
+        flightSub(e);
+      } else if (e.needsRetx) {
+        // Waiting to be sent again, and the peer has it: the retry is
+        // cancelled (a late SACK after T3 marked it).
+        e.needsRetx = false;
+        retxCount--;
+        pendingBytes -= e.payloadLen;
+        e.inFlight = true;
+        inFlightCount++;
+      } else {
+        continue;   // never sent: validation keeps such a SACK out
+      }
+      e.gapAcked = true;
+      if (sackHtna === null || tsnGt(e.tsn, sackHtna)) { sackHtna = e.tsn; sackHtnaSentAt = e.retransmits === 0 ? e.sentAt : null; }
     }
   }
 
@@ -1693,18 +1874,122 @@ function SctpAssociation(config) {
   var sackAbandon = null;   // messageSeqs to abandon after this SACK's walk; null outside one
   var sackNow = 0;
   var sackHtna = null;      // this SACK: the highest TSN it newly acknowledged
+  var sackHtnaSentAt = null; // ... when that chunk was sent (null: it was sent again, Karn)
   var sackCountAll = false; // this SACK: in Fast Recovery, and the cumulative ack advanced
   var sackFast = null;      // this SACK: the chunks at the threshold, lowest TSN first
+  var sackLossTime = 0;     // this SACK: lossTimeThreshold()
   function markMissing(k) {
     var entry = sendQueue[k];
     if (!entry.inFlight) return;
     if (!sackCountAll && !(sackHtna !== null && tsnLt(entry.tsn, sackHtna))) return;
     if (entry.retxFence !== null && !(sackHtna !== null && tsnGt(sackHtna, entry.retxFence))) return;
     entry.missingReports++;
-    if (entry.missingReports >= fastRetransmitThreshold) {
-      if (shouldAbandon(entry, sackNow)) sackAbandon.add(entry.messageSeq);
-      else sackFast.push(entry);
+    if (entry.missingReports >= fastRetransmitThreshold) takeMissing(entry, sackNow, sackLossTime, sackFast, sackAbandon);
+  }
+
+  // A chunk at the threshold is lost once it has also been out longer than
+  // the round trip plus the path's reordering, RACK's rule (RFC 8985 §6.2):
+  // RTT + max(minRtt / 4, reorderWindowMs). Sooner, the reports may come
+  // from chunks that merely overtook it: with 50 ms ±5 ms each way, three of
+  // them arrived first for 2–3% of the chunks, each one resent and the window
+  // halved, and 4 MiB took a minute at 0.6 Mbit/s. RFC 9260 §7.2.4 asks for
+  // at least three reports, not that they suffice.
+  // The RTT is the one the last SACK with gap blocks measured (ackRtt), not
+  // srtt: srtt carries the peer's delayed SACKs, up to 200 ms each, and on a
+  // 1 ms path with 1% loss that wait before every resend took a transfer
+  // from 0.5 s to 20 s. srtt only before such a SACK; before any sample, 0:
+  // the reports alone.
+  // The reordering allowance grows when the peer reports duplicates (RFC
+  // 8985 §6.2, reo_wnd_mult): a quarter of minRtt more for each round trip
+  // that brought them, up to srtt; back to one quarter after 16 loss events
+  // without any. Against usrsctp at 50 ms ±5 ms the fixed quarter still
+  // resent 220 chunks of which the peer already had 216.
+  function lossTimeThreshold() {
+    var r = ackRtt !== null ? ackRtt : srtt;
+    if (r === null) return 0;
+    var reo = reoWndMult * (minRtt !== null ? minRtt : r) / 4;
+    if (srtt !== null && reo > srtt) reo = srtt;
+    return r + Math.max(reorderWindowMs, reo);
+  }
+  var reoWndMult = 1, reoWndPersist = 16, reoGrownAt = 0;
+  function onPeerDuplicates(now) {
+    if (now < reoGrownAt + (srtt !== null ? srtt : 0)) return;   // once per round trip
+    reoWndMult++;
+    reoGrownAt = now;
+    reoWndPersist = 16;
+  }
+
+  // A chunk at the threshold: lost (resent, or abandoned past its budget)
+  // once lossTime has passed since it was sent; until then the loss timer
+  // looks at it again when that time comes.
+  function takeMissing(entry, now, lossTime, fast, abandon) {
+    var due = entry.sentAt + lossTime;
+    if (now < due) { armLossTimer(due); return; }
+    if (shouldAbandon(entry, now)) abandon.add(entry.messageSeq);
+    else fast.push(entry);
+  }
+
+  // The loss timer: the earliest time a chunk at the threshold becomes lost.
+  // No SACK may come by then (the burst is over); it takes what is due.
+  var lossTimer = null, lossAt = 0;
+  function armLossTimer(at) {
+    if (lossTimer !== null && lossAt <= at) return;
+    if (lossTimer !== null) clearTimeout(lossTimer);
+    lossAt = at;
+    lossTimer = setTimeout(onLossTimer, Math.max(1, Math.ceil(at - Date.now())));
+    if (lossTimer.unref) lossTimer.unref();
+  }
+  function clearLossTimer() {
+    if (lossTimer !== null) { clearTimeout(lossTimer); lossTimer = null; }
+  }
+  function onLossTimer() {
+    lossTimer = null;
+    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_PENDING &&
+        state !== STATE_SHUTDOWN_RECEIVED && state !== STATE_SHUTDOWN_SENT) return;
+    var now = Date.now(), lossTime = lossTimeThreshold(), fast = [], abandon = new Set();
+    for (var k = 0; k < sendQueue.length; k++) {
+      var e = sendQueue[k];
+      if (!e.everSent) break;
+      if (e.inFlight && !e.abandoned && e.missingReports >= fastRetransmitThreshold) takeMissing(e, now, lossTime, fast, abandon);
     }
+    if (abandon.size > 0) abandonMessages(abandon);
+    if (fastRetransmitChunks(fast, now) > 0 || abandon.size > 0) transmitPending();
+  }
+
+  // The chunks found lost (lowest TSN first): resent now, up to Max.Burst of
+  // them; the window halved once per loss event. Returns how many went.
+  function fastRetransmitChunks(frs, now) {
+    var resent = 0;
+    for (var fi = 0; fi < frs.length && resent < maxBurst; fi++) {
+      var fr = frs[fi];
+      if (fr.abandoned) continue;
+      resent++;
+      fr.retransmits++;
+      fr.missingReports = 0;
+      fr.retxFence = highestTsnSent;
+      fr.sentAt = now;
+      // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
+      // no CRC recomputation. Packet bytes are byte-identical to the
+      // original send (vtag, ports, TSN, payload all unchanged).
+      _sctpDiagPacket(soloPacket(fr), 'retransmit');
+      emitDataPacket(fr.packet);
+      sctpStats.fastRetransmits++;
+      sctpStats.chunksRetransmitted++;
+    }
+
+    // SCTP-9: fast retransmit signals moderate congestion (peer's sending
+    // SACKs, path's not dead — just losing some chunks). RFC 4960 §7.2.4:
+    //   ssthresh = max(cwnd/2, 4*MTU); cwnd = ssthresh (straight to CA); pba = 0
+    // Once per loss event: on entering Fast Recovery (fastRecoveryExit).
+    if (resent > 0 && fastRecoveryExit === null) {
+      if (--reoWndPersist <= 0) { reoWndMult = 1; reoWndPersist = 16; }
+      var mtu = pmtu;
+      ssthresh          = Math.max((cwnd / 2) | 0, 4 * mtu);
+      cwnd              = ssthresh;
+      partialBytesAcked = 0;
+      fastRecoveryExit  = highestTsnSent;   // the highest outstanding
+    }
+    return resent;
   }
 
   // Every queued chunk whose offset from cumTsn is in [lo, hi] — found by
@@ -1734,13 +2019,12 @@ function SctpAssociation(config) {
   function handleSack(data) {
     if (data.length < 12) return;
     var cumTsn       = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
-    remoteRwnd       = (data[4] << 24 | data[5] << 16 | data[6] << 8 | data[7]) >>> 0;
+    var aRwnd        = (data[4] << 24 | data[5] << 16 | data[6] << 8 | data[7]) >>> 0;
     var numGapBlocks = data[8] << 8 | data[9];
-    // numDupTsns is informational (reported by peer for diagnostics).
-    // We don't act on it: peer reports duplicates we caused (e.g.,
-    // unnecessary retransmit due to lost SACK), and our retransmit
-    // discipline is already governed by missingReports + RTO.
-    // var numDupTsns   = data[10] << 8 | data[11];
+    // The duplicates the peer got: counted (stats.dupTsnsReported), not acted
+    // on. Most are retransmissions it did not need (the first copy was late,
+    // or its SACK lost); the path may also duplicate.
+    var numDupTsns   = data[10] << 8 | data[11];
 
     // Parse gap blocks. Each block: start(2) + end(2), as offsets from
     // cumTsn. Convert to absolute TSNs for downstream comparison via
@@ -1757,6 +2041,27 @@ function SctpAssociation(config) {
       });
       off += 4;
     }
+
+    // Validate before anything changes (RFC 9260 §6.2.1 D). A SACK whose
+    // cumulative ack is below one already seen was overtaken by a newer one
+    // (reordering): its window and its smaller gap coverage are stale, and
+    // applying them un-acked chunks the peer holds. A cumulative ack beyond
+    // what was ever sent (DATA, or a FORWARD-TSN point over abandoned
+    // chunks) or a gap block beyond the highest DATA TSN sent describes
+    // chunks that do not exist.
+    var sentBound = highestTsnSent;
+    if (lastForwardTsnSent !== undefined && (sentBound === null || tsnGt(lastForwardTsnSent, sentBound))) sentBound = lastForwardTsnSent;
+    var impossible = (sackCumSeen !== null && tsnLt(cumTsn, sackCumSeen)) ||
+                     (sentBound !== null && tsnGt(cumTsn, sentBound));
+    for (var gv = 0; !impossible && gv < gaps.length; gv++) {
+      if (highestTsnSent === null || tsnGt(gaps[gv].end, highestTsnSent)) impossible = true;
+    }
+    if (impossible) { sctpStats.sacksDiscarded++; return; }
+    var cumAdvanced = sackCumSeen === null || tsnGt(cumTsn, sackCumSeen);
+    sackCumSeen = cumTsn;
+    remoteRwnd  = aRwnd;
+    sctpStats.dupTsnsReported += numDupTsns;
+    if (numDupTsns > 0) onPeerDuplicates(Date.now());
 
     var now = Date.now();
     var ackedSomething = false;
@@ -1808,10 +2113,11 @@ function SctpAssociation(config) {
     var dropCount  = 0;
     var bytesAcked = 0;
     sackHtna = null;
+    sackHtnaSentAt = null;
     while (dropCount < sendQueue.length && tsnLeq(sendQueue[dropCount].tsn, cumTsn)) {
       var acked = sendQueue[dropCount];
       ackedSomething = true;
-      if (!acked.gapAcked) sackHtna = acked.tsn;   // newly acknowledged by this SACK
+      if (!acked.gapAcked) { sackHtna = acked.tsn; sackHtnaSentAt = acked.retransmits === 0 ? acked.sentAt : null; }   // newly acknowledged by this SACK
       // Karn's algorithm skips retransmitted chunks. A chunk the peer had
       // already reported in an earlier SACK is skipped too: it was received
       // back then (gap-acked behind a hole) and is only cum-acked now that
@@ -1827,7 +2133,7 @@ function SctpAssociation(config) {
       // SCTP-9: track bytesAcked BEFORE chunkRemoved decrements outstandingBytes,
       // so the cwnd-growth gate (computed below) sees the pre-drain values
       // implied by `outstandingBytes + bytesAcked`.
-      if (acked.inFlight) bytesAcked += acked.payloadLen;
+      if (acked.inFlight) bytesAcked += acked.wireLen;
       chunkRemoved(acked);
       dropCount++;
     }
@@ -1836,6 +2142,16 @@ function SctpAssociation(config) {
     // Chunks the peer reports in a gap block leave the flight (see
     // updateGapCoverage) — so a hole does not freeze the window.
     updateGapCoverage(cumTsn, gaps);
+    // The round trip right now, from the newest chunk this SACK acknowledged
+    // for the first time (lossTimeThreshold). Only from a SACK with gap
+    // blocks: the peer sends those at once (RFC 9260 §6.2), where one
+    // without may have waited out its delayed-SACK timer.
+    if (gaps.length > 0 && sackHtnaSentAt !== null) {
+      ackRtt = Math.max(1, now - sackHtnaSentAt);
+      if (minRtt === null || ackRtt < minRtt) minRtt = ackRtt;
+    }
+    // The peer acknowledged something new: the path works (RFC 9260 §8.1).
+    if (cumAdvanced || sackHtna !== null) assocErrorCount = 0;
 
     // Fast Recovery (RFC 9260 §7.2.4): in it, a SACK that advances the
     // cumulative ack has every TSN it reports missing counted (markMissing);
@@ -1852,14 +2168,19 @@ function SctpAssociation(config) {
     // has seen does not change, so the gap test alone misses it. Gating on
     // only one of the two leaves the backoff stuck in the other case.
     if (dropCount > 0 || peerMadeProgress) collapseRtoBackoff();
-    // SCTP-14: retire I-FORWARD-TSN skip entries the peer has provably
-    // consumed — its cumulative ack has moved past every TSN of the
-    // abandoned message, which can only happen after it processed the
-    // I-FORWARD-TSN covering that hole.
+    // SCTP-14: retire skip entries (I-FORWARD-TSN and FORWARD-TSN) the peer
+    // has provably consumed — its cumulative ack has moved past every TSN of
+    // the abandoned message, which can only happen after it processed the
+    // forward covering that hole.
     for (var akey in abandonedMidPerStream) {
       if (tsnGt(cumTsn, abandonedMidPerStream[akey].tsn)) {
         delete abandonedMidPerStream[akey];
       }
+    }
+    for (var skey in abandonedSSNPerStream) {
+      var sitems = abandonedSSNPerStream[skey];
+      for (var si = sitems.length - 1; si >= 0; si--) if (tsnLeq(sitems[si].hi, cumTsn)) sitems.splice(si, 1);
+      if (sitems.length === 0) delete abandonedSSNPerStream[skey];
     }
     // A stream may have just gone quiet — release any reset waiting on it.
     _releaseReadyStreamResets();
@@ -1877,10 +2198,8 @@ function SctpAssociation(config) {
     // entries after this drain — the only reason they're sitting there
     // is the cwnd/rwnd budget. If the queue is empty (or all inFlight),
     // the user isn't pushing — don't reward them with extra cwnd.
-    // Some chunk not in flight ⇔ fewer in flight than queued — the count
-    // transmitPending keeps and tests the same way ("nothing pending" is
-    // inFlightCount === sendQueue.length). It walked the queue to find one.
-    var hasPending = inFlightCount < sendQueue.length;
+    // Some chunk waits to be sent (again): the test transmitPending makes.
+    var hasPending = retxCount > 0 || sentCount < sendQueue.length;
     if (bytesAcked > 0 && hasPending && fastRecoveryExit === null) {
       var mtu = pmtu;
       if (cwnd < ssthresh) {
@@ -1907,7 +2226,7 @@ function SctpAssociation(config) {
     for (var lk = 0; lifetimeEverUsed && lk < sendQueue.length; lk++) {
       var le = sendQueue[lk];
       if (le.maxLifetime != null && (now - le.firstSentAt) >= le.maxLifetime &&
-          peerSupportsForwardTsn) {
+          prNegotiated()) {
         if (toAbandon === null) toAbandon = new Set();
         toAbandon.add(le.messageSeq);
       }
@@ -1924,6 +2243,7 @@ function SctpAssociation(config) {
       sackFast = [];
       sackAbandon = new Set();
       sackNow = now;
+      sackLossTime = lossTimeThreshold();
 
       // sendQueue and the gap blocks are both in ascending TSN order, so one
       // pointer into the gaps suffices (was a scan of every gap per chunk).
@@ -2001,35 +2321,7 @@ function SctpAssociation(config) {
       // out of budget) is not resent.
       var frs = sackFast;
       sackFast = null;
-      var resent = 0;
-      for (var fi = 0; fi < frs.length && resent < maxBurst; fi++) {
-        var fr = frs[fi];
-        if (fr.abandoned) continue;
-        resent++;
-        fr.retransmits++;
-        fr.missingReports = 0;
-        fr.retxFence = sendQueue[inFlightCount - 1].tsn;   // the highest TSN sent so far
-        fr.sentAt = now;
-        // P2: re-emit the pre-built packet — no Buffer.alloc, no copy,
-        // no CRC recomputation. Packet bytes are byte-identical to the
-        // original send (vtag, ports, TSN, payload all unchanged).
-        _sctpDiagPacket(soloPacket(fr), 'retransmit');
-        ev.emit('packet', fr.packet);
-        sctpStats.fastRetransmits++;
-        sctpStats.chunksRetransmitted++;
-      }
-
-      // SCTP-9: fast retransmit signals moderate congestion (peer's sending
-      // SACKs, path's not dead — just losing some chunks). RFC 4960 §7.2.4:
-      //   ssthresh = max(cwnd/2, 4*MTU); cwnd = ssthresh (straight to CA); pba = 0
-      // Once per loss event: on entering Fast Recovery (fastRecoveryExit).
-      if (resent > 0 && fastRecoveryExit === null) {
-        var mtu = pmtu;
-        ssthresh          = Math.max((cwnd / 2) | 0, 4 * mtu);
-        cwnd              = ssthresh;
-        partialBytesAcked = 0;
-        fastRecoveryExit  = sendQueue[inFlightCount - 1].tsn;   // the highest outstanding
-      }
+      fastRetransmitChunks(frs, now);
     }
 
     // SCTP-8: rwnd may have opened up. Try to promote pending chunks
@@ -2039,13 +2331,13 @@ function SctpAssociation(config) {
     var wasNoInFlight = (inFlightCount === 0);
     transmitPending();
 
-    // T3 lifecycle. Empty in-flight count → cancel; non-empty AND we
+    // T3 lifecycle. Nothing outstanding → cancel; non-empty AND we
     // either acked or just promoted pending → restart so the (possibly
     // new) oldest in-flight chunk gets a fresh budget. Otherwise leave
     // the existing timer alone (the oldest chunk hasn't changed;
     // resetting its timer would be a free pass to retransmit attackers
     // can exploit).
-    if (inFlightCount === 0) {
+    if (!t3Needed()) {
       clearT3Timer();
     } else if (ackedSomething || wasNoInFlight || peerMadeProgress) {
       // SCTP-14: peerMadeProgress included. Without it a SACK that advances
@@ -2060,7 +2352,7 @@ function SctpAssociation(config) {
     // lost or this SACK was sent before peer received it. Re-emit if so.
     // maybeFwdTsn early-returns when nothing has been abandoned, so this
     // is free for fully-reliable workloads.
-    if (peerSupportsForwardTsn && sctpStats.chunksAbandoned > 0) {
+    if (prNegotiated() && sctpStats.chunksAbandoned > 0) {
       // Peer's cumTsn from this SACK is the snapshot we want to compare against.
       var advPt = advancedPeerAckPoint();
       // Only when the peer's cumulative TSN sits at an abandoned TSN (the
@@ -2277,7 +2569,7 @@ function SctpAssociation(config) {
       dropCount++;
     }
     if (dropCount > 0) sendQueue.splice(0, dropCount);
-    if (inFlightCount === 0) clearT3Timer();
+    if (!t3Needed()) clearT3Timer();
 
     if (state === STATE_ESTABLISHED) {
       // Standard passive shutdown path.
@@ -2319,7 +2611,7 @@ function SctpAssociation(config) {
       // send a SHUTDOWN_COMPLETE with T-bit set. We're not that
       // defensive yet; the vtag check in handlePacket already gates.
       sendShutdownComplete();
-      finalizeClose();
+      finishGracefully();
     }
     // In other states: peer sent unexpected SHUTDOWN_ACK. Per RFC
     // 4960 §8.5.1 we'd respond with SHUTDOWN_COMPLETE+T-bit; for
@@ -2329,7 +2621,7 @@ function SctpAssociation(config) {
   function handleShutdownComplete() {
     if (state === STATE_SHUTDOWN_ACK_SENT) {
       // Three-way handshake complete from our side.
-      finalizeClose();
+      finishGracefully();
     }
     // Other states: malformed exchange or duplicate. Silently ignore.
   }
@@ -2431,11 +2723,23 @@ function SctpAssociation(config) {
     // guards on state, but clearing here means no work is even attempted.
     txJobs.length = 0;
     clearShutdownTimer();
+    // RFC 6525 state: no request retransmitted, no reset released, once
+    // the association is gone (callers learn of it from 'close').
+    if (reconfigOut) _clearReconfigTimer(reconfigOut);
+    reconfigOut = null;
+    reconfigQueue.length = 0;
+    for (var pr = 0; pr < pendingStreamResets.length; pr++) {
+      if (pendingStreamResets[pr].drainTimer) clearTimeout(pendingStreamResets[pr].drainTimer);
+    }
+    pendingStreamResets.length = 0;
+    deferredPeerReset = null;
     // SCTP-1: also clear retransmit + heartbeat timers, otherwise they
     // may fire after the association is supposedly gone, hitting
     // ev.emit('packet', ...) with stale verification tags or trying to
     // run logic on a torn-down state.
+    heldData.length = 0;   // DATA of the pass in progress (P11): not sent once stopped
     clearT3Timer();
+    clearLossTimer();
     clearT1Timer();
     clearHeartbeatTimer();
     // SCTP-2: cancel any in-flight delayed SACK — peer won't get one,
@@ -2448,6 +2752,16 @@ function SctpAssociation(config) {
     state = STATE_CLOSED;
   }
 
+  // The SHUTDOWN exchange is over. Messages we acknowledged may still wait
+  // for their delivery task; they are handed up first, then 'close'. (An
+  // ABORT, ours or the peer's, still ends at once: finalizeClose.)
+  var closeAfterDelivery = false;
+  function finishGracefully() {
+    stopAll();
+    if (_deliverHead < _deliverQueue.length) closeAfterDelivery = true;
+    else finalizeClose();
+  }
+
   function finalizeClose() {
     if (closed) return;   // idempotent
     closed = true;
@@ -2457,6 +2771,56 @@ function SctpAssociation(config) {
     // attached after construction can run. (ev.emit is synchronous;
     // listeners fire before this line.)
     ev.removeAllListeners();
+  }
+
+  // The messages handed to send() of which not one fragment has gone on the
+  // wire yet, in send order — for an owner moving to a NEW association (the
+  // transport moved, see DataChannelController.moveToNewTransport): these
+  // the peer cannot have, so they go out again there with no risk of a
+  // duplicate. A message with any fragment already sent is left out: the
+  // peer may have it (it is not ours to tell), as with any loss of an
+  // association. Read-only; the caller destroys this association after.
+  //
+  // Each: { streamId, ppid, payload, unordered, maxRetransmits, maxLifetime }.
+  function unsentMessages() {
+    var recs = new Map();
+    var order = [];
+    var rec = function (seq, src) {
+      var r = recs.get(seq);
+      if (!r) {
+        r = { streamId: src.streamId, ppid: src.ppid, unordered: !!src.unordered,
+              maxRetransmits: src.maxRetransmits, maxLifetime: src.maxLifetime,
+              parts: [], sent: false };
+        recs.set(seq, r);
+        order.push(seq);
+      }
+      return r;
+    };
+    for (var i = 0; i < sendQueue.length; i++) {
+      var e = sendQueue[i];
+      var r = rec(e.messageSeq, e);
+      if (e.everSent) { r.sent = true; continue; }
+      // Payload right after the chunk's metadata: 12 (common header) + 16
+      // (DATA) or + 20 (I-DATA) — the chunk type tells which.
+      var off = 12 + (e.packet[12] === CHUNK_I_DATA ? I_DATA_CHUNK_OVERHEAD : DATA_CHUNK_OVERHEAD);
+      r.parts.push(e.packet.subarray(off, off + e.payloadLen));
+    }
+    // Long messages still being fed into sendQueue (SCTP-14): the rest of
+    // their payload, from the fragment the pump has not built yet.
+    for (var j = 0; j < txJobs.length; j++) {
+      var job = txJobs[j];
+      var rj = rec(job.messageSeq, job);
+      var from = job.cursor * job.maxPerChunk;
+      if (from < job.payload.length) rj.parts.push(job.payload.subarray(from));
+    }
+    var out = [];
+    for (var k = 0; k < order.length; k++) {
+      var m = recs.get(order[k]);
+      if (m.sent) continue;
+      out.push({ streamId: m.streamId, ppid: m.ppid, payload: Buffer.concat(m.parts),
+                 unordered: m.unordered, maxRetransmits: m.maxRetransmits, maxLifetime: m.maxLifetime });
+    }
+    return out;
   }
 
   // Gone without a word: no SHUTDOWN, no ABORT, no 'close'. For an owner
@@ -2596,11 +2960,7 @@ function SctpAssociation(config) {
     }
     var pending = pendingMsgs[streamId];
     if (pending) {
-      var toDel = [];
-      pending.forEach(function (_msg, mid) {
-        if (mid === abandonedMid || tsnLt(mid, abandonedMid)) toDel.push(mid);
-      });
-      for (var di = 0; di < toDel.length; di++) pending.delete(toDel[di]);
+      deliverHeldUpTo(pending, streamId, abandonedMid, tsnLt);
       var expected = recvSSN[streamId];
       while (pending.has(expected)) {
         var nxt = pending.get(expected);
@@ -2708,10 +3068,25 @@ function SctpAssociation(config) {
     sackForForwardTsn(false);
   }
 
+  // Held complete messages at or below an abandoned sequence number arrived
+  // whole: they are delivered, in order, not dropped (RFC 3758 §3.6 makes
+  // them available once the skip passes them). They used to be deleted,
+  // which lost messages the peer had sent and we had acknowledged.
+  function deliverHeldUpTo(pending, streamId, upTo, lt) {
+    var keys = [];
+    pending.forEach(function (_msg, k) { if (k === upTo || lt(k, upTo)) keys.push(k); });
+    keys.sort(function (a, b) { return a === b ? 0 : (lt(a, b) ? -1 : 1); });
+    for (var i = 0; i < keys.length; i++) {
+      var m = pending.get(keys[i]);
+      pending.delete(keys[i]);
+      processMessage(streamId, m.ppid, m.payload);
+    }
+  }
+
   // SCTP-6: advance recvSSN past an abandoned ordered SSN reported by
   // peer in FORWARD-TSN. Bumps recvSSN[sid] to (abandonedSsn + 1) iff
   // recvSSN was at-or-below abandonedSsn (mod-16 arithmetic), then
-  // drains pendingMsgs[sid] in case the new recvSSN unlocks held messages.
+  // delivers held messages up to it and those the new recvSSN unlocks.
   function advanceRecvSSNPastAbandoned(streamId, abandonedSsn) {
     var current = recvSSN[streamId] || 0;
     // ssnLeq: equivalent of "current is at or below abandonedSsn in
@@ -2720,16 +3095,9 @@ function SctpAssociation(config) {
     if (current === abandonedSsn || ssnLt(current, abandonedSsn)) {
       recvSSN[streamId] = (abandonedSsn + 1) & 0xFFFF;
     }
-    // Drop pendingMsgs entries with SSN ≤ abandonedSsn — they're orphans.
     var pending = pendingMsgs[streamId];
     if (pending) {
-      var toDel = [];
-      pending.forEach(function (_msg, ssn) {
-        if (ssn === abandonedSsn || ssnLt(ssn, abandonedSsn)) {
-          toDel.push(ssn);
-        }
-      });
-      for (var di = 0; di < toDel.length; di++) pending.delete(toDel[di]);
+      deliverHeldUpTo(pending, streamId, abandonedSsn, ssnLt);
 
       // Drain in order: any held message at the new recvSSN gets delivered.
       var expected = recvSSN[streamId];
@@ -2763,9 +3131,12 @@ function SctpAssociation(config) {
    *     Our own buffered DATA on those streams is dropped (the peer
    *     won't deliver them).
    *
-   *   • PARAM_RECONFIG_RESPONSE (0x0010) — peer's response to one of our
-   *     prior outgoing-reset requests. Resolves the corresponding entry
-   *     in pendingResetRequests, fires the user's callback.
+   *   • PARAM_RECONFIG_RESPONSE (0x0010) — peer's response to our
+   *     outgoing-reset request in flight (reconfigOut). Fires the callers'
+   *     callbacks, or keeps the request going on "In progress".
+   *
+   *   • SSN/TSN reset and Add Streams requests — not implemented, answered
+   *     "Denied".
    *
    * "Sender's Last Assigned TSN" in the outgoing-reset request is the
    * highest TSN we've assigned on the streams being reset. RFC 6525 §5
@@ -2789,28 +3160,58 @@ function SctpAssociation(config) {
       if (pType === PARAM_OUTGOING_SSN_RESET)        handleOutgoingResetRequest(pBody);
       else if (pType === PARAM_INCOMING_SSN_RESET)   handleIncomingResetRequest(pBody);
       else if (pType === PARAM_RECONFIG_RESPONSE)    handleReconfigResponse(pBody);
-      // Other reconfig param types (ADD streams, etc.) silently ignored.
+      // SSN/TSN reset and Add Streams are not implemented. They used to be
+      // ignored without a word, and the peer — allowed one request in flight
+      // (RFC 6525 §5.1.1) — retransmitted it with every later request stuck
+      // behind it. §5.2.1: a request the endpoint does not wish to process
+      // still gets a response: "Denied".
+      else if (pType === PARAM_SSN_TSN_RESET || pType === PARAM_ADD_OUT_STREAMS ||
+               pType === PARAM_ADD_IN_STREAMS)       denyReconfigRequest(pBody);
 
       off += pLen;
       if (off % 4 !== 0) off += 4 - (off % 4);
     }
   }
 
-  // Peer is resetting THEIR outgoing → OUR incoming. Reset our recv state
-  // and reply with success. Per RFC 6525 §5.2.1 we must guard against
-  // duplicates: if peer's request seq matches the last we processed,
-  // replay the previous response without redoing the reset (idempotent).
+  // RFC 6525 §5.2.1 sequence check for an incoming request. True: it is the
+  // next request, process it. False: already answered here — a
+  // retransmission of the last request gets our CURRENT answer to it again
+  // (a deferred reset's "In progress" becomes "Performed" once done), any
+  // other number "Bad Sequence Number".
+  function acceptPeerRequest(reqSeq) {
+    if (lastReconfigPeerReqSeen === undefined) return true;   // no handshake seen
+    if (reqSeq === lastReconfigPeerReqSeen) {
+      if (lastReconfigResponseResult !== undefined) sendReconfigResponse(reqSeq, lastReconfigResponseResult);
+      return false;
+    }
+    if (reqSeq !== ((lastReconfigPeerReqSeen + 1) >>> 0)) {
+      sendReconfigResponse(reqSeq, RECONFIG_RESULT_ERROR_BAD_SEQ);
+      return false;
+    }
+    return true;
+  }
+
+  function answerPeerRequest(reqSeq, result) {
+    lastReconfigPeerReqSeen    = reqSeq;
+    lastReconfigResponseResult = result;
+    sendReconfigResponse(reqSeq, result);
+  }
+
+  // A request type we do not implement (every request parameter starts with
+  // its Re-configuration Request Sequence Number).
+  function denyReconfigRequest(body) {
+    if (body.length < 4) return;
+    var reqSeq = (body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0;
+    if (!acceptPeerRequest(reqSeq)) return;
+    answerPeerRequest(reqSeq, RECONFIG_RESULT_DENIED);
+  }
+
+  // Peer is resetting THEIR outgoing → OUR incoming (RFC 6525 §5.2.2).
   function handleOutgoingResetRequest(body) {
     if (body.length < 12) return;
-    var reqSeq      = (body[0] << 24 | body[1] << 16 | body[2] << 8  | body[3])  >>> 0;
-    var respSeq     = (body[4] << 24 | body[5] << 16 | body[6] << 8  | body[7])  >>> 0;
+    var reqSeq        = (body[0] << 24 | body[1] << 16 | body[2] << 8  | body[3])  >>> 0;
     var senderLastTsn = (body[8] << 24 | body[9] << 16 | body[10] << 8 | body[11]) >>> 0;
-
-    // Dup detection — peer retransmitted the same RECONFIG.
-    if (lastReconfigPeerReqSeen !== undefined && reqSeq === lastReconfigPeerReqSeen) {
-      sendReconfigResponse(reqSeq, lastReconfigResponseResult);
-      return;
-    }
+    if (!acceptPeerRequest(reqSeq)) return;
 
     // Parse stream-id list (each 2 bytes; if empty list, all streams reset).
     var streams = [];
@@ -2818,19 +3219,61 @@ function SctpAssociation(config) {
       streams.push(body[i] << 8 | body[i + 1]);
     }
 
-    // RFC 6525 §5.2.2: if peer's senderLastTsn is above our cumulative ack,
-    // we'd be racing in-flight DATA. Defer with IN_PROGRESS — peer will
-    // retry. (Simplification: we don't actually defer, we just respond
-    // IN_PROGRESS once. Peer should resend if it cares; otherwise the
-    // reset is moot anyway because peer already gave up on those TSNs.)
-    if (tsnGt(senderLastTsn, lastCumulativeTsn)) {
-      lastReconfigPeerReqSeen     = reqSeq;
-      lastReconfigResponseResult  = RECONFIG_RESULT_IN_PROGRESS;
-      sendReconfigResponse(reqSeq, RECONFIG_RESULT_IN_PROGRESS);
+    // E2: data up to senderLastTsn may still be on its way. The reset waits
+    // for our cumulative ack to reach it — answered "In progress" now,
+    // performed by _performDeferredReset after the packet that completes
+    // the data. It used to be answered "In progress" once and then never
+    // performed: the peer's channel stayed 'closing' forever.
+    //
+    // A new request while one is deferred is a peer that re-sent its
+    // pending reset under a new sequence number (the old one is then
+    // abandoned by the sender): one deferral covers both, answered under the
+    // newest number. senderLastTsn only grows, so the later one bounds both.
+    var d = deferredPeerReset;
+    if (d) {
+      d.streams = (d.streams.length === 0 || streams.length === 0) ? [] : mergeStreamIds(d.streams, streams);
+      if (tsnGt(senderLastTsn, d.lastTsn)) d.lastTsn = senderLastTsn;
+      d.reqSeq = reqSeq;
+    } else {
+      d = deferredPeerReset = { reqSeq: reqSeq, lastTsn: senderLastTsn, streams: streams };
+    }
+    if (tsnGt(d.lastTsn, lastCumulativeTsn)) {
+      answerPeerRequest(reqSeq, RECONFIG_RESULT_IN_PROGRESS);
       return;
     }
+    lastReconfigPeerReqSeen = reqSeq;
+    _performDeferredReset();
+  }
 
-    // Apply the reset to our recv state for each requested stream.
+  function mergeStreamIds(a, b) {
+    var out = a.slice();
+    for (var i = 0; i < b.length; i++) if (out.indexOf(b[i]) === -1) out.push(b[i]);
+    return out;
+  }
+
+  // Perform the peer's outgoing reset once our cumulative ack covers its
+  // last TSN (RFC 6525 §5.2.2 E3-E5). Called when the request arrives
+  // and, for a deferred one, at the end of every packet (handlePacket):
+  // after the whole packet, so the DATA that completed the cumulative ack
+  // has been reassembled and handed to processMessage first.
+  function _performDeferredReset() {
+    var d = deferredPeerReset;
+    if (!d || tsnGt(d.lastTsn, lastCumulativeTsn)) return;
+    deferredPeerReset = null;
+    resetIncomingStreams(d.streams);
+    // Sent unasked when the reset was deferred: the peer's request is
+    // complete now rather than at its next retransmission. A duplicate
+    // of the request from here on gets "Performed" (acceptPeerRequest).
+    if (d.reqSeq === lastReconfigPeerReqSeen) {
+      answerPeerRequest(d.reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
+    } else {
+      sendReconfigResponse(d.reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
+    }
+  }
+
+  // Reset our receive state on the peer's outgoing streams, and tell the
+  // upper layer.
+  function resetIncomingStreams(streams) {
     for (var s = 0; s < streams.length; s++) {
       var sid = streams[s];
       // DELIVER BEFORE DISCARDING (RFC 6525 3.1 + RFC 8831 6.7): an
@@ -2853,20 +3296,27 @@ function SctpAssociation(config) {
         }
       }
       delete recvSSN[sid];
-      if (pendingMsgs[sid]) delete pendingMsgs[sid];
-      if (fragStore[sid])   delete fragStore[sid];
-      if (iDataHint[sid])   delete iDataHint[sid];
+      if (pendingMsgs[sid]) { pendingMsgs[sid].clear(); delete pendingMsgs[sid]; }
+      if (fragStore[sid])   { fragStore[sid].clear();   delete fragStore[sid]; }
+      if (iDataHint[sid])   { iDataHint[sid].clear();   delete iDataHint[sid]; }
     }
-
-    lastReconfigPeerReqSeen     = reqSeq;
-    lastReconfigResponseResult  = RECONFIG_RESULT_SUCCESS_PERFORMED;
-    sendReconfigResponse(reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
 
     // Notify upper layer. RFC 8831 §6.7: peer reset its outgoing direction;
     // we should reset our outgoing direction on the same streams in
-    // response, completing the bidirectional close. We emit and let cm.js
-    // decide — usually it'll call resetStreams() back.
-    try { ev.emit('streamReset', { streamIds: streams.slice(), incoming: true }); } catch (e) {}
+    // response, completing the bidirectional close. cm.js decides —
+    // usually it calls resetStreams() back.
+    queueStreamResetNotice(streams, true);
+  }
+
+  // 'streamReset' goes through the delivery queue, BEHIND the messages of
+  // the stream still waiting for their task (processMessage delivers one
+  // per macrotask). Emitted synchronously, it reached the upper layer
+  // first, which closed and forgot the channel — and the messages queued
+  // ahead of the reset were then dropped as "no DataChannel": the peer's
+  // "send(m); close();" lost m (RFC 8831 §6.7).
+  function queueStreamResetNotice(streams, incoming) {
+    _deliverQueue.push({ streamReset: { streamIds: streams.slice(), incoming: incoming } });
+    _scheduleDelivery();
   }
 
   // Peer asks US to reset OUR outgoing on some streams. We clear sendSSN
@@ -2875,11 +3325,7 @@ function SctpAssociation(config) {
   function handleIncomingResetRequest(body) {
     if (body.length < 4) return;
     var reqSeq = (body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0;
-
-    if (lastReconfigPeerReqSeen !== undefined && reqSeq === lastReconfigPeerReqSeen) {
-      sendReconfigResponse(reqSeq, lastReconfigResponseResult);
-      return;
-    }
+    if (!acceptPeerRequest(reqSeq)) return;
 
     var streams = [];
     for (var i = 4; i + 2 <= body.length; i += 2) {
@@ -2900,50 +3346,73 @@ function SctpAssociation(config) {
         chunkRemoved(dropped);
       }
     }
-    for (var s = 0; s < streams.length; s++) delete sendSSN[streams[s]];
+    for (var s = 0; s < streams.length; s++) resetSendSequence(streams[s]);
 
-    lastReconfigPeerReqSeen     = reqSeq;
-    lastReconfigResponseResult  = RECONFIG_RESULT_SUCCESS_PERFORMED;
-    sendReconfigResponse(reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
-
-    try { ev.emit('streamReset', { streamIds: streams.slice(), incoming: false }); } catch (e) {}
+    answerPeerRequest(reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
+    queueStreamResetNotice(streams, false);
   }
 
-  // Peer's response to one of our outgoing-reset requests.
+  // An outgoing stream starts again from SSN 0 and MID 0 (RFC 6525 §5.2.2
+  // E3 / RFC 8260 §2.3: the receiver resets both). Only the SSN used to be
+  // cleared, so under I-DATA a reused stream id carried on with the old
+  // MIDs and the peer, expecting MID 0, held its ordered messages.
+  function resetSendSequence(sid) {
+    delete sendSSN[sid];
+    delete sendMIDOrdered[sid];
+    delete sendMIDUnordered[sid];
+  }
+
+  var RECONFIG_RESULT_NAMES = ['success: nothing to do', 'success: performed', 'denied',
+    'error: wrong SSN', 'error: request already in progress', 'error: bad sequence number', 'in progress'];
+
+  // Peer's response to our request in flight (RFC 6525 §5.2.7).
   function handleReconfigResponse(body) {
     if (body.length < 8) return;
     var respSeq = (body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0;
     var result  = (body[4] << 24 | body[5] << 16 | body[6] << 8 | body[7]) >>> 0;
 
-    var pending = pendingResetRequests.get(respSeq);
-    if (!pending) return;   // unknown — late dup, ignore
+    var req = reconfigOut;
+    if (!req || respSeq !== req.reqSeq) return;   // H1: not the request in flight — a late duplicate
 
     if (result === RECONFIG_RESULT_IN_PROGRESS) {
-      // Peer hasn't finished; they'll respond again. We just wait — no
-      // explicit retry here because RECONFIG goes over reliable SCTP and
-      // peer is responsible for re-responding.
+      // H2: the peer deferred the reset (its cumulative ack is behind our
+      // last TSN). Restart the timer; on expiry the SAME request goes again,
+      // without counting as an error — the peer is alive and answering.
+      // This used to wait for a second response the peer never sends.
+      req.inProgress = true;
+      req.timeout = rto;
+      _armReconfigTimer(req);
       return;
     }
 
-    pendingResetRequests.delete(respSeq);
+    _clearReconfigTimer(req);
+    reconfigOut = null;
 
-    // For SUCCESS responses, also reset our local sendSSN for those
-    // streams (we'd deferred this until peer confirmed).
-    if (result === RECONFIG_RESULT_SUCCESS_PERFORMED ||
-        result === RECONFIG_RESULT_SUCCESS_NOTHING_TO_DO) {
-      for (var s = 0; s < pending.streamIds.length; s++) {
-        delete sendSSN[pending.streamIds[s]];
+    // H3/H4: only a successful reset restarts our sequence numbering on the
+    // streams. Any other result (Denied, Wrong SSN, Request already in
+    // progress, Bad Sequence Number) is a FAILED reset and is reported as
+    // one: it used to complete the callback like a success, so our channel
+    // closed while the peer's stayed open.
+    var ok = result === RECONFIG_RESULT_SUCCESS_PERFORMED ||
+             result === RECONFIG_RESULT_SUCCESS_NOTHING_TO_DO;
+    for (var u = 0; u < req.users.length; u++) {
+      var user = req.users[u];
+      if (ok) for (var s = 0; s < user.streamIds.length; s++) resetSendSequence(user.streamIds[s]);
+      if (typeof user.callback !== 'function') continue;
+      var info = { result: result, streamIds: user.streamIds.slice() };
+      var err = null;
+      if (!ok) {
+        err = new Error('stream reset failed: ' + (RECONFIG_RESULT_NAMES[result] || 'result ' + result));
+        err.code   = 'ERR_SCTP_STREAM_RESET';
+        err.result = result;
       }
+      try { user.callback(err, info); } catch (e) {}
     }
-
-    if (typeof pending.callback === 'function') {
-      try { pending.callback(null, { result: result, streamIds: pending.streamIds.slice() }); }
-      catch (e) {}
-    }
+    _pumpReconfig();
   }
 
   // Build and send a RECONFIG chunk containing a Re-configuration Response
-  // parameter. Used by handleOutgoingResetRequest / handleIncomingResetRequest.
+  // parameter. Used by the incoming-request handlers above.
   function sendReconfigResponse(reqSeq, result) {
     var body = Buffer.alloc(12);                      // param type+len + 8B body
     body.writeUInt16BE(PARAM_RECONFIG_RESPONSE, 0);
@@ -2953,18 +3422,12 @@ function SctpAssociation(config) {
     sendChunk(CHUNK_RECONFIG, 0, body, remoteVerificationTag);
   }
 
-  // Public: ask peer to reset (close) the given streams. Returns the
-  // request sequence number; the callback fires when peer responds.
-  // Caller can pass an empty list to reset ALL streams (RFC 6525 §4.1).
-  // If peer doesn't support RECONFIG, the callback fires immediately
-  // with err='peer-no-reconfig' so cm.js can fall back to local-only
-  // close (W3C-compatible degradation).
   /**
-   * Stream resets that are WAITING for their data to be acknowledged.
-   *   key: reqSeq   value: { streamIds, body, timer }
-   * See _streamHasOutstanding for why they wait.
+   * Stream resets WAITING for their stream's data to be acknowledged
+   * (see _streamHasOutstanding). Each: { users: [{streamIds, callback}],
+   * drainTimer }. Released into reconfigQueue.
    */
-  var pendingStreamResets = new Map();
+  var pendingStreamResets = [];
 
   /**
    * Does this stream still have data we have not seen acknowledged?
@@ -2994,50 +3457,153 @@ function SctpAssociation(config) {
   /**
    * Release any reset whose streams have gone quiet. Called from
    * handleSack (every acknowledgement is a chance for a stream to
-   * drain) and from the safety timer below.
+   * drain); each reset's safety timer releases it regardless.
    */
   function _releaseReadyStreamResets() {
-    if (pendingStreamResets.size === 0) return;
-    pendingStreamResets.forEach(function (entry, reqSeq) {
-      var stillBusy = entry.streamIds.some(_streamHasOutstanding);
-      if (stillBusy) return;
-      if (entry.timer) clearTimeout(entry.timer);
-      pendingStreamResets.delete(reqSeq);
-      entry.send();
+    if (pendingStreamResets.length === 0) return;
+    var ready = pendingStreamResets.filter(function (r) {
+      return !r.users[0].streamIds.some(_streamHasOutstanding);
     });
+    for (var i = 0; i < ready.length; i++) _releaseStreamReset(ready[i]);
   }
 
+  function _releaseStreamReset(req) {
+    var idx = pendingStreamResets.indexOf(req);
+    if (idx !== -1) pendingStreamResets.splice(idx, 1);
+    if (req.drainTimer) { clearTimeout(req.drainTimer); req.drainTimer = null; }
+    if (closed || req.released) return;
+    req.released = true;
+    reconfigQueue.push(req);
+    _pumpReconfig();
+  }
+
+  // Most stream ids one request carries: the RECONFIG chunk must fit one
+  // packet with room to spare (16 + 2 per id bytes of parameter).
+  var RECONFIG_MAX_STREAMS = 256;
+
+  /**
+   * Send the next request, if none is in flight.
+   *
+   * RFC 6525 §5.1.1: at most ONE request in flight. Each resetStreams()
+   * used to go out at once with its own number, so closing several channels
+   * put several requests in flight, and a drain-wait could send them out of
+   * number order — both refused by a conforming peer. The number is now
+   * taken here, at the moment the request leaves (§5.1.2 A2), and the
+   * waiting requests leave together: one parameter listing all their
+   * streams, the way dcSCTP batches (a request listing every stream is kept
+   * on its own: an empty list means "all streams").
+   */
+  function _pumpReconfig() {
+    if (reconfigOut || reconfigQueue.length === 0) return;
+    if (state !== STATE_ESTABLISHED) return;
+
+    var first = reconfigQueue.shift();
+    var req = { reqSeq: 0, users: first.users.slice(), streamIds: first.users[0].streamIds.slice(),
+                body: null, timer: null, timeout: rto, inProgress: false };
+    if (req.streamIds.length > 0) {
+      while (reconfigQueue.length > 0) {
+        var next = reconfigQueue[0], ids = next.users[0].streamIds;
+        if (ids.length === 0 || req.streamIds.length + ids.length > RECONFIG_MAX_STREAMS) break;
+        reconfigQueue.shift();
+        req.users.push(next.users[0]);
+        req.streamIds = mergeStreamIds(req.streamIds, ids);
+      }
+    }
+
+    req.reqSeq = reconfigReqSeq;
+    reconfigReqSeq = (reconfigReqSeq + 1) >>> 0;
+
+    // PARAM_OUTGOING_SSN_RESET (RFC 6525 §4.1):
+    //   type(2) + len(2) + reqSeq(4) + respSeq(4) + senderLastTsn(4) + sids(2*N)
+    var paramLen = 16 + req.streamIds.length * 2;
+    var bodyLen  = paramLen;
+    if (bodyLen % 4 !== 0) bodyLen += 4 - (bodyLen % 4);   // pad
+    var body = Buffer.alloc(bodyLen);
+    body.writeUInt16BE(PARAM_OUTGOING_SSN_RESET, 0);
+    body.writeUInt16BE(paramLen, 2);
+    body.writeUInt32BE(req.reqSeq, 4);
+    // Re-configuration Response Sequence Number: "the next expected
+    // request sequence number of the peer minus 1" (§5.1.2 A4).
+    body.writeUInt32BE((lastReconfigPeerReqSeen || 0) >>> 0, 8);
+    // A3: the next TSN we assign minus 1 — read now, after the data of
+    // these streams has been given its TSNs, so it covers that data.
+    body.writeUInt32BE((localTsn - 1) >>> 0, 12);
+    for (var i = 0; i < req.streamIds.length; i++) {
+      body.writeUInt16BE(req.streamIds[i] & 0xFFFF, 16 + i * 2);
+    }
+    req.body = body;
+    reconfigOut = req;
+    sendChunk(CHUNK_RECONFIG, 0, body, remoteVerificationTag);
+    _armReconfigTimer(req);
+  }
+
+  // Re-configuration Timer (RFC 6525 §5.1.1): RTO-based, doubled at every
+  // expiry, the same request (same number) retransmitted. A request used
+  // to be sent once: lost, it was never answered and the channel stayed
+  // 'closing' forever.
+  function _armReconfigTimer(req) {
+    _clearReconfigTimer(req);
+    req.timer = setTimeout(function () { _onReconfigTimer(req); }, req.timeout);
+    if (req.timer && typeof req.timer.unref === 'function') req.timer.unref();
+  }
+
+  function _clearReconfigTimer(req) {
+    if (req.timer) { clearTimeout(req.timer); req.timer = null; }
+  }
+
+  function _onReconfigTimer(req) {
+    req.timer = null;
+    if (closed || reconfigOut !== req) return;
+    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_PENDING &&
+        state !== STATE_SHUTDOWN_SENT && state !== STATE_SHUTDOWN_RECEIVED) return;
+    if (req.inProgress) {
+      // H2: the peer answered "In progress" — resend, count nothing. Cleared
+      // so that a peer that stops answering is counted from the next expiry.
+      req.inProgress = false;
+    } else {
+      // An unanswered request counts against Association.Max.Retrans like a
+      // T3 expiry does (RFC 6525 §5.1.1 → RFC 9260 §8.1).
+      assocErrorCount++;
+      if (assocErrorCount > assocMaxRetrans) {
+        sctpStats.pathFailures++;
+        try { ev.emit('pathFailure', { retransmits: assocErrorCount, source: 'reconfig' }); } catch (e) {}
+        sendAbort();
+        finalizeClose();
+        return;
+      }
+      req.timeout = Math.min(req.timeout * 2, rtoMaxMs);
+    }
+    sendChunk(CHUNK_RECONFIG, 0, req.body, remoteVerificationTag);
+    _armReconfigTimer(req);
+  }
+
+  // Public: ask peer to reset (close) the given outgoing streams. The
+  // callback fires with (null, { result, streamIds }) when the peer has
+  // reset them, or with an Error (err.code 'ERR_SCTP_STREAM_RESET',
+  // err.result the RFC 6525 result code) when it refused. Caller can pass
+  // an empty list to reset ALL streams (RFC 6525 §4.1).
+  // If peer doesn't support RECONFIG, the callback fires immediately
+  // with err='peer-no-reconfig' so cm.js can fall back to local-only
+  // close (W3C-compatible degradation).
   function resetStreams(streamIds, callback) {
     if (state !== STATE_ESTABLISHED) {
       if (typeof callback === 'function') {
         queueMicrotask(function() { callback(new Error('not established')); });
       }
-      return null;
+      return;
     }
     if (!Array.isArray(streamIds)) streamIds = [streamIds];
     if (!peerSupportsReconfig) {
       if (typeof callback === 'function') {
         queueMicrotask(function() { callback(new Error('peer-no-reconfig')); });
       }
-      return null;
+      return;
     }
 
-    var reqSeq = reconfigReqSeq;
-    reconfigReqSeq = (reconfigReqSeq + 1) >>> 0;
+    var req = { users: [{ streamIds: streamIds.slice(), callback: callback || null }],
+                drainTimer: null, released: false };
 
-    pendingResetRequests.set(reqSeq, {
-      streamIds: streamIds.slice(),
-      callback:  callback || null,
-    });
-
-    // Build PARAM_OUTGOING_SSN_RESET:
-    //   type(2) + len(2) + reqSeq(4) + respSeq(4) + senderLastTsn(4) + sids(2*N)
-    var paramBodyLen = 12 + streamIds.length * 2;
-    var paramLen     = 4 + paramBodyLen;
-    var bodyLen      = paramLen;
-    if (bodyLen % 4 !== 0) bodyLen += 4 - (bodyLen % 4);   // pad
-
-    // BUILD LATE, SEND LATE — and WAIT FOR THE STREAM TO DRAIN.
+    // SEND LATE — and WAIT FOR THE STREAM TO DRAIN.
     //
     // Two orderings must hold before a RECONFIG may leave:
     //   • it must not overtake data still queued behind the coalescing
@@ -3045,47 +3611,14 @@ function SctpAssociation(config) {
     //   • senderLastTsn must cover that data, which means reading
     //     localTsn only after the data has been assigned its TSNs
     //     (RFC 6525 4.1).
-    // Building the whole parameter inside the deferred sender gives both.
+    // _pumpReconfig builds the parameter when it sends, which gives both.
     // On top of that, if the stream still has UNACKNOWLEDGED chunks the
     // reset waits for them: the peer would otherwise apply the reset
     // while those chunks are in flight and drop them — the "send(msg);
     // close();" data loss. handleSack releases the reset as soon as the
     // stream goes quiet, and a safety timer releases it regardless so a
     // stalled queue can never keep a channel open forever.
-    var _sendReset = function () {
-    var body = Buffer.alloc(bodyLen);
-    body.writeUInt16BE(PARAM_OUTGOING_SSN_RESET, 0);
-    body.writeUInt16BE(paramLen, 2);
-    body.writeUInt32BE(reqSeq, 4);
-    // "Reconfig Response Sequence Number" — peer's last seen response seq.
-    // RFC 6525 §4.1: this is "the next response sequence number expected".
-    // We use the last we saw or 0; not strictly required for our flow.
-    body.writeUInt32BE(lastReconfigPeerReqSeen || 0, 8);
-    body.writeUInt32BE((localTsn - 1) >>> 0, 12);
-    for (var i = 0; i < streamIds.length; i++) {
-      body.writeUInt16BE(streamIds[i] & 0xFFFF, 16 + i * 2);
-    }
-
-    // ORDER WITH PENDING DATA (RFC 8831 6.7 / W3C 6.2.5): user data goes
-    // out through sendQueue on a coalescing MICROTASK, while this
-    // RECONFIG was written synchronously — so a stream reset OVERTOOK
-    // data the application had just sent and the peer closed the stream
-    // before the message arrived. "send(msg); close();" silently lost
-    // msg. queueMicrotask preserves FIFO order and send() already
-    // scheduled its transmit pass, so deferring the RECONFIG the same
-    // way puts it strictly AFTER the data it must not overtake.
-    sendChunk(CHUNK_RECONFIG, 0, body, remoteVerificationTag);
-    };
-
-    // STATUS (round 116): the wait itself works — traced busy=true, the
-    // reset held, released on the SACK. But with an IMMEDIATE close the
-    // peer's SCTP never emits the message at all, so the loss is EARLIER
-    // than this layer: between dcc.send()'s enqueue and the transmit
-    // pass, for that one timing. The two orderings fixed in round 115
-    // and this drain-wait are all RFC-correct and stay; the remaining
-    // piece is why that first chunk never leaves. Next probe: trace
-    // transmitPending's selection for a stream whose channel entered
-    // 'closing' in the same turn.
+    //
     // SCTP-14: W3C close() flushes what the application already sent, so
     // finish enqueuing any in-progress message on these streams rather than
     // dropping its tail. This also settles _streamHasOutstanding into its
@@ -3099,21 +3632,19 @@ function SctpAssociation(config) {
     }
     scheduleTransmit();
 
-    var _busy = streamIds.some(_streamHasOutstanding);
-    if (_busy) {
-      var _entry = { streamIds: streamIds.slice(), send: _sendReset, timer: null };
-      _entry.timer = setTimeout(function () {
-        if (pendingStreamResets.has(reqSeq)) {
-          pendingStreamResets.delete(reqSeq);
-          _sendReset();   // safety net: never leave a channel unclosed
-        }
+    if (streamIds.some(_streamHasOutstanding)) {
+      req.drainTimer = setTimeout(function () {
+        req.drainTimer = null;
+        _releaseStreamReset(req);   // safety net: never leave a channel unclosed
       }, Math.max(200, (typeof rto === 'number' ? rto : 200) * 2));
-      if (_entry.timer && _entry.timer.unref) _entry.timer.unref();
-      pendingStreamResets.set(reqSeq, _entry);
+      if (req.drainTimer && req.drainTimer.unref) req.drainTimer.unref();
+      pendingStreamResets.push(req);
     } else {
-      queueMicrotask(_sendReset);
+      // queueMicrotask preserves FIFO order and the data's transmit pass
+      // was scheduled above, so the RECONFIG leaves strictly AFTER the data
+      // it must not overtake (RFC 8831 6.7 / W3C 6.2.5).
+      queueMicrotask(function () { _releaseStreamReset(req); });
     }
-    return reqSeq;
   }
 
 
@@ -3169,6 +3700,15 @@ function SctpAssociation(config) {
    * We don't include error causes in the body — the empty ABORT is
    * RFC-valid and matches libwebrtc's path-failure ABORT.
    */
+  // The peer broke the protocol: ABORT with cause 13, Protocol Violation.
+  function abortProtocolViolation(info) {
+    try { ev.emit('protocolViolation', info); } catch (e) {}
+    sctpStats.pathFailures++;
+    try { ev.emit('pathFailure', { source: 'protocol', cause: 13 }); } catch (e) {}
+    sendAbort(13);
+    finalizeClose();
+  }
+
   function sendAbort(causeCode) {
     var body = Buffer.alloc(0);
     if (causeCode != null) {
@@ -3176,7 +3716,9 @@ function SctpAssociation(config) {
       body.writeUInt16BE(causeCode, 0);
       body.writeUInt16BE(4, 2);    // length-only error cause (no info)
     }
-    // Bypass the bundling path so ABORT goes out alone.
+    // Bypass the bundling path so ABORT goes out alone; DATA held for this
+    // pass is not sent after it.
+    heldData.length = 0;
     if (pendingOutChunks.length > 0) flushOutChunks();
     emitOneChunk(CHUNK_ABORT, 0, body, remoteVerificationTag);
   }
@@ -3225,11 +3767,6 @@ function SctpAssociation(config) {
   // when it empties.
   var _deliverQueue = [];
   var _deliverHead = 0;
-  // Bytes of messages assembled but not yet handed up. They are held here
-  // exactly like fragStore/pendingMsgs, so they count against the receive
-  // window: a sender that outruns the application is told to slow down
-  // instead of growing this queue without bound.
-  var _deliverBytes = 0;
   // a_rwnd in our last SACK, to know when a draining queue should reopen
   // the window to the peer (see _drainDeliveries).
   var _lastAdvertisedRwnd = null;
@@ -3238,7 +3775,13 @@ function SctpAssociation(config) {
 
   function _drainDeliveries() {
     _deliverScheduled = false;
-    if (closed) { _deliverQueue = []; _deliverHead = 0; _deliverBytes = 0; return; }
+    if (closed) {
+      for (var dq = _deliverHead; dq < _deliverQueue.length; dq++) {
+        if (!_deliverQueue[dq].streamReset) rxHeld -= _deliverQueue[dq][2].length + RX_MSG_CHARGE;
+      }
+      _deliverQueue = []; _deliverHead = 0;
+      return;
+    }
     var item = null;
     if (_deliverHead < _deliverQueue.length) {
       item = _deliverQueue[_deliverHead];
@@ -3251,18 +3794,22 @@ function SctpAssociation(config) {
         _deliverHead = 0;
       }
     }
-    if (item) {
-      _deliverBytes -= item[2].length;
+    if (item && item.streamReset) {
+      // A stream reset queued behind its stream's messages (queueStreamResetNotice).
+      try { ev.emit('streamReset', item.streamReset); } catch (e) {}
+    } else if (item) {
+      rxHeld -= item[2].length + RX_MSG_CHARGE;
       try { ev.emit('data', item[0], item[1], item[2]); } catch (e) { /* a handler must not stall the queue */ }
-      // Window update (RFC 4960 §6.2): if our last SACK told the peer the
-      // window was nearly closed and draining has opened it up again, say
-      // so now rather than waiting for the peer's next window probe.
-      if (_lastAdvertisedRwnd !== null && _lastAdvertisedRwnd < (maxReceiveBufferSize >>> 2) &&
-          state === STATE_ESTABLISHED && myReceiverWindowCredit() >= (maxReceiveBufferSize >>> 1)) {
+      // Window update (RFC 9260 §6.2): our last SACK left the peer less
+      // than one full chunk, and this delivery opened room for one: say so
+      // now rather than waiting for its next window probe.
+      if (_lastAdvertisedRwnd !== null && _lastAdvertisedRwnd < RX_FULL_PAYLOAD &&
+          state === STATE_ESTABLISHED && myReceiverWindowCredit() >= RX_FULL_PAYLOAD) {
         sendSackAndReset();
       }
     }
     if (_deliverHead < _deliverQueue.length) _scheduleDelivery();
+    else if (closeAfterDelivery) finalizeClose();
   }
 
   // setImmediate, not setTimeout(0): same reason as scheduleTxPump. Each
@@ -3311,7 +3858,7 @@ function SctpAssociation(config) {
    */
   function processMessage(streamId, ppid, payload) {
     _deliverQueue.push([streamId, ppid, payload]);
-    _deliverBytes += payload.length;
+    rxHeld += payload.length + RX_MSG_CHARGE;
     _scheduleDelivery();
     return;
   }
@@ -3395,7 +3942,7 @@ function SctpAssociation(config) {
     // TSN we MUST send fully reliably regardless of caller's wish for
     // partial reliability. (Caller can detect this via assoc.peerSupports
     // ForwardTsn if they care.)
-    if (!peerSupportsForwardTsn) {
+    if (!prNegotiated()) {
       maxRetransmits = null;
       maxLifetime    = null;
     }
@@ -3447,9 +3994,15 @@ function SctpAssociation(config) {
     // reassembles by walking a contiguous TSN run (tryAssemble's
     // expectTsn = tsn + 1 walk), so any fragment of another message landing
     // in the middle breaks the chain — for messages on OTHER streams too,
-    // since a gap in the run is a gap regardless of who filled it. So
-    // without I-DATA we keep the old all-at-once behaviour, which is also
-    // what a peer that never advertised the extension expects.
+    // since a gap in the run is a gap regardless of who filled it. So under
+    // classic DATA a long message is still a job, built when the window
+    // reaches it, but whole, in one go (_fillTxQueueInner): no other message
+    // takes a TSN inside its run (classicJobInProgress covers a send() from a
+    // listener while it is built), and the next is chosen when it is done
+    // (selectActiveJobs). Short messages are built at send() as before, ahead
+    // of the long ones still waiting. Built at send(), a backlog of long messages
+    // took every TSN ahead, and a 100 B message on another channel waited
+    // for all of it: 671 ms behind 20 × 256 KiB, against 92 ms with I-DATA.
     var job = {
       streamId:       streamId,
       payload:        payload,
@@ -3472,7 +4025,13 @@ function SctpAssociation(config) {
     };
 
     sampleRates();
-    if (!shouldSlice(useIData, numFragments)) {
+    // One message at a time per stream: while an earlier message of this
+    // stream is still a job, a later one, however short and ordered or not,
+    // queues behind it. Built at once, a short message took TSNs between the
+    // long one's fragments and the receiver held it, ordered behind a MID
+    // still arriving, until its window filled and both sides stalled (F7).
+    // RFC 8260 §2.2.2 lets a stream carry one partially sent message only.
+    if (!shouldSlice(useIData, numFragments) && !streamHasJob(streamId) && !classicJobInProgress()) {
       while (emitFragment(job)) { /* drain synchronously */ }
       // SCTP-13: coalesced transmit. Instead of transmitting inline on every
       // send(), schedule a single transmit pass on the microtask queue. A
@@ -3616,6 +4175,8 @@ function SctpAssociation(config) {
       ppid:           job.ppid,
       ssn:            job.ssn,
       payloadLen:     fragPayload.length,
+      wireLen:        pkt.length - SCTP_HEADER_OVERHEAD,   // the chunk, padded
+      creditLen:      Math.max(pkt.length - SCTP_HEADER_OVERHEAD, PEER_CHUNK_COST),
       flags:          flags,
       packet:         pkt,            // full pre-built wire packet, reused on retransmit
       crcDone:        false,          // standalone CRC written yet (soloPacket)
@@ -3625,6 +4186,7 @@ function SctpAssociation(config) {
       missingReports: 0,
       retxFence:      null,       // fast-retransmitted: the highest TSN sent then (markMissing)
       needsRetx:      false,      // SCTP-14: set by T3 (RFC 4960 §6.3.3 E3)
+      everSent:       false,      // inside the sentCount prefix
       messageSeq:     job.messageSeq,
       mid:            job.mid,        // SCTP-14: needed for I-FORWARD-TSN skips
       maxRetransmits: job.maxRetransmits,
@@ -3763,7 +4325,6 @@ function SctpAssociation(config) {
 
   /* Should this message be sliced? */
   function shouldSlice(useIData, numFragments) {
-    if (!useIData) return false;                        // classic DATA cannot interleave
     if (numFragments <= INTERLEAVE_SYNC_FRAGMENTS) return false;
     if (interleaveMode === 'never') return false;
     if (interleaveMode === 'adaptive' && bidirectionalLoad) return false;
@@ -3784,8 +4345,7 @@ function SctpAssociation(config) {
     // the window opens, and keep handleSack's hasPending test true so cwnd
     // still grows. Both need only the unfilled part of the window plus a
     // little headroom — not a second copy of the window.
-    var w    = Math.min(cwnd, remoteRwnd);
-    var room = Math.max(0, w - outstandingBytes);
+    var room = Math.max(0, Math.min(cwnd - outstandingBytes, remoteRwnd - creditOutstanding));
     return room + INTERLEAVE_QUANTUM * pmtu;
   }
 
@@ -3821,6 +4381,7 @@ function SctpAssociation(config) {
   }
 
   function _fillTxQueueInner(maxFragments) {
+    if (lifetimeEverUsed) abandonExpiredJobs(Date.now());
     var target = txRefillTarget();
     var built  = 0;
     var order  = selectActiveJobs();
@@ -3830,7 +4391,9 @@ function SctpAssociation(config) {
         var job = order[i];
         if (txJobs.indexOf(job) === -1) continue;   // finished earlier this pass
         var more = true;
-        for (var q = 0; q < INTERLEAVE_QUANTUM && more; q++) {
+        // A classic-DATA job is built whole once picked: its fragments are one
+        // TSN run, and a short message sent meanwhile need not wait as a job.
+        for (var q = 0; (q < INTERLEAVE_QUANTUM || !job.useIData) && more; q++) {
           more = emitFragment(job);
           built++;
           progressed = true;
@@ -3863,6 +4426,45 @@ function SctpAssociation(config) {
     return built > 0;
   }
 
+  /* PR-SCTP lifetime BEFORE transmission (RFC 9260 §10.1 / RFC 3758 timed
+   * reliability, W3C maxPacketLifeTime): a message whose lifetime has run out
+   * is abandoned, never transmitted late. Only the SACK sweep (handleSack)
+   * used to check it, and only for chunks already in sendQueue, so a message
+   * still waiting as a job — or queued behind a closed window — went out
+   * long after its deadline (measured: 520 of 547 messages first sent past a
+   * 50 ms lifetime). Checked where data is chunked (abandonExpiredJobs) and
+   * where it is transmitted (abandonExpiredUnsent); abandonMessages covers
+   * the hole with FORWARD-TSN as for any other abandonment.
+   *
+   * A job never started holds an SSN/MID but no TSN, and a FORWARD-TSN can
+   * only skip a message through a TSN: its first fragment is built (never
+   * sent) so the skip is announced like any other. An unordered message
+   * under classic DATA leaves no hole to skip and is just dropped. At the
+   * top of a fill pass no classic job is half-built (a pass builds one
+   * whole), so the extra fragment cannot split another message's TSN run. */
+  function abandonExpiredJobs(now) {
+    var seqs = null;
+    for (var i = 0; i < txJobs.length; i++) {
+      var job = txJobs[i];
+      if (job.maxLifetime == null || now - job.createdAt < job.maxLifetime) continue;
+      if (job.cursor === 0 && (job.useIData || !job.unordered)) emitFragment(job);
+      (seqs || (seqs = new Set())).add(job.messageSeq);
+    }
+    if (seqs) abandonMessages(seqs);
+  }
+
+  // The chunks a transmit pass may send: new ones, and any waiting to be
+  // sent again (a retransmission past the lifetime is not sent either).
+  function abandonExpiredUnsent(now) {
+    var seqs = null;
+    for (var i = retxCount > 0 ? 0 : sentCount; i < sendQueue.length; i++) {
+      var e = sendQueue[i];
+      if (e.inFlight || e.maxLifetime == null || now - e.firstSentAt < e.maxLifetime) continue;
+      (seqs || (seqs = new Set())).add(e.messageSeq);
+    }
+    if (seqs) abandonMessages(seqs);
+  }
+
   /* Which jobs get to run this pass. Shortest REMAINING work first, not
    * arrival order.
    *
@@ -3874,19 +4476,56 @@ function SctpAssociation(config) {
    *
    * Shortest-remaining-first is the right rule here (it minimises mean
    * completion time), and it is the rule that matches what people expect: the
-   * small thing does not wait for the big thing. To stop a steady drip of
+   * small thing does not wait for the big thing on another stream (on its
+   * own stream it waits, see sendData). To stop a steady drip of
    * small messages from starving a large transfer, the OLDEST job always
    * holds one slot regardless of size, so the bulk transfer keeps draining.
    */
+  function streamHasJob(streamId) {
+    for (var i = txJobs.length - 1; i >= 0; i--) if (txJobs[i].streamId === streamId) return true;
+    return false;
+  }
+
+  // Classic DATA: a long message part-built, whose fragments must stay one
+  // TSN run (see sendData).
+  function classicJobInProgress() {
+    for (var i = 0; i < txJobs.length; i++) {
+      var j = txJobs[i];
+      if (!j.useIData && j.cursor > 0) return true;
+    }
+    return false;
+  }
+
+  var classicPickedOldest = false;   // classic DATA: the last pick (selectActiveJobs)
   function selectActiveJobs() {
     // Total on an empty list. fillTxQueue re-selects every time a job
     // finishes, and the job that finishes may have been the last one — which
     // is the normal end of every transfer, not an edge case.
     if (txJobs.length === 0) return [];
     var oldest = txJobs[0];
-    var pool   = txJobs.slice(1).sort(function (x, y) {
+    // Only the oldest job of each stream may run (see sendData): the others
+    // wait their turn on their stream, whatever their size.
+    var heads = [], seen = new Set([oldest.streamId]);
+    for (var h = 1; h < txJobs.length; h++) {
+      if (seen.has(txJobs[h].streamId)) continue;
+      seen.add(txJobs[h].streamId);
+      heads.push(txJobs[h]);
+    }
+    var pool   = heads.sort(function (x, y) {
       return (x.numFragments - x.cursor) - (y.numFragments - y.cursor);
     });
+    // Classic DATA: one message at a time, the part-built one until it is
+    // done; then the shortest remaining head, but the oldest at least every
+    // other time, so neither the small messages nor a bulk transfer wait for
+    // the other.
+    if (!oldest.useIData) {
+      for (var c = 0; c < txJobs.length; c++) if (txJobs[c].cursor > 0) return [txJobs[c]];
+      var pick = oldest;
+      if (classicPickedOldest && pool.length > 0 &&
+          pool[0].numFragments - pool[0].cursor < oldest.numFragments - oldest.cursor) pick = pool[0];
+      classicPickedOldest = (pick === oldest);
+      return [pick];
+    }
 
     /* ── Byte budget, not just a message count ──
      *
@@ -4041,30 +4680,43 @@ function SctpAssociation(config) {
   }
 
   /* SCTP-8 + SCTP-9: walk sendQueue, promote pending entries to in-flight
-   * while outstandingBytes + entry.payloadLen <= effectiveWindow, where
-   * effectiveWindow = min(cwnd, remoteRwnd). cwnd governs congestion
-   * (our rate); rwnd governs flow control (peer's buffer). Whichever is
+   * while the chunk fits both windows: cwnd against the flight in wire
+   * bytes (congestion, our rate), remoteRwnd against its cost to the peer
+   * (flow control, the peer's buffer; see creditOutstanding). Whichever is
    * tighter wins.
    *
    * Special case: per RFC 4960 §6.1, the sender MAY transmit one full
    * MTU even when the offered window is zero, to probe for window
    * re-opening. We honour this when outstandingBytes === 0 (nothing in
-   * flight) and the effective window is 0 — send ONE chunk so peer's
+   * flight) and the next chunk fits neither window — send ONE chunk so peer's
    * next SACK tells us whether the window has opened.
    *
-   * Performance: queue invariant says sendQueue[0..inFlightCount-1] are
-   * all in-flight and sendQueue[inFlightCount..] are all pending. So we
-   * skip directly to the first pending — no per-entry inFlight check,
-   * no wasted iterations over the (potentially long) in-flight prefix.
+   * Performance: new data starts at sentCount, so the (potentially long)
+   * sent prefix is walked only while chunks wait to be sent again.
    * Hot path: gets called from sendData and handleSack, both per-message.
    */
+  // A transmit pass holds its packets to its end (P11, flushPacketOutput):
+  // a SACK the delayed-SACK timer still owes goes now, inside the first DATA
+  // packet, rather than alone later — the peer learns sooner and one
+  // datagram fewer is sent (usrsctp bundles it the same way).
   function transmitPending() {
+    packetDepth++;
+    try {
+      transmitPass();
+    } finally {
+      if (packetDepth === 1 && heldData.length > 0 && delayedSackTimer) sendSackAndReset();
+      packetDepth--;
+      if (packetDepth === 0) flushPacketOutput();
+    }
+  }
+
+  function transmitPass() {
     // SCTP-14: top the queue up FIRST, in this same turn. A SACK that opened
     // the window must find data ready to go, and handleSack's cwnd-growth
     // test must find a non-empty pending region.
     if (txJobs.length > 0) fillTxQueue(TX_REFILL_BURST);
-    if (inFlightCount === sendQueue.length) return;   // nothing pending
-    var effectiveWindow = Math.min(cwnd, remoteRwnd);
+    if (lifetimeEverUsed) abandonExpiredUnsent(Date.now());
+    if (retxCount === 0 && sentCount === sendQueue.length) return;   // nothing pending
     // ── SCTP-14: window-probe condition (RFC 4960 §6.1) ──
     //
     // The probe must fire whenever nothing is in flight and the next chunk
@@ -4076,8 +4728,8 @@ function SctpAssociation(config) {
     // retransmit timer running because nothing was ever in flight.
     //
     // It is reachable without interleaving but interleaving walks straight
-    // into it. The receiver advertises (maxReceiveBufferSize − bytes held in
-    // reassembly), and interleaving is precisely the feature that keeps N
+    // into it. The receiver advertises what is left of its window after what
+    // it holds, and interleaving is precisely the feature that keeps N
     // messages PARTIALLY assembled at once instead of completing them one at
     // a time. Held bytes therefore scale with concurrency, the advertised
     // window shrinks toward zero, and it passes through "smaller than one
@@ -4125,7 +4777,7 @@ function SctpAssociation(config) {
         // Single chunk — emit its standalone packet untouched (byte-for-
         // byte identical to the non-bundled path; no concat, no CRC redo).
         _sctpDiagPacket(soloPacket(bundle[0]), 'bundle');
-        ev.emit('packet', bundle[0].packet);
+        emitDataPacket(bundle[0].packet);
       } else {
         var parts = new Array(bundle.length + 1);
         var header = Buffer.allocUnsafe(SCTP_HEADER_OVERHEAD);
@@ -4141,7 +4793,7 @@ function SctpAssociation(config) {
         }
         var pkt = Buffer.concat(parts);
         pkt.writeUInt32LE(crc32c(pkt), 8);                 // CRC over whole datagram
-        ev.emit('packet', pkt);
+        emitDataPacket(pkt);
         sctpStats.chunksBundled += bundle.length;
         sctpStats.bundledPackets++;
       }
@@ -4150,12 +4802,24 @@ function SctpAssociation(config) {
     }
 
     var packetsOut = 0;     // packets emitted this pass (Max.Burst)
-    for (var i = inFlightCount; i < sendQueue.length; i++) {
+    // Chunks waiting to be sent again go first, lowest TSN first (RFC 9260
+    // §6.1 C), then new data from the end of the sent prefix.
+    var retrying = retxCount > 0;
+    for (var i = retrying ? 0 : sentCount; ; i++) {
+      if (retrying) {
+        while (i < sentCount && !sendQueue[i].needsRetx) i++;
+        if (i >= sentCount) { retrying = false; i = sentCount; }
+      }
+      if (i >= sendQueue.length) break;
       var entry = sendQueue[i];
       // Invariant: entry.inFlight === false here.
-      if ((outstandingBytes + entry.payloadLen) > effectiveWindow && !probeAllowed) {
-        break;   // stop at the first non-fitting entry
+      if (!probeAllowed) {   // stop at the first non-fitting entry
+        if (outstandingBytes + entry.wireLen > cwnd) { sctpStats.txHeldBy.cwnd++; break; }
+        if (creditOutstanding + entry.creditLen > remoteRwnd) { sctpStats.txHeldBy.rwnd++; break; }
       }
+      // New data stays within 65535 TSNs of the peer's cumulative ack, so
+      // its gap blocks (16-bit offsets) can always describe what it holds.
+      if (!retrying && sackCumSeen !== null && ((entry.tsn - sackCumSeen) >>> 0) > 65535) break;
       // Max.Burst: no more packets than that in one pass — the rest go as
       // the SACKs for these come back (ack-clocked).
       var nextLen = entry.packet.length - SCTP_HEADER_OVERHEAD;
@@ -4171,8 +4835,14 @@ function SctpAssociation(config) {
       // that needs it long — and keeps the PR-SCTP retransmit budget real.
       if (entry.needsRetx) {
         entry.needsRetx = false;
+        retxCount--;
         entry.retransmits++;
         sctpStats.chunksRetransmitted++;
+      }
+      if (!entry.everSent) {
+        entry.everSent = true;
+        sentCount++;
+        highestTsnSent = entry.tsn;
       }
       entry.inFlight    = true;
       entry.gapAcked    = false;   // sent (again): in the flight until the peer reports it
@@ -4184,7 +4854,7 @@ function SctpAssociation(config) {
         entry.transmitted = true;
         emitUnbuffered(entry.streamId, entry.ppid, entry.payloadLen);
       }
-      outstandingBytes += entry.payloadLen;
+      flightAdd(entry);
       pendingBytes     -= entry.payloadLen;
       inFlightCount++;
 
@@ -4194,7 +4864,7 @@ function SctpAssociation(config) {
       if (chunkLen > maxChunksBytes) {
         flushBundle();
         packetsOut++;
-        ev.emit('packet', soloPacket(entry));
+        emitDataPacket(soloPacket(entry));
         continue;
       }
       // Won't fit alongside the current bundle → flush and start fresh.
@@ -4205,48 +4875,17 @@ function SctpAssociation(config) {
     flushBundle();   // emit the final partial bundle
   }
 
-  /* SCTP-8: pion-style receive-window credit (getMyReceiverWindowCredit).
-   *
-   * We advertise (maxReceiveBufferSize − bytesHeldInReassembly) instead of
-   * a fixed window, so the peer is told to slow down when our reassembly /
-   * reorder buffers fill and to resume as they drain. This is the exact
-   * shape pion uses, and mirrors usrsctp/Linux (minus Linux's optional
-   * >>1 halving — we advertise the full remaining space like pion).
-   *
-   * CRITICAL SAFETY PROPERTY: this is recomputed from the LIVE buffer
-   * contents on every SACK, NOT tracked as a running counter. A running
-   * counter that mis-decrements is the classic a_rwnd bug (window stuck at
-   * 0 forever → total receive stall) that the Linux kernel fixed in
-   * ef2820a7. Deriving from ground truth each time makes that class of bug
-   * structurally impossible: if the buffers are empty, the window is full,
-   * period.
-   *
-   * Assembled messages wait in the delivery queue (one handed up per task)
-   * and count too (_deliverBytes, kept exactly in step with the queue). With
-   * an application that keeps up, held bytes stay near 0 and the window sits
-   * near maxReceiveBufferSize. It shrinks during active fragmentation,
-   * SSN-reordering, or when the application falls behind — exactly when flow
-   * control should engage. A useful side effect: the
-   * pendingMsgs / fragStore overflow paths become effectively unreachable
-   * with a compliant peer, because the advertised window closes before the
-   * reorder buffer can fill (fixing the silent-drop-on-overflow hazard).
-   *
-   * Cost: O(total buffered fragments/messages), which is bounded
-   * (MAX_FRAGS_PER_STREAM / MAX_PENDING_MSGS_PER_STREAM) and normally zero.
-   * Called once per SACK (delayed-ACK batched), not per chunk.
+  /* SCTP-8: the receive window we advertise: what is left of rxWindow,
+   * converted to payload bytes at the full-chunk rate, so a bulk sender that
+   * counts payload fills rxWindow exactly. A sender of small chunks costs us
+   * more per byte than this credit pays for; it meets the receive rule
+   * (admitChunk), which then drops chunks unmarked or takes them through the
+   * lane. rxHeld is kept by the stores themselves (see rxMap), so this is
+   * O(1) per SACK.
    */
   function myReceiverWindowCredit() {
-    var held = _deliverBytes;
-    var fk = Object.keys(fragStore);
-    for (var i = 0; i < fk.length; i++) {
-      for (var f of fragStore[fk[i]].values()) held += f.payload.length;
-    }
-    var pk = Object.keys(pendingMsgs);
-    for (var j = 0; j < pk.length; j++) {
-      for (var m of pendingMsgs[pk[j]].values()) held += m.payload.length;
-    }
-    if (held >= maxReceiveBufferSize) return 0;
-    return maxReceiveBufferSize - held;
+    if (rxHeld >= rxWindow) return 0;
+    return Math.floor((rxWindow - rxHeld) * RX_FULL_PAYLOAD / RX_FULL_CHARGE);
   }
 
   function sendSack() {
@@ -4292,10 +4931,7 @@ function SctpAssociation(config) {
     var body = Buffer.alloc(bodyLen);
 
     body.writeUInt32BE(lastCumulativeTsn, 0);
-    // Advertised receive window: maxReceiveBufferSize minus what we're
-    // currently holding un-delivered (pion getMyReceiverWindowCredit).
-    // Dynamic, so it shrinks under reassembly/reorder pressure and the
-    // peer applies real flow control. Was a fixed DEFAULT_A_RWND (64 KB).
+    // Advertised receive window: what is left of ours (myReceiverWindowCredit).
     _lastAdvertisedRwnd = myReceiverWindowCredit();
     body.writeUInt32BE(_lastAdvertisedRwnd, 4);
     body.writeUInt16BE(gaps.length, 8);
@@ -4481,6 +5117,57 @@ function SctpAssociation(config) {
     ev.emit('packet', pkt);
   }
 
+  /* P11: a SACK in the DATA packet of the same pass (RFC 9260 §6.10).
+   *
+   * Inside handlePacket a SACK opens the window and transmitPending sends;
+   * the SACK for the same packet was its own datagram, after the DATA. The
+   * DATA packets of the pass now wait for the end of handlePacket (same
+   * task, no delay), and the replies queued in pendingOutChunks go in front
+   * of the first one when they fit under the PMTU: control chunks first, as
+   * §6.10 requires. When they do not (a PMTU-sized fragment), the replies go
+   * alone, first. With both sides sending, a third of the datagrams were a
+   * SACK alone. */
+  var heldData = [];
+  function emitDataPacket(pkt) {
+    if (packetDepth > 0) heldData.push(pkt);
+    else ev.emit('packet', pkt);
+  }
+  function flushPacketOutput() {
+    if (heldData.length === 0) { flushOutChunks(); return; }
+    var data = heldData;
+    heldData = [];
+    var first = data[0], from = 0;
+    if (pendingOutChunks.length > 0) {
+      var vt = first.readUInt32BE(4), ctl = 0, same = true;
+      for (var i = 0; i < pendingOutChunks.length; i++) {
+        var cl = 4 + pendingOutChunks[i].chunkBody.length;
+        ctl += cl + ((cl % 4) ? 4 - (cl % 4) : 0);
+        if (pendingOutChunks[i].vtag !== vt) same = false;
+      }
+      if (same && first.length + ctl <= pmtu) {
+        var pkt = Buffer.allocUnsafe(first.length + ctl);
+        first.copy(pkt, 0, 0, SCTP_HEADER_OVERHEAD);
+        var off = SCTP_HEADER_OVERHEAD;
+        for (var j = 0; j < pendingOutChunks.length; j++) {
+          var c = pendingOutChunks[j], len = 4 + c.chunkBody.length, end = off + len + ((len % 4) ? 4 - (len % 4) : 0);
+          pkt[off] = c.chunkType; pkt[off + 1] = c.chunkFlags; pkt.writeUInt16BE(len, off + 2);
+          c.chunkBody.copy(pkt, off + 4);
+          pkt.fill(0, off + len, end);
+          off = end;
+        }
+        first.copy(pkt, off, SCTP_HEADER_OVERHEAD);
+        pkt.writeUInt32LE(0, 8);
+        pkt.writeUInt32LE(crc32c(pkt), 8);
+        pendingOutChunks.length = 0;
+        sctpStats.repliesBundled++;
+        ev.emit('packet', pkt);
+        from = 1;
+      }
+    }
+    if (from === 0) flushOutChunks();
+    for (var k = from; k < data.length; k++) ev.emit('packet', data[k]);
+  }
+
   function flushOutChunks() {
     if (pendingOutChunks.length === 0) return;
     if (pendingOutChunks.length === 1) {
@@ -4560,8 +5247,16 @@ function SctpAssociation(config) {
   // deadline moves EARLIER than the running one.)
   var t3Deadline = 0;
   var t3FireAt = 0;
+  // T3 covers everything outstanding: DATA sent and not cumulatively acked
+  // (in flight, gap-acked or waiting to be sent again), and a FORWARD-TSN
+  // the peer has not confirmed. Without the last, a lost FORWARD-TSN with
+  // no DATA behind it was never resent: no SACK came to trigger it.
+  function forwardPending() {
+    return lastForwardTsnSent !== undefined && (sackCumSeen === null || tsnGt(lastForwardTsnSent, sackCumSeen));
+  }
+  function t3Needed() { return sentCount > 0 || forwardPending(); }
   function startT3Timer() {
-    if (sendQueue.length === 0) { clearT3Timer(); return; }
+    if (!t3Needed()) { clearT3Timer(); return; }
     t3Deadline = Date.now() + rto;
     if (t3Timer && t3FireAt <= t3Deadline) return;
     clearT3Timer();
@@ -4595,17 +5290,19 @@ function SctpAssociation(config) {
         state !== STATE_SHUTDOWN_SENT) {
       return;
     }
-    // SCTP-8: nothing in flight → no T3 work. Pending entries don't get
-    // covered by T3 (they were never transmitted; rwnd-deferred).
-    if (inFlightCount === 0) return;
+    // Nothing outstanding → no T3 work. Chunks never sent are not covered
+    // (they were held back by the window).
+    if (!t3Needed()) return;
 
     sctpStats.rtoExpiries++;
+    var now = Date.now();
 
-    // Queue invariant: sendQueue[0..inFlightCount-1] are all in-flight,
-    // and we got here only when inFlightCount > 0. So sendQueue[0] is
-    // always the oldest in-flight entry — no search needed.
-    var oldest = sendQueue[0];
-    var now    = Date.now();
+    // The earliest chunk the peer does not hold. Gap-acked chunks are not
+    // lost (they may be reneged, which a SACK reports).
+    var oldest = null;
+    for (var oi = 0; oi < sentCount; oi++) {
+      if (!sendQueue[oi].gapAcked) { oldest = sendQueue[oi]; break; }
+    }
 
     // SCTP-6: PR-SCTP abandon check. If the user marked this message with
     // a maxRetransmits/maxLifetime that's now exceeded, drop the whole
@@ -4613,17 +5310,17 @@ function SctpAssociation(config) {
     // NOT increase RTO on abandon (path isn't necessarily slow — we just
     // chose to give up on this chunk).
     //
-    // Not only the oldest: every in-flight chunk that is lost by now and may
-    // not be resent goes with it (RFC 3758 §3.5 A3 — at T3 all outstanding
+    // Not only the oldest: every outstanding chunk that is lost by now and
+    // may not be resent goes with it (RFC 3758 §3.5 A3 — at T3 all outstanding
     // data is up for retransmission, and each chunk is checked for
     // abandonment). Lost = not gap-acked, and either passed over by the
     // peer (below the highest TSN it reported) or out a full RTO. Abandoning
     // just the oldest drained a burst's tail at one message per RTO: after
     // the sender goes quiet no SACKs come to report the other holes.
-    if (shouldAbandon(oldest, now)) {
+    if (oldest && shouldAbandon(oldest, now)) {
       var lost = new Set();
       lost.add(oldest.messageSeq);
-      for (var li = 1; li < inFlightCount; li++) {
+      for (var li = 0; li < sentCount; li++) {
         var le = sendQueue[li];
         if (le.gapAcked || lost.has(le.messageSeq) || !shouldAbandon(le, now)) continue;
         if ((peerHighestSeen !== null && tsnLt(le.tsn, peerHighestSeen)) ||
@@ -4632,87 +5329,75 @@ function SctpAssociation(config) {
         }
       }
       abandonMessages(lost);
-      if (inFlightCount > 0) startT3Timer();   // current rto, no doubling
+      if (t3Needed()) startT3Timer();   // current rto, no doubling
       return;
     }
 
-    // Per RFC 4960 §6.3.3: retransmit the oldest unacked chunk and double
-    // the RTO. (Some implementations retransmit all chunks below cwnd; we
-    // keep it minimal here. SCTP-9's congestion control will revisit.)
-    oldest.retransmits++;
-
-    if (oldest.retransmits > assocMaxRetrans) {
-      // Path is dead. RFC 4960 §8.2: declare unreachable and send ABORT.
-      // sendAbort uses our remoteVerificationTag (T-bit clear); peer
-      // tears down on receipt without acking, completing the implicit
-      // close. Without this peer keeps retransmitting until their own
-      // T3 budget exhausts.
+    // RFC 9260 §8.1: one more consecutive expiry; past the limit the peer is
+    // unreachable. sendAbort uses our remoteVerificationTag (T-bit clear);
+    // the peer tears down on receipt without acking. Without it the peer
+    // keeps retransmitting until its own T3 budget runs out.
+    assocErrorCount++;
+    if (assocErrorCount > assocMaxRetrans) {
       sctpStats.pathFailures++;
-      try { ev.emit('pathFailure', { retransmits: oldest.retransmits }); } catch (e) {}
+      try { ev.emit('pathFailure', { retransmits: assocErrorCount }); } catch (e) {}
       sendAbort();
       finalizeClose();
       return;
     }
 
-    // ── SCTP-14: RFC 4960 §6.3.3 E3 — release the whole outstanding window ──
+    // ── RFC 9260 §6.3.3 E3: every unacknowledged chunk is marked ──
     //
-    // The old code retransmitted sendQueue[0] and left every OTHER in-flight
-    // chunk marked inFlight = true. Those chunks were presumed lost, yet they
-    // kept their share of outstandingBytes forever, so transmitPending's
-    //
-    //     (outstandingBytes + entry.payloadLen) > effectiveWindow  ->  break
-    //
-    // test could never pass again: cwnd had just been cut to one MTU while
-    // outstandingBytes still counted the entire pre-loss window. From that
-    // point the association advanced only by one T3 retransmit per RTO, with
-    // the RTO doubling each time — and because only one chunk was ever in
-    // flight, the peer's SACKs carried no gap blocks, so fast retransmit
-    // could not fire either. Measured: 10 retransmits in 80 seconds, all T3,
-    // zero fast retransmits, cwnd pinned at 1200.
-    //
-    // E3 says to mark all outstanding data for retransmission and then send
-    // what cwnd allows. Clearing inFlight puts them back in the pending
-    // region, where transmitPending re-sends them in TSN order as the window
-    // reopens. needsRetx keeps two things honest on the way back out: the
-    // chunk must count as a retransmission, and it must not produce an RTT
-    // sample (Karn's algorithm — sendQueue's retransmits === 0 test is what
-    // gates that).
-    //
-    // Interleaving is what made this pre-existing bug load-bearing. Serial
-    // sending lays a message's fragments in one contiguous TSN run, so when a
-    // T3 finally pushes sendQueue[0] through, the cumulative ack sweeps the
-    // whole already-received run behind it and frees a large block of
-    // outstandingBytes in one go — the association claws its way out.
-    // Interleaved, the holes are scattered among four messages, each cum-ack
-    // advance stops at the next hole a few chunks later, and the recovery
-    // never gets going.
-    for (var ri = 0; ri < inFlightCount; ri++) {
+    // Retransmitting only the oldest and leaving the rest in the flight kept
+    // their bytes in outstandingBytes after cwnd fell to one MTU, so nothing
+    // else could go out: one T3 retransmit per RTO, the RTO doubling (SCTP-14,
+    // measured: 10 retransmits in 80 s, cwnd pinned at 1200). Marked chunks
+    // leave the flight and go out again through transmitPending, lowest TSN
+    // first, as cwnd allows; needsRetx makes each count as a retransmission
+    // (Karn's rule, the PR-SCTP budget). Gap-acked chunks stay acked: the
+    // peer has them, and resending them flooded it with duplicates.
+    // A marked chunk that may not be sent again (its PR-SCTP budget or
+    // lifetime is spent: maxRetransmits 0 is always spent) is abandoned
+    // instead (RFC 3758 §3.5 A3). Marked anyway, it went out a second time
+    // whenever the oldest chunk was a reliable one.
+    var spent = null;
+    for (var ri = 0; ri < sentCount; ri++) {
       var re = sendQueue[ri];
+      re.missingReports = 0;   // reports from before the timeout are void (RFC 9260 §6.3.3)
+      re.retxFence = null;     // resent by T3: counted afresh
+      if (!re.inFlight || re.gapAcked) continue;
+      if (shouldAbandon(re, now)) { (spent || (spent = new Set())).add(re.messageSeq); continue; }
       re.inFlight  = false;
       re.needsRetx = true;
-      re.gapAcked  = false;
-      re.missingReports = 0;   // reports from before the timeout are void (RFC 4960 §6.3.3)
-      re.retxFence = null;            // resent by T3: counted afresh
-      pendingBytes += re.payloadLen;   // SCTP-14: moved in-flight -> pending
+      retxCount++;
+      inFlightCount--;
+      flightSub(re);
+      pendingBytes     += re.payloadLen;
     }
-    outstandingBytes = 0;
-    inFlightCount    = 0;
-    gapCoverage      = [];   // nothing is in flight now; the next SACK marks afresh
-
-    oldest.sentAt = now;
-    oldest.missingReports = 0;   // expiry supersedes any in-flight gap reporting
-    oldest.retxFence = null;
     fastRecoveryExit = null;     // a T3 expiry ends Fast Recovery (RFC 9260 §7.2.4)
-    // Retransmit the oldest chunk here and now; the rest go out through
-    // transmitPending as cwnd (one MTU, then slow start) permits.
-    oldest.needsRetx = false;    // already counted via oldest.retransmits++ above
-    oldest.inFlight  = true;
-    outstandingBytes = oldest.payloadLen;
-    pendingBytes    -= oldest.payloadLen;
-    inFlightCount    = 1;
-    // P2: re-emit pre-built packet (zero-alloc retransmit path).
-    ev.emit('packet', soloPacket(oldest));
-    sctpStats.chunksRetransmitted++;
+    if (spent) abandonMessages(spent);
+
+    // An unconfirmed FORWARD-TSN goes again first; then the earliest marked
+    // chunk, here and now, the rest as cwnd (one MTU, then slow start)
+    // permits.
+    if (forwardPending()) sendForwardTsn(advancedPeerAckPoint());
+    var first = null;
+    for (var fi = 0; fi < sentCount; fi++) {
+      if (sendQueue[fi].needsRetx) { first = sendQueue[fi]; break; }
+    }
+    if (first) {
+      first.needsRetx = false;
+      retxCount--;
+      first.retransmits++;
+      first.inFlight = true;
+      inFlightCount++;
+      flightAdd(first);
+      pendingBytes     -= first.payloadLen;
+      first.sentAt = now;
+      // P2: re-emit pre-built packet (zero-alloc retransmit path).
+      ev.emit('packet', soloPacket(first));
+      sctpStats.chunksRetransmitted++;
+    }
 
     // SCTP-9: T3 expiry signals heavy congestion. Per RFC 4960 §7.2.3:
     //   ssthresh = max(cwnd/2, 4*MTU)
@@ -4748,7 +5433,7 @@ function SctpAssociation(config) {
    * defend in depth: the test runs anyway.)
    */
   function shouldAbandon(entry, now) {
-    if (!peerSupportsForwardTsn) return false;
+    if (!prNegotiated()) return false;
     if (entry.maxRetransmits != null && entry.retransmits >= entry.maxRetransmits) return true;
     if (entry.maxLifetime    != null && (now - entry.firstSentAt) >= entry.maxLifetime) return true;
     return false;
@@ -4779,11 +5464,13 @@ function SctpAssociation(config) {
    */
   function chunkRemoved(entry) {
     if (entry.inFlight) {
-      if (!entry.gapAcked) outstandingBytes -= entry.payloadLen;   // a gap-acked one left the flight already
+      if (!entry.gapAcked) flightSub(entry);   // a gap-acked one left the flight already
       inFlightCount--;
     } else {
       pendingBytes -= entry.payloadLen;   // SCTP-14
+      if (entry.needsRetx) retxCount--;
     }
+    if (entry.everSent) sentCount--;
     // Leaving the queue without ever being sent (abandoned, stream reset):
     // its bytes stop being buffered too.
     if (!entry.transmitted) {
@@ -4840,8 +5527,7 @@ function SctpAssociation(config) {
         // remember the highest SSN we've abandoned per stream. Sent in
         // the FORWARD-TSN body so peer's recvSSN can jump past the gap
         // — without this, peer holds the stream waiting for a message
-        // that will never arrive (until the MAX_PENDING_MSGS_PER_STREAM
-        // safety cap kicks in, which is a coarse fallback).
+        // that will never arrive.
         if (peerSupportsIData) {
           // SCTP-14 / RFC 8260 §2.3.1: under interleaving the skip list
           // carries 32-bit MIDs, and — unlike classic FORWARD-TSN — entries
@@ -4856,9 +5542,13 @@ function SctpAssociation(config) {
             iPrev.tsn = entry.tsn;   // same message, later fragment: track its highest TSN
           }
         } else if (!entry.unordered) {
-          var prev = abandonedSSNPerStream[entry.streamId];
-          if (prev === undefined || ssnGt(entry.ssn, prev)) {
-            abandonedSSNPerStream[entry.streamId] = entry.ssn;
+          var list = abandonedSSNPerStream[entry.streamId] || (abandonedSSNPerStream[entry.streamId] = []);
+          var item = null;
+          for (var ai = list.length - 1; ai >= 0 && !item; ai--) if (list[ai].ssn === entry.ssn) item = list[ai];
+          if (!item) list.push({ ssn: entry.ssn, lo: entry.tsn, hi: entry.tsn });
+          else {
+            if (tsnLt(entry.tsn, item.lo)) item.lo = entry.tsn;
+            if (tsnGt(entry.tsn, item.hi)) item.hi = entry.tsn;
           }
         }
 
@@ -4901,15 +5591,10 @@ function SctpAssociation(config) {
    * needed. We use sctpStats.chunksAbandoned as the cheap "ever
    * abandoned anything?" flag.
    *
-   * Note: optional Stream/SSN pairs in FORWARD-TSN (RFC 3758 §3.2) are
-   * deferred. Without them, peer's per-stream recvSSN doesn't auto-skip
-   * past abandoned ordered messages — receive side falls back to the
-   * MAX_PENDING_MSGS_PER_STREAM cap (Patch 2 / SCTP-5) which eventually
-   * unsticks the stream by dropping its pending buffer wholesale. We
-   * accept this trade for now.
+   * The Stream/SSN pairs (RFC 3758 §3.2) are written by sendForwardTsn.
    */
   function maybeFwdTsn() {
-    if (!peerSupportsForwardTsn) return;
+    if (!prNegotiated()) return;
     if (sctpStats.chunksAbandoned === 0) return;
 
     var advPt = advancedPeerAckPoint();
@@ -4917,6 +5602,7 @@ function SctpAssociation(config) {
     if (lastForwardTsnSent !== undefined && !tsnGt(advPt, lastForwardTsnSent)) return;
 
     sendForwardTsn(advPt);
+    if (!t3Timer) startT3Timer();   // the FORWARD-TSN is outstanding too
   }
 
   /* The point FORWARD-TSN may move the peer's cumulative TSN to: just below
@@ -4970,7 +5656,7 @@ function SctpAssociation(config) {
     //
     // SCTP-6 follow-up: Stream/SSN pairs let peer advance recvSSN past
     // abandoned ordered messages. Without them peer waits for a message
-    // that never arrives (until MAX_PENDING_MSGS_PER_STREAM trips). We
+    // that never arrives. We
     // emit one pair per stream with abandoned ordered chunks since the
     // last FORWARD-TSN.
     if (peerSupportsIData) {
@@ -5011,21 +5697,27 @@ function SctpAssociation(config) {
       return;
     }
 
-    var streams = Object.keys(abandonedSSNPerStream);
-    var bodyLen = 4 + streams.length * 4;
-    var body    = Buffer.alloc(bodyLen);
+    // Per stream, the highest abandoned SSN this FORWARD-TSN skips: a
+    // message with an abandoned TSN at or below newCumTsn (RFC 3758 §3.5).
+    // One wholly above it is not skipped yet; naming it would let the peer
+    // pass the earlier, live messages of that stream still in flight.
+    var pairs = [];
+    for (var sk in abandonedSSNPerStream) {
+      var items = abandonedSSNPerStream[sk], best = null;
+      for (var ii = 0; ii < items.length; ii++) {
+        if (tsnLeq(items[ii].lo, newCumTsn) && (best === null || ssnGt(items[ii].ssn, best))) best = items[ii].ssn;
+      }
+      if (best !== null) pairs.push(sk | 0, best);
+    }
+    var body = Buffer.alloc(4 + pairs.length * 2);
     body.writeUInt32BE(newCumTsn, 0);
-    for (var i = 0; i < streams.length; i++) {
-      var sid = streams[i] | 0;
-      body.writeUInt16BE(sid, 4 + i * 4);
-      body.writeUInt16BE(abandonedSSNPerStream[sid] & 0xFFFF, 4 + i * 4 + 2);
+    for (var i = 0; i < pairs.length; i += 2) {
+      body.writeUInt16BE(pairs[i], 4 + i * 2);
+      body.writeUInt16BE(pairs[i + 1] & 0xFFFF, 4 + i * 2 + 2);
     }
     sendChunk(CHUNK_FORWARD_TSN, 0, body, remoteVerificationTag);
     lastForwardTsnSent = newCumTsn;
     lastForwardTsnSentAt = Date.now();
-    // Clear the per-stream tracker — peer's been told. New abandons
-    // beyond this point will accumulate fresh entries.
-    abandonedSSNPerStream = {};
   }
 
   /* SCTP-14: undo the T3 exponential backoff once the peer proves the path
@@ -5062,6 +5754,7 @@ function SctpAssociation(config) {
     // exactly RTO_MIN_MS forever — aggressive but not catastrophic).
     if (R < 1) R = 1;
     sctpStats.rttSamples++;
+    if (minRtt === null || R < minRtt) minRtt = R;
     if (srtt === null) {
       srtt   = R;
       rttvar = R / 2;
@@ -5222,36 +5915,7 @@ function SctpAssociation(config) {
   // the client side. Pre-rename this was the public `initiate()` method.
   function sendInit() {
     state = STATE_COOKIE_WAIT;
-
-    var body = Buffer.alloc(20);
-    body.writeUInt32BE(localVerificationTag, 0);
-    body.writeUInt32BE(maxReceiveBufferSize, 4);
-    body.writeUInt16BE(DEFAULT_NUM_STREAMS, 8);
-    body.writeUInt16BE(DEFAULT_NUM_STREAMS, 10);
-    body.writeUInt32BE(localTsn, 12);
-
-    // Supported Extensions: FORWARD-TSN (PR-SCTP), RECONFIG (stream reset),
-    // and I-DATA (RFC 8260 user message interleaving).
-    //
-    // Advertising I-DATA is a statement that we can RECEIVE it — the receive
-    // path landed in stage 1. It does not commit us to sending it: a peer
-    // that also advertises it may start sending I-DATA to us, which is
-    // exactly what we want to exercise, while our own send path stays on
-    // classic DATA until stage 2b.
-    //
-    // Both directions of an association negotiate this independently in the
-    // sense that each side advertises what it can receive, so this is safe
-    // asymmetrically (RFC 8260 3.1).
-    body.writeUInt16BE(PARAM_SUPPORTED_EXTENSIONS, 16);
-    body.writeUInt16BE(7, 18);
-
-    var padded = Buffer.alloc(24);
-    body.copy(padded, 0, 0, 20);
-    padded[20] = CHUNK_FORWARD_TSN;
-    padded[21] = CHUNK_RECONFIG;
-    padded[22] = CHUNK_I_DATA;
-
-    sendChunk(CHUNK_INIT, 0, padded, 0);  // INIT always has vtag=0
+    sendChunk(CHUNK_INIT, 0, initBody(localVerificationTag, localTsn, null), 0);  // INIT always has vtag=0
   }
 
 
@@ -5462,7 +6126,7 @@ function SctpAssociation(config) {
     if (store.size === 0) delete fragStore[streamId];
     return {
       ssn: ssn, ppid: ppid, unordered: unordered,
-      payload: Buffer.concat(parts),
+      payload: ownConcat(parts),
     };
   }
 
@@ -5509,7 +6173,7 @@ function SctpAssociation(config) {
         if (store.size === 0) delete fragStore[streamId];
         return {
           ssn: head.ssn, ppid: head.ppid, unordered: head.isUnordered,
-          payload: Buffer.concat(iParts),
+          payload: ownConcat(iParts),
           // SCTP-14: ssn here is a 32-bit MID, not a 16-bit SSN. The
           // ordered-delivery gate needs to know which, because the two
           // wrap at different points.
@@ -5535,6 +6199,10 @@ function SctpAssociation(config) {
   //     when peer abandoned the message under PR-SCTP).
   // This is the fix for B3.
   function deliverAssembled(streamId, msg) {
+    if (msg.payload.length > maxRecvMessageSize) {
+      abortProtocolViolation({ code: 'message-too-big', streamId: streamId, length: msg.payload.length });
+      return;
+    }
     if (msg.unordered) {
       processMessage(streamId, msg.ppid, msg.payload);
       return;
@@ -5573,17 +6241,8 @@ function SctpAssociation(config) {
 
     if (gt(msg.ssn, expected)) {
       // Future SSN — hold it.
-      if (!pendingMsgs[streamId]) pendingMsgs[streamId] = new Map();
-      var pending = pendingMsgs[streamId];
-      if (pending.size >= MAX_PENDING_MSGS_PER_STREAM) {
-        // Defensive: peer has held back delivery too long. Drop the
-        // entire stream's pending buffer and let the application handle
-        // the gap. (This matches libwebrtc behavior and SCTP-5's DoR.)
-        pending.clear();
-        delete pendingMsgs[streamId];
-        return;
-      }
-      pending.set(msg.ssn, { ppid: msg.ppid, payload: msg.payload });
+      if (!pendingMsgs[streamId]) pendingMsgs[streamId] = rxMap(msgCharge);
+      pendingMsgs[streamId].set(msg.ssn, { ppid: msg.ppid, payload: msg.payload });
       return;
     }
 
@@ -5639,7 +6298,8 @@ function SctpAssociation(config) {
   // State Cookie carries it in (see makeCookie).
   function supportedExtensionsMask(paramsBuf) {
     var ext = extractParam(paramsBuf, PARAM_SUPPORTED_EXTENSIONS);
-    var mask = 0;
+    // RFC 3758 §3.3.1: PR-SCTP may also be offered by its own parameter.
+    var mask = extractParam(paramsBuf, PARAM_FORWARD_TSN) ? EXT_FORWARD_TSN : 0;
     if (!ext) return mask;
     for (var i = 0; i < ext.length; i++) {
       if (ext[i] === CHUNK_FORWARD_TSN) mask |= EXT_FORWARD_TSN;
@@ -5648,6 +6308,7 @@ function SctpAssociation(config) {
       // stage 2b can gate sending on it — a peer that did not advertise must
       // never be sent I-DATA, since it has no parser for the chunk type.
       if (ext[i] === CHUNK_I_DATA)      mask |= EXT_I_DATA;
+      if (ext[i] === CHUNK_I_FORWARD_TSN) mask |= EXT_I_FORWARD_TSN;
     }
     return mask;
   }
@@ -5656,6 +6317,15 @@ function SctpAssociation(config) {
     if (mask & EXT_FORWARD_TSN) peerSupportsForwardTsn = true;
     if (mask & EXT_RECONFIG)    peerSupportsReconfig    = true;
     if (mask & EXT_I_DATA)      peerSupportsIData       = true;
+    if (mask & EXT_I_FORWARD_TSN) peerSupportsIForwardTsn = true;
+  }
+
+  // What is in use, read by the sender and the receiver alike. We list every
+  // extension (initBody), so each one is negotiated when the peer lists it.
+  // RFC 8260 §2.3.1: with I-DATA, partial reliability needs I-FORWARD-TSN on
+  // both sides; with DATA, FORWARD-TSN.
+  function prNegotiated() {
+    return peerSupportsIData ? peerSupportsIForwardTsn : peerSupportsForwardTsn;
   }
 
 
@@ -5726,6 +6396,7 @@ function SctpAssociation(config) {
 
   this.abort = abort;
   this.destroy = destroy;   // destroy() — stop silently (after 'restart')
+  this.unsentMessages = unsentMessages;   // for a move to a new association
 
   // Did the peer advertise RFC 8260 interleaving? Useful for diagnostics and
   // for the interop harness, which reports whether it was negotiated.
@@ -5738,6 +6409,7 @@ function SctpAssociation(config) {
   Object.defineProperty(this, 'role', { get: function() { return role; } });
   Object.defineProperty(this, 'pmtu',           { get: function() { return pmtu; } });
   Object.defineProperty(this, 'maxMessageSize', { get: function() { return maxMessageSize; } });
+  Object.defineProperty(this, 'maxRecvMessageSize', { get: function() { return maxRecvMessageSize; } });
   Object.defineProperty(this, 'maxReceiveBufferSize', { get: function() { return maxReceiveBufferSize; } });
   // SCTP-6: lets the upper layer probe whether PR-SCTP options will take
   // effect. False until INIT/INIT-ACK exchange completes; consult after 'open'.
@@ -5758,6 +6430,12 @@ function SctpAssociation(config) {
       fastRetransmits:     sctpStats.fastRetransmits,
       rtoExpiries:         sctpStats.rtoExpiries,
       pathFailures:        sctpStats.pathFailures,
+      sacksDiscarded:      sctpStats.sacksDiscarded,
+      dupTsnsReported:     sctpStats.dupTsnsReported,
+      repliesBundled:      sctpStats.repliesBundled,
+      rxLane:              sctpStats.rxLane,
+      txHeldBy:            Object.assign({}, sctpStats.txHeldBy),
+      rxDropped:           Object.assign({}, sctpStats.rxDropped),
       rttSamples:          sctpStats.rttSamples,
       srtt:                srtt,
       rttvar:              rttvar,
@@ -5809,6 +6487,15 @@ function SctpAssociation(config) {
     var pend=[]; var pm=pendingMsgs[sid];
     if(pm) pm.forEach(function(m,k){pend.push(k);});
     return { recvSSN: recvSSN[sid], frags: frags, pending: pend };
+  };
+  // The receive ledger against a recount of every store (tests).
+  this._debugRecvLedger = function () {
+    var recount = 0, k, v;
+    for (k in fragStore) fragStore[k].forEach(function (f) { recount += fragCharge(f); });
+    for (k in iDataHint) recount += iDataHint[k].size * RX_PARTIAL_CHARGE;
+    for (k in pendingMsgs) pendingMsgs[k].forEach(function (m) { recount += msgCharge(m); });
+    for (v = _deliverHead; v < _deliverQueue.length; v++) if (!_deliverQueue[v].streamReset) recount += _deliverQueue[v][2].length + RX_MSG_CHARGE;
+    return { held: rxHeld, recount: recount };
   };
   this._debugState = function () {
     return {
