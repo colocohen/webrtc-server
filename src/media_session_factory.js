@@ -436,6 +436,13 @@ function buildOffer(state, options) {
   //   3. m=application (DataChannel) → preserve unconditionally.
   if (state.parsedCurrentLocalSdp && Array.isArray(state.parsedCurrentLocalSdp.media)) {
     var existingParsed = state.parsedCurrentLocalSdp;
+    // Every mid that has a section in the description, known up front: the
+    // recycle pass below must not take a transceiver that owns a section
+    // LATER in this same loop (see there).
+    var _sectionMids = {};
+    for (var smi = 0; smi < existingParsed.media.length; smi++) {
+      if (existingParsed.media[smi].mid != null) _sectionMids[String(existingParsed.media[smi].mid)] = true;
+    }
     for (var ei = 0; ei < existingParsed.media.length; ei++) {
       var em = existingParsed.media[ei];
 
@@ -519,7 +526,19 @@ function buildOffer(state, options) {
         // its own section further down, so an offer that should have reused
         // one slot emitted two. Every add/stop cycle then grew the SDP by a
         // section that never went away.
-        if (cand._associated && existingMids[cand.mid]) continue;
+        //
+        // And "placed" means placed ANYWHERE in the description, not only in
+        // the slots this loop has passed so far (existingMids grows as it
+        // goes). A live transceiver whose section comes AFTER the rejected
+        // one was taken for a recycle candidate and moved into it, under a
+        // fresh mid; its own section, reached later, then found no owner and
+        // went to the next new transceiver under yet another mid. A live
+        // m-line had changed its mid, and Chrome rejected the whole offer
+        // ("The order of m-lines in subsequent offer doesn't match"): in an
+        // SFU room, the first renegotiation after one consumer was retired
+        // and another added (a camera turned off and on) failed for that
+        // viewer, who never got the new video.
+        if (cand._associated && (existingMids[cand.mid] || _sectionMids[String(cand.mid)])) continue;
         if (_placedTransceivers.indexOf(cand) !== -1) continue;
         recycle = cand;
         break;
