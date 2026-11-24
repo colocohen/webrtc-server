@@ -1044,11 +1044,50 @@ class MediaTransport extends EventEmitter {
         // scanning the remote SDP for the m-section that advertises this
         // rid in its simulcast send list.
         if (!_mapping) {
+          // A rid names a stream WITHIN its m-section, not in the session:
+          // two simulcast tracks routinely use the same rid names (Chrome
+          // apps' q/h/f, mediasoup-client's r0/r1/r2 on every producer).
+          // The stream is identified by MID + RID (RFC 8852 §3.3, RFC 8843
+          // §9.2), and the sender puts the MID extension on these same
+          // first packets. Taking the first m-section that lists the rid
+          // gave every simulcast track's layers to the FIRST one: a second
+          // track (screen share beside a camera, a camera turned off and on
+          // again) never got an SSRC, its receiver stayed empty, and an SFU
+          // above it never saw that producer's media. So: the packet's MID
+          // when it names a live section; else the first LIVE section
+          // listing the rid — a rejected one (port 0) carries no media.
           var _ownerMid = null;
-          if (state.parsedRemoteSdp && state.parsedRemoteSdp.media) {
-            for (var _rmi = 0; _rmi < state.parsedRemoteSdp.media.length; _rmi++) {
-              var _rm = state.parsedRemoteSdp.media[_rmi];
+          var _media = (state.parsedRemoteSdp && state.parsedRemoteSdp.media) || [];
+          var _midExtId = null;
+          if (state.remoteExtensions) {
+            for (var _xid in state.remoteExtensions) {
+              if (state.remoteExtensions[_xid] === 'urn:ietf:params:rtp-hdrext:sdes:mid') { _midExtId = +_xid; break; }
+            }
+          }
+          var _midBuf = (_midExtId != null) ? parsed.extensions[_midExtId] : null;
+          if (_midBuf && _midBuf.length > 0) {
+            var _pktMid = _midBuf.toString('ascii');
+            for (var _mmi = 0; _mmi < _media.length; _mmi++) {
+              var _mm = _media[_mmi];
+              if ((_mm.type === 'video' || _mm.type === 'audio') && _mm.port !== 0 && String(_mm.mid) === _pktMid) {
+                // MID + RID: the section the MID names must also list this
+                // rid as sent. A MID naming a section that does not (a
+                // description whose mids are not the ones on the wire) is
+                // no evidence; the rid search below decides.
+                var _hasRid = false;
+                for (var _mri = 0; _mm.rids && _mri < _mm.rids.length; _mri++) {
+                  if (_mm.rids[_mri].direction === 'send' && _mm.rids[_mri].id === _learnedRid) { _hasRid = true; break; }
+                }
+                if (_hasRid) _ownerMid = _mm.mid;
+                break;
+              }
+            }
+          }
+          if (_ownerMid == null) {
+            for (var _rmi = 0; _rmi < _media.length; _rmi++) {
+              var _rm = _media[_rmi];
               if (_rm.type !== 'video' && _rm.type !== 'audio') continue;
+              if (_rm.port === 0) continue;
               if (!_rm.rids) continue;
               for (var _rdi = 0; _rdi < _rm.rids.length; _rdi++) {
                 var _rd = _rm.rids[_rdi];
