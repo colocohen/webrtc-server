@@ -61,6 +61,22 @@ import {
 // Media objects — media-processing
 import { MediaStreamTrack, MediaStream } from 'media-processing';
 
+// A remote track joins / leaves a MediaStream as the User Agent's "add a
+// track" / "remove a track" (webrtc-pc §4.4.1.6, "set the associated remote
+// streams" / "process the removal of a remote track"): those fire
+// 'addtrack' / 'removetrack'. The script's MediaStream.addTrack() /
+// removeTrack() fire nothing (mediacapture-main's event table), so the
+// media-processing UA methods are used; a MediaStream without them (another
+// implementation) gets the script's method, as before.
+function _uaAddTrack(stream, track) {
+  if (typeof stream._addTrackFromUA === 'function') stream._addTrackFromUA(track);
+  else stream.addTrack(track);
+}
+function _uaRemoveTrack(stream, track) {
+  if (typeof stream._removeTrackFromUA === 'function') stream._removeTrackFromUA(track);
+  else stream.removeTrack(track);
+}
+
 // ──────────────────────────────────────────────────────────────────
 //  Per-codec keyframe peeking (RTP-1)
 // ──────────────────────────────────────────────────────────────────
@@ -3266,7 +3282,7 @@ function ConnectionManager(config) {
             try { Object.defineProperty(_upStream, 'id', { value: _upSid, configurable: true }); } catch (eI) {}
             state._remoteStreams[_upSid] = _upStream;
           }
-          _upStream.addTrack(existing.receiver.track);
+          _uaAddTrack(_upStream, existing.receiver.track);
           // MULTI-STREAM on the UPDATE path, matching what the creation
           // path got in round 127: a track may belong to several
           // MediaStreams, one per a=msid line. Building only from m.msid
@@ -3285,7 +3301,7 @@ function ConnectionManager(config) {
               state._remoteStreams[_uid] = _us;
             }
             if (_us.getTracks().indexOf(existing.receiver.track) === -1) {
-              _us.addTrack(existing.receiver.track);
+              _uaAddTrack(_us, existing.receiver.track);
             }
             if (_upAll.indexOf(_us) === -1) _upAll.push(_us);
           }
@@ -3468,9 +3484,9 @@ function ConnectionManager(config) {
               return x === _rmTrack || (x && x.id === _rmTrack.id);
             });
             if (!_rmHas) continue;
-            // removeTrack fires 'removetrack' itself — fix 23 on not
+            // _uaRemoveTrack fires 'removetrack' itself — fix 23 on not
             // dispatching a second time.
-            try { _rmStream.removeTrack(_rmTrack); } catch (eRm) {}
+            try { _uaRemoveTrack(_rmStream, _rmTrack); } catch (eRm) {}
           }
           if (_rmTrack.muted !== true) {
             _rmTrack.muted = true;
@@ -3725,7 +3741,7 @@ function ConnectionManager(config) {
                   } catch (eNs1) {}
                   state._remoteStreams[_nsSid] = _nsSt;
                 }
-                if (_nsSt.getTracks().indexOf(_birthTrack) === -1) _nsSt.addTrack(_birthTrack);
+                if (_nsSt.getTracks().indexOf(_birthTrack) === -1) _uaAddTrack(_nsSt, _birthTrack);
                 if (_nsStreams.indexOf(_nsSt) === -1) _nsStreams.push(_nsSt);
               }
               // Through the SAME hold-aware queue the ssrc path uses. Track
@@ -3991,7 +4007,7 @@ function ConnectionManager(config) {
           state._remoteStreams[msidSid] = stream;
         }
       }
-      stream.addTrack(track);
+      _uaAddTrack(stream, track);
       // MULTI-STREAM: the track belongs to EVERY stream its m-section
       // named, not just the first. We added it to one, so an app that
       // read stream2.getTracks() found it empty even though the track
@@ -4006,7 +4022,7 @@ function ConnectionManager(config) {
           try { Object.defineProperty(_js, 'id', { value: _jid, configurable: true }); } catch (eJ) {}
           state._remoteStreams[_jid] = _js;
         }
-        if (_js.getTracks().indexOf(track) === -1) _js.addTrack(track);
+        if (_js.getTracks().indexOf(track) === -1) _uaAddTrack(_js, track);
       }
       transceiver.receiver.track = track;
 

@@ -44,6 +44,22 @@ import * as MediaSessionFactory from './media_session_factory.js';
 import * as SDP from './sdp.js';
 import * as TransportController from './transport_controller.js';
 
+// A remote track joins / leaves a MediaStream as the User Agent's "add a
+// track" / "remove a track" (webrtc-pc §4.4.1.6, "set the associated remote
+// streams" / "process the removal of a remote track"): those fire
+// 'addtrack' / 'removetrack'. The script's MediaStream.addTrack() /
+// removeTrack() fire nothing (mediacapture-main's event table), so the
+// media-processing UA methods are used; a MediaStream without them (another
+// implementation) gets the script's method, as before.
+function _uaAddTrack(stream, track) {
+  if (typeof stream._addTrackFromUA === 'function') stream._addTrackFromUA(track);
+  else stream.addTrack(track);
+}
+function _uaRemoveTrack(stream, track) {
+  if (typeof stream._removeTrackFromUA === 'function') stream._removeTrackFromUA(track);
+  else stream.removeTrack(track);
+}
+
 
 class SdpOfferAnswer extends EventEmitter {
   /**
@@ -1999,7 +2015,7 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
               return x === _rtTrack || (x && x.id === _rtTrack.id);
             });
             if (!_rsHas) continue;
-            try { _rsm.removeTrack(_rtTrack); } catch (eS) {}
+            try { _uaRemoveTrack(_rsm, _rtTrack); } catch (eS) {}
           }
         }
       } catch (eRbS) { /* stream cleanup must never break a rollback */ }
@@ -2026,7 +2042,7 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
               return x === _mtrack || (x && x.id === _mtrack.id);
             });
             if (_present) continue;
-            try { _ms.addTrack(_mtrack); } catch (eA) {}
+            try { _uaAddTrack(_ms, _mtrack); } catch (eA) {}
           }
         }
       } catch (eRbR) { /* restoration must never break a rollback either */ }
@@ -2073,9 +2089,9 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
                 return x === _rbTrack || (x && x.id === _rbTrack.id);
               });
               if (!_has) continue;
-              // removeTrack fires 'removetrack' itself — see fix 23 on not
+              // _uaRemoveTrack fires 'removetrack' itself — see fix 23 on not
               // dispatching a second time.
-              try { _rstream.removeTrack(_rbTrack); } catch (eRm) {}
+              try { _uaRemoveTrack(_rstream, _rbTrack); } catch (eRm) {}
             }
           }
 

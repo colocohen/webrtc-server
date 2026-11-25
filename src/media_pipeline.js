@@ -1943,11 +1943,27 @@ function createAudioReceivePipeline(opts) {
 
   /* ── WritableStream → decoder ──────────────────────────────────────── */
 
+  // The depacketizer (and the readable, as RTCEncodedAudioFrame) carry the
+  // RTP timestamp in clock ticks; an EncodedAudioChunk's timestamp is in
+  // microseconds (W3C WebCodecs). The ticks went to the decoder as they
+  // were, so 20 ms packets were 960 "µs" apart: the decoded AudioData (and
+  // what an echo re-encoded from them) ran ~21x too slow on the wire —
+  // Chrome concealed 98 % of an echoed stream. Unwrapped (RFC 3550 §5.1,
+  // 32-bit wrap), relative to the first packet.
+  var _tsFirst = null, _tsLastRaw = 0, _tsExt = 0;
+  function _toDecoderChunk(chunk) {
+    var raw = chunk.timestamp >>> 0;
+    if (_tsFirst === null) { _tsFirst = raw; _tsLastRaw = raw; _tsExt = 0; }
+    else { _tsExt += ((raw - _tsLastRaw) | 0); _tsLastRaw = raw; }
+    return { type: chunk.type || 'key', data: chunk.data,
+      timestamp: Math.round(_tsExt * 1e6 / codecInfo.clockRate) };
+  }
+
   var writable = new WritableStream({
     write: function (encoded) {
       if (stopped) return;
       _ensureDecoder();
-      try { decoder.decode(encoded); }
+      try { decoder.decode(_toDecoderChunk(encoded)); }
       catch (e) {
         if (typeof console !== 'undefined' && console.error) {
           console.error('[media_pipeline] audio decode threw:', e && e.message || e);
@@ -2010,6 +2026,11 @@ function createAudioReceivePipeline(opts) {
       // a container, there is no supported way to feed it raw Opus
       // packets via stdin directly.
       rawFrames:        true,
+      // s16, not the library's f32 default (Chrome's): half the bytes
+      // through the FFmpeg pipes and in every AudioData, for audio that is
+      // usually re-encoded right away. Consumers read it through copyTo
+      // (any format), so nothing downstream depends on f32.
+      outputFormat:     's16',
     });
   }
 
@@ -2030,7 +2051,7 @@ function createAudioReceivePipeline(opts) {
   function _decodeChunkDirect(chunk) {
     if (stopped) return;
     _ensureDecoder();
-    try { decoder.decode(chunk); }
+    try { decoder.decode(_toDecoderChunk(chunk)); }
     catch (e) {
       if (typeof console !== 'undefined' && console.error) {
         console.error('[media_pipeline] decoder.decode threw:', e && e.message || e);
