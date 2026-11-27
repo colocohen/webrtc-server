@@ -17,7 +17,8 @@ import {
 import * as SDP from './sdp.js';
 import { pem as PEM } from 'cryptographic-formats';
 import * as RtpManager from './rtp_transmission_manager.js';
-import { getSupportedVideoCodecs, getSupportedAudioCodecs, MediaStreamTrack } from 'media-processing';
+import { MediaStreamTrack } from 'media-processing';
+import * as CodecSupport from './codec_support.js';
 
 // Debug logging gate. Set WEBRTC_DEBUG=1 in env to enable diagnostic
 // '[api-diag]' lines that trace track/datachannel/pipeline lifecycle.
@@ -403,11 +404,13 @@ function RTCPeerConnection(config) {
   }
   if (config.iceCandidatePoolSize != null) {
     var pool = config.iceCandidatePoolSize;
-    if (typeof pool !== 'number' || !isFinite(pool) || pool < 0 || pool > 255 ||
-        Math.floor(pool) !== pool) {
+    // [EnforceRange] octet (WebIDL ConvertToInt): a non-finite value or one
+    // out of range once truncated throws; a fraction is truncated (bug 81).
+    if (typeof pool !== 'number' || !isFinite(pool) || Math.trunc(pool) < 0 || Math.trunc(pool) > 255) {
       throw new TypeError('RTCPeerConnection: iceCandidatePoolSize must be ' +
         'an integer in [0, 255], got ' + pool);
     }
+    config = Object.assign({}, config, { iceCandidatePoolSize: Math.trunc(pool) + 0 });
   }
   // NOTE: bundlePolicy='balanced' and 'max-compat' are accepted but not
   // enforced — the implementation always produces 'max-bundle' style SDP.
@@ -435,9 +438,14 @@ function RTCPeerConnection(config) {
       for (var _ci = 0; _ci < config.certificates.length; _ci++) {
         var _c = config.certificates[_ci];
         try {
+          // All of its fingerprints (each hash, RFC 8122 §5.1), the
+          // first certificate's SHA-256 first: sdp.js writes that one last,
+          // the line libwebrtc keeps.
           var _fl = (_c && typeof _c.getFingerprints === 'function') ? _c.getFingerprints() : null;
-          if (_fl && _fl.length && _fl[0].value) {
-            _allFps.push({ algorithm: _fl[0].algorithm || 'sha-256', value: _fl[0].value });
+          for (var _fi = 0; _fl && _fi < _fl.length; _fi++) {
+            if (_fl[_fi] && _fl[_fi].value) {
+              _allFps.push({ algorithm: _fl[_fi].algorithm || 'sha-256', value: _fl[_fi].value });
+            }
           }
         } catch (eF) {}
       }
@@ -1280,7 +1288,11 @@ function RTCPeerConnection(config) {
         // old pattern only allowed ":port" after a host with no colons, so
         // stun:[::1]:3478 and turn:[2001:db8::1] threw SyntaxError (browsers
         // accept them; turn-server's URL parser already handles brackets).
-        var m = /^(stun|stuns|turn|turns):(?:\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9._\-]+))(?::(\d{1,5}))?(\?transport=(?:udp|tcp))?$/.exec(url);
+        // the scheme is case-insensitive (RFC 3986 §3.1; bug 82)
+        // (W3C 4.4.1.6 parses it with the URL parser, which lowercases it)
+        var _colon = url.indexOf(':');
+        var _urlL = _colon > 0 ? url.slice(0, _colon).toLowerCase() + url.slice(_colon) : url;
+        var m = /^(stun|stuns|turn|turns):(?:\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9._\-]+))(?::(\d{1,5}))?(\?transport=(?:udp|tcp))?$/.exec(_urlL);
         if (!m || (m[2] !== undefined && !isIPv6(m[2]))) {
           throw new DOMException(ctxName + ': invalid ICE server url "' + url + '"', 'SyntaxError');
         }
@@ -1346,7 +1358,8 @@ function RTCPeerConnection(config) {
         // The unmute now happens where media actually arrives — see the
         // first-packet path in connection_manager. Muting on a direction that
         // can no longer receive stays here, because that IS a negotiated fact.
-        if (!recv && tr.muted === false) {
+        // (an ended track is not muted again — mediacapture-main)
+        if (!recv && tr.muted === false && tr.readyState !== 'ended') {
           tr.muted = true;
           try { tr.dispatchEvent && tr.dispatchEvent({ type: 'mute' }); } catch (u2) {}
         }
@@ -1382,6 +1395,11 @@ function RTCPeerConnection(config) {
         if (newConfig.iceTransportPolicy !== 'all') throw new TypeError('setConfiguration: invalid iceTransportPolicy');
       }
     }
+    // W3C 4.4.1.4 step 1 (set a configuration): a closed connection throws
+    // InvalidStateError whatever the argument, the omitted one too (bug 83).
+    if (manager.state.closed) {
+      throw new DOMException('setConfiguration: peer connection is closed', 'InvalidStateError');
+    }
     if (newConfig == null) return;
     // W3C §4.4.1.4 — setConfiguration. Three classes of checks:
     //   1. Connection state: closed PCs reject (InvalidStateError).
@@ -1416,11 +1434,12 @@ function RTCPeerConnection(config) {
     }
     if (newConfig.iceCandidatePoolSize != null) {
       var pool = newConfig.iceCandidatePoolSize;
-      if (typeof pool !== 'number' || !isFinite(pool) || pool < 0 || pool > 255 ||
-          Math.floor(pool) !== pool) {
+      // [EnforceRange] octet: a fraction is truncated (bug 81)
+      if (typeof pool !== 'number' || !isFinite(pool) || Math.trunc(pool) < 0 || Math.trunc(pool) > 255) {
         throw new TypeError('setConfiguration: iceCandidatePoolSize must be ' +
           'an integer in [0, 255], got ' + pool);
       }
+      newConfig = Object.assign({}, newConfig, { iceCandidatePoolSize: Math.trunc(pool) + 0 });
     }
 
     // Immutable-field checks (only after enum validation, so the more
@@ -1462,26 +1481,32 @@ function RTCPeerConnection(config) {
         throw new DOMException('setConfiguration: certificates cannot be modified', 'InvalidModificationError');
       }
     }
-    manager.state.iceServers = _validateIceServers(newConfig.iceServers, 'setConfiguration');
-    // Per W3C 4.4.1.4, iceTransportPolicy changes take effect on the next
-    // ICE gathering round — the running IceAgent keeps its current policy
-    // until a restart happens.
+    var _servers = _validateIceServers(newConfig.iceServers, 'setConfiguration');
+    // W3C 4.4.1.6 "set a configuration": the ICE agent's ICE transports
+    // setting and ICE servers list take the new values; "no action will be
+    // taken until the next gathering phase". RFC 9429 §4.1.18: a change to
+    // either "affects the next gathering phase. If an ICE gathering phase has
+    // already started or completed, the 'needs-ice-restart' bit ... will be
+    // set" (the next createOffer restarts, RFC 9429 §5.2.2: new ufrag/pwd
+    // when "the ICE configuration has changed").
     //
-    // But the change itself is what REQUIRES that restart (W3C 4.3.2: an
-    // altered policy sets [[NeedsIceRestart]]). Storing the value without
-    // setting the flag meant the next createOffer reused the same ufrag and
-    // gathered under the old policy — so `setConfiguration({
-    // iceTransportPolicy: 'relay' })` silently kept using host candidates,
-    // and an application that switched to relay for privacy or firewall
-    // reasons never actually did.
-    if (newConfig.iceTransportPolicy) {
-      var _oldPolicy = manager.state.iceTransportPolicy || 'all';
-      manager.state.iceTransportPolicy = newConfig.iceTransportPolicy;
-      if (newConfig.iceTransportPolicy !== _oldPolicy &&
-          typeof manager.restartIce === 'function') {
-        manager.state._descGen = (manager.state._descGen || 0) + 1;   // see restartIce
-        manager.restartIce();
-      }
+    // Before, the policy only reached manager.state and the servers only
+    // the getConfiguration echo: the running IceAgent kept its constructor
+    // policy and its host candidates across the restart, so a switch to
+    // 'relay' kept announcing and using host candidates, and one to 'all'
+    // never gathered any (WPT RTCConfiguration-iceTransportPolicy "Changing
+    // iceTransportPolicy ..."). And the restart was asked for even before
+    // any negotiation (negotiationneeded with nothing gathered).
+    var _changed = manager.setIceConfiguration({
+      iceTransportPolicy: newConfig.iceTransportPolicy || 'all',
+      iceServers:         _servers,
+    });
+    var _gathered = !!(manager.state.currentLocalDescription ||
+                       manager.state.pendingLocalDescription ||
+                       (manager.state.iceGatheringState && manager.state.iceGatheringState !== 'new'));
+    if (_changed && _gathered && typeof manager.restartIce === 'function') {
+      manager.state._descGen = (manager.state._descGen || 0) + 1;   // see restartIce
+      manager.restartIce();
     }
     // Stored for the getConfiguration round-trip (the pool itself is
     // pre-gathered only from the constructor's value).
@@ -1499,7 +1524,9 @@ function RTCPeerConnection(config) {
     // so for now we just stash them on the sender wrapper for later.
     var streams = [];
     for (var si = 1; si < arguments.length; si++) {
-      if (arguments[si]) streams.push(arguments[si]);
+      // W3C 5.2: a stream's id is associated once (the same stream given
+      // twice is one msid).
+      if (arguments[si] && streams.indexOf(arguments[si]) === -1) streams.push(arguments[si]);
     }
 
     if (manager.state.closed) {
@@ -1729,7 +1756,7 @@ function RTCPeerConnection(config) {
       // WPT harvest — encoding.codec must exist in the sender's
       // capabilities for this kind; otherwise OperationError.
       var kindCaps = null;
-      try { kindCaps = RTCRtpSender.getCapabilities(kind); } catch (eC) {}
+      try { kindCaps = { codecs: _registryCodecCaps(kind, manager.state.passthroughCodecs ? 'all' : 'send') }; } catch (eC) {}
       for (var ci0 = 0; ci0 < init.sendEncodings.length; ci0++) {
         var reqC = init.sendEncodings[ci0] && init.sendEncodings[ci0].codec;
         if (reqC == null) continue;
@@ -1885,11 +1912,16 @@ function RTCPeerConnection(config) {
     var _o = options;
     // WebIDL [EnforceRange] unsigned short: negatives and values > 65535
     // throw TypeError at the binding layer (WPT enforce-range files).
+    // A fraction is truncated, not refused (WebIDL ConvertToInt, bug 81).
     var _rangeCheck = function (v, name) {
       if (v === undefined || v === null) return;
       var n = Number(v);
-      if (!isFinite(n) || n < 0 || n > 65535 || Math.floor(n) !== n) {
+      if (!isFinite(n) || Math.trunc(n) < 0 || Math.trunc(n) > 65535) {
         throw new TypeError('createDataChannel: ' + name + ' value ' + v + ' is out of [EnforceRange] unsigned short range');
+      }
+      if (Math.trunc(n) !== n) {
+        if (_o === options) { _o = Object.assign({}, _o); options = _o; }
+        _o[name] = Math.trunc(n) + 0;
       }
     };
     _rangeCheck(_o.maxPacketLifeTime, 'maxPacketLifeTime');
@@ -2244,6 +2276,15 @@ function RTCPeerConnection(config) {
 
   _wireStateEvents();
 
+  // RTP circuit breaker (RFC 8083 §4.5) state changes: W3C webrtc-pc defines
+  // no event for them, so none is dispatched. The standard surface is
+  // getStats: a video stream's outbound-rtp qualityLimitationReason is
+  // 'bandwidth' while the breaker has stopped it or holds it down (W3C
+  // webrtc-stats defines the member for video only). outbound-rtp.active
+  // stays the encoding's configured value ("configured to be sent or
+  // disabled ... an active stream can still not be sending, e.g. when being
+  // limited by network conditions").
+
 
   // ── Internal access (for advanced usage / testing) ──
 
@@ -2292,6 +2333,10 @@ RTCPeerConnection.generateCertificate = function(keygenAlgorithm) {
       }
       return cert;
     } catch (e) {
+      // A failed WebCrypto normalization (a required member missing:
+      // ECDSA without namedCurve) rejects with its TypeError (webrtc-pc
+      // §4.10.1 step 2, as Chrome).
+      if (e && e.normalization) throw e;
       // Translate cert.js's TypeError into the spec-mandated
       // NotSupportedError. Keep the message.
       var err = new DOMException(e && e.message || String(e), 'NotSupportedError');
@@ -2389,7 +2434,7 @@ RTCPeerConnection.prototype.setLocalDescription = function (desc) {
   if (desc === undefined && this._manager && this._manager.state) {
     var _stP = this._manager.state;
     var _implied = (_stP.signalingState === 'have-remote-offer' ||
-                    _stP.signalingState === 'have-remote-pranswer') ? 'answer' : 'offer';
+                    _stP.signalingState === 'have-local-pranswer') ? 'answer' : 'offer';
     var _last = _implied === 'offer' ? _stP._lastOffer : _stP._lastAnswer;
     var _stamp = _implied === 'offer' ? _stP._lastOfferStamp : _stP._lastAnswerStamp;
     if (_last && _last.sdp && _descStampValid(_stP, _stamp)) {
@@ -2446,6 +2491,9 @@ RTCPeerConnection.prototype.addEventListener = function () { return this._impl.a
 RTCPeerConnection.prototype.removeEventListener = function () { return this._impl.removeEventListener.apply(this, arguments); };
 RTCPeerConnection.prototype.setIdentityProvider = function () { return this._impl.setIdentityProvider.apply(this, arguments); };
 RTCPeerConnection.prototype.getIdentityAssertion = function () { return this._impl.getIdentityAssertion.apply(this, arguments); };
+
+// Ids of the senders registered with their connection's rate controller.
+var _rateSenderSeq = 0;
 
 function RTCRtpSender(internal, track, manager) {
   // WebIDL prototype surface (WPT): methods live on the prototype;
@@ -2522,7 +2570,9 @@ function RTCRtpSender(internal, track, manager) {
           !(manager.state.pendingLocalDescription || manager.state.currentLocalDescription)) return null;
       // A stopped transceiver's m-section was retired: it is on no
       // transport any more (Chrome: null after the answer that stops it).
-      if (internal.currentDirection === 'stopped') return null;
+      // Not when close() stopped it: W3C 4.4.1.7 stops every transceiver
+      // but leaves [[SenderTransport]] — the transport, now 'closed'.
+      if (internal.currentDirection === 'stopped' && !manager.state.closed) return null;
       return manager._getDtlsTransport ? manager._getDtlsTransport() : null;
     },
   });
@@ -2677,33 +2727,65 @@ function RTCRtpSender(internal, track, manager) {
   // (RFC 2198) and the telephone-event PT (RFC 4733), all from
   // sender._negotiatedCodecs (populated by cm.js when a description is
   // applied). Falls back to PT 111 with no fmtp/RED/DTMF before negotiation.
+  // Opus when negotiated; otherwise the first G.711 law the negotiation
+  // carries (RFC 7874 §3: both are mandatory for WebRTC endpoints, and we
+  // offer them). The pipeline used to send Opus on PT 111 whatever was
+  // negotiated: a peer that took PCMU / PCMA only got packets of a payload
+  // type it had not agreed to (RFC 3264 §5.1).
+  //
+  // telephone-event: the one at the chosen codec's clock rate (RFC 4733
+  // §2.1: the event uses the clock of the audio it accompanies, and it
+  // shares that audio's SSRC and timestamp space) — /48000 with Opus,
+  // /8000 with G.711. The first telephone-event of any rate used to be
+  // taken, so a PCMU stream sent its tones clocked at 48 kHz. When only
+  // a mismatching rate was negotiated there is no DTMF on this stream
+  // (dtmfPt null: the pipeline's sendDtmf declines, as when none was
+  // negotiated), rather than events whose timestamps and durations the
+  // receiver reads at the wrong clock.
   function _pickAudioSendCodec() {
-    var out = { pt: 111, fmtp: null, redPt: null, dtmfPt: null };
+    var out = { name: 'opus', pt: 111, fmtp: null, redPt: null, dtmfPt: null };
     var neg = internal.sender && internal.sender._negotiatedCodecs;
     if (!neg || !neg.length) return out;
-    var opusSeen = false;
+    var opus = null, g711 = null, events = [];
     for (var i = 0; i < neg.length; i++) {
       var c = neg[i];
       var n = c && c.name ? c.name.toLowerCase() : '';
-      if (n === 'opus' && !opusSeen) {
-        opusSeen = true;
+      if (n === 'opus' && !opus) {
+        opus = c;
         out.pt = c.payloadType;
         out.fmtp = c.fmtp || null;
-        out.redPt = (c.redPayloadType != null) ? c.redPayloadType : null;
-      } else if (n === 'telephone-event' && out.dtmfPt == null) {
-        out.dtmfPt = c.payloadType;
+        // RED only when the peer's description prefers it (listed before
+        // Opus: sdp.js extractCodecs, redPreferred), as libwebrtc does.
+        out.redPt = (c.redPayloadType != null && c.redPreferred) ? c.redPayloadType : null;
+      } else if ((n === 'pcmu' || n === 'pcma') && !g711) {
+        g711 = c;
+      } else if (n === 'telephone-event') {
+        events.push(c);
       }
+    }
+    if (!opus && g711) {
+      out.name = g711.name.toLowerCase();
+      out.pt = g711.payloadType;
+    }
+    var rate = opus ? opus.clockRate : (g711 ? g711.clockRate : 48000);
+    for (var e = 0; e < events.length; e++) {
+      if (events[e].clockRate === rate) { out.dtmfPt = events[e].payloadType; break; }
     }
     return out;
   }
   function _audioSendKey(a) {
-    return 'opus/' + a.pt + '/' + JSON.stringify(a.fmtp) + '/red' + a.redPt + '/dtmf' + a.dtmfPt;
+    return a.name + '/' + a.pt + '/' + JSON.stringify(a.fmtp) + '/red' + a.redPt + '/dtmf' + a.dtmfPt;
   }
   // Key of what the running pipeline sends with (_sendCodecKey for video,
   // _audioSendKey for audio), compared on 'transceiver:codec-negotiated'.
   var _runningSendCodec = null;
+  // Whether the pli / encodings-updated / codec-negotiated handlers are
+  // registered (_stop removes them, startPipeline puts them back).
+  var _listening = false;
+  var _relisten = null;
 
   function startPipeline() {
+    if (self.track && _relisten) _relisten();
     // FIELD DIAG: the three reasons the send pipeline declines to start.
     // A silent bail here is indistinguishable from "never called", which
     // is exactly what made the round-80 hunt long — one line ends that.
@@ -2884,11 +2966,11 @@ function RTCRtpSender(internal, track, manager) {
         // can extrapolate rtpTimestamp using the codec's clockRate. The
         // current audio pipeline is Opus-only; the negotiated PT is read
         // from sender._negotiatedCodecs above.
-        var _audioCodecMeta = _codecByName('audio', 'opus');
+        var _audioCodecMeta = _codecByName('audio', _aPick.name);
         if (_audioCodecMeta && internal.sender.ssrc != null) {
           manager.registerOutboundStream(internal.sender.ssrc, {
             clockRate:   _audioCodecMeta.clockRate,
-            codecName:   'opus',
+            codecName:   _audioCodecMeta.name,
             payloadType: _negotiatedAudioPt,
           });
         }
@@ -2897,6 +2979,7 @@ function RTCRtpSender(internal, track, manager) {
           track:       self.track,
           manager:     manager,
           ssrc:        internal.sender.ssrc,
+          codec:       _aPick.name,
           payloadType: _negotiatedAudioPt,
           maxBitrate:  enc.maxBitrate || 0,
           initialSequenceNumber: initSeqA,
@@ -2912,10 +2995,81 @@ function RTCRtpSender(internal, track, manager) {
         console.error('[RTCRtpSender] pipeline start failed:', e && e.message || e);
       }
     }
+    if (pipeline) _registerRate();
+  }
+
+  // ── Rate control (RFC 8834 §7) ──
+  //
+  // The running pipeline's encoder(s) are the connection's rate controller's
+  // to drive (media_transport.updateRates, rate_controller.js): it reads the
+  // encodings here on every update (maxBitrate is a ceiling it never
+  // exceeds, active, scaleResolutionDownBy for the simulcast order, the
+  // first encoding's priority for the split between video senders) and
+  // sets each layer's target bitrate and on/off through the pipeline.
+  var _rateId = 'sender-' + (++_rateSenderSeq);
+  var _rateAudioCodec = null;
+  function _rateDescribe() {
+    var encs = currentParams.encodings || [];
+    var e0 = encs[0] || {};
+    var kind = self.track ? self.track.kind : internal.kind;
+    var lys = internal.sender.layers || [];
+    if (kind === 'video' && lys.length > 1) {
+      return {
+        priority: e0.priority,
+        layers: lys.map(function (ly, i) {
+          var e = encs[i] || {};
+          return { ssrc: ly.ssrc, rid: ly.rid, maxBitrate: e.maxBitrate || 0,
+                   scale: e.scaleResolutionDownBy || 1, active: e.active !== false };
+        }),
+      };
+    }
+    var mb = e0.maxBitrate || 0;
+    // G.711 has one rate (64 kbps): what it takes from the budget.
+    if (kind === 'audio' && _rateAudioCodec && _rateAudioCodec.toLowerCase() !== 'opus') mb = 64000;
+    return {
+      priority: e0.priority,
+      layers: [{ ssrc: internal.sender.ssrc, maxBitrate: mb,
+                 scale: e0.scaleResolutionDownBy || 1, active: e0.active !== false }],
+    };
+  }
+  function _registerRate() {
+    if (!pipeline || typeof manager.registerRateSender !== 'function') return;
+    var kind = self.track ? self.track.kind : internal.kind;
+    if (kind === 'audio') {
+      try { _rateAudioCodec = _pickAudioSendCodec().name; } catch (eA) { _rateAudioCodec = null; }
+    }
+    manager.registerRateSender(_rateId, {
+      kind: kind,
+      get mid() { return internal.mid; },
+      controllable: true,
+      frameIntervalMs: kind === 'video' ? 1000 / 30 : 20,
+      describe: _rateDescribe,
+      apply: function (ssrc, t) {
+        if (!pipeline) return;
+        if (typeof pipeline.setRateTargetForRid === 'function') {
+          var lys = internal.sender.layers || [];
+          for (var i = 0; i < lys.length; i++) {
+            if (lys[i].ssrc != null && (lys[i].ssrc >>> 0) === (ssrc >>> 0)) {
+              pipeline.setRateTargetForRid(lys[i].rid, t);
+              return;
+            }
+          }
+        } else if (typeof pipeline.setRateTarget === 'function') {
+          pipeline.setRateTarget(t);
+        }
+      },
+      onPacketLoss: function (ssrc, fraction) {
+        if (pipeline && typeof pipeline.setPacketLoss === 'function') pipeline.setPacketLoss(fraction);
+      },
+    });
+  }
+  function _unregisterRate() {
+    if (typeof manager.unregisterRateSender === 'function') manager.unregisterRateSender(_rateId);
   }
 
   function stopPipeline() {
     if (!pipeline) return;
+    _unregisterRate();
     // Capture last-emitted RTP seq (or per-layer Map for simulcast) so
     // the next pipeline can resume the same SSRC's seq counter without a
     // discontinuity. Matches libwebrtc's RtpSender::SetTrack behaviour:
@@ -3056,6 +3210,7 @@ function RTCRtpSender(internal, track, manager) {
     startPipeline();
   };
   manager.on('transceiver:codec-negotiated', _codecNegotiatedHandler);
+  _listening = true;
 
   impl.replaceTrack = function(newTrack) {
     // Per W3C §5.2, replaceTrack does NOT trigger negotiationneeded even if
@@ -3133,7 +3288,7 @@ function RTCRtpSender(internal, track, manager) {
     var _ids = [];
     for (var _s = 0; _s < arguments.length; _s++) {
       var _st = arguments[_s];
-      if (_st && _st.id) _ids.push(_st.id);
+      if (_st && _st.id && _ids.indexOf(_st.id) === -1) _ids.push(_st.id);   // each id once (W3C 5.2)
     }
     internal.streamIds = _ids;
     // Refresh the routing slot so an offer built before the next
@@ -3159,11 +3314,24 @@ function RTCRtpSender(internal, track, manager) {
   // and old/stopped senders keep reacting to events meant for the live one.
   this._stop = function () {
     stopPipeline();
-    if (manager.ev && typeof manager.ev.off === 'function') {
+    if (_listening && manager.ev && typeof manager.ev.off === 'function') {
       manager.ev.off('pli', _pliHandler);
       manager.ev.off('transceiver:encodings-updated', _encodingsUpdatedHandler);
       manager.ev.off('transceiver:codec-negotiated', _codecNegotiatedHandler);
+      _listening = false;
     }
+  };
+  // ...and a pipeline started again registers them again (bug 66): a
+  // removeTrack (which _stop()s) followed by addTrack reusing the
+  // transceiver, or replaceTrack, started a pipeline with no PLI handler —
+  // no key frame on the peer's PLI / FIR — and no codec-negotiated or
+  // encodings-updated handler.
+  _relisten = function () {
+    if (_listening) return;
+    manager.on('pli', _pliHandler);
+    manager.on('transceiver:encodings-updated', _encodingsUpdatedHandler);
+    manager.on('transceiver:codec-negotiated', _codecNegotiatedHandler);
+    _listening = true;
   };
 
   // Internal hook: point this sender at a different track, restarting the
@@ -3301,7 +3469,7 @@ function RTCRtpSender(internal, track, manager) {
           ? currentParams.codecs
           : (internal._codecPreferences && internal._codecPreferences.length)
             ? internal._codecPreferences
-            : (function () { try { return (RTCRtpSender.getCapabilities(internal.kind) || {}).codecs || []; }
+            : (function () { try { return _registryCodecCaps(internal.kind, manager.state.passthroughCodecs ? 'all' : 'send'); }
                              catch (eCv) { return []; } })();
         var known = _srcList.some(function (c) {
           if (!c || !c.mimeType) return false;
@@ -3675,6 +3843,25 @@ function RTCRtpSender(internal, track, manager) {
         return Promise.reject(err);
       }
     }
+    // The rate controller re-reads the encodings (a new maxBitrate is a new
+    // ceiling, at once). An encoding the application keeps active is a
+    // request to send: streams the RTP circuit breaker stopped may resume
+    // (RFC 8083 §4.5; media_transport rate-limits it).
+    try {
+      if (typeof manager.resetCircuitBreakers === 'function') {
+        var _cbSsrcs = [];
+        var _lys = internal.sender.layers || [];
+        if (_lys.length > 1) {
+          for (var _ci = 0; _ci < _lys.length; _ci++) {
+            if ((currentParams.encodings[_ci] || {}).active !== false && _lys[_ci].ssrc != null) _cbSsrcs.push(_lys[_ci].ssrc);
+          }
+        } else if ((currentParams.encodings[0] || {}).active !== false && internal.sender.ssrc != null) {
+          _cbSsrcs.push(internal.sender.ssrc);
+        }
+        if (_cbSsrcs.length) manager.resetCircuitBreakers(_cbSsrcs);
+      }
+      if (typeof manager.updateRates === 'function') manager.updateRates();
+    } catch (eR) { /* rate control must never fail setParameters */ }
 
     _mergeRequested();
     // Per spec, a new transactionId is generated after successful apply.
@@ -3831,45 +4018,23 @@ function _capabilityKey(c) {
   return c.mimeType + '|' + c.clockRate + '|' + (c.channels || 0);
 }
 
-RTCRtpSender.getCapabilities = function(kind) {
-  // W3C 5.2/5.3: an unrecognised kind returns NULL — only 'audio' and
-  // 'video' have capabilities. We were falling through to a default
-  // table and reporting codecs for kinds that do not exist.
-  if (kind !== 'audio' && kind !== 'video') return null;
-  // W3C §5.2.7: returns RTCRtpCapabilities = { codecs, headerExtensions }
-  // for the platform's capabilities (NOT for any particular sender).
-  //
-  // codecs: derived from media-processing's actual encoder/decoder
-  // registry, filtered to WebRTC-relevant entries and deduplicated.
-  //
-  // headerExtensions: pulled from sdp.js's DEFAULT_*_EXTENSIONS so the
-  // list matches what we actually advertise in our offers/answers.
-  // Each entry is { uri } per spec.
-
-  if (kind !== 'video' && kind !== 'audio') {
-    return { codecs: [], headerExtensions: [] };
-  }
-
-  // DERIVED FROM THE REGISTRY (sdp.js), intersected with what
-  // media-processing reports it can actually encode. Two rules make the
-  // three-way disagreement that used to exist impossible:
-  //   • nothing is ADVERTISED that the wire tables don't offer — both
-  //     come from the same registry entries;
-  //   • nothing is advertised that media-processing can't ENCODE, except
-  //     entries with no encoder by design (telephone-event is produced
-  //     by the DTMF sender).
+// The registry's codecs as RTCRtpCodec dictionaries (deduplicated), those
+// this process can use `way`: 'send' (an encoder), 'recv' (a decoder),
+// 'any' (either: setCodecPreferences' union, W3C 5.4.1 step 6), 'all' (a
+// pass-through connection: every codec the RTP layer packetizes).
+// codec_support.js decides; telephone-event (no encoder by design) is
+// available both ways.
+function _registryCodecCaps(kind, way) {
   var registry = SDP.CODEC_REGISTRY[kind] || [];
-  var available = {};
-  try {
-    var names = (kind === 'video') ? getSupportedVideoCodecs() : getSupportedAudioCodecs();
-    for (var ni = 0; ni < names.length; ni++) available[String(names[ni]).toLowerCase()] = true;
-  } catch (eSup) { available = null; }   // no encoder info: advertise the registry as-is
-
   var seen = {};
   var codecs = [];
   for (var i = 0; i < registry.length; i++) {
     var entry = registry[i];
-    if (entry.mpName && available && !available[String(entry.mpName).toLowerCase()]) continue;
+    if (way !== 'all') {
+      var send = CodecSupport.registryEntryAvailable(kind, entry, 'send');
+      var recv = CodecSupport.registryEntryAvailable(kind, entry, 'recv');
+      if (way === 'send' ? !send : way === 'recv' ? !recv : !(send || recv)) continue;
+    }
     var key = _capabilityKey(entry);
     if (seen[key]) continue;
     seen[key] = true;
@@ -3881,6 +4046,36 @@ RTCRtpSender.getCapabilities = function(kind) {
     }
     codecs.push(out);
   }
+  return codecs;
+}
+
+// setCodecPreferences' codecCapabilities (W3C 5.4.1 step 6): the union of
+// the sender's and receiver's capabilities; every registry codec for a
+// pass-through connection.
+function _codecPrefCaps(kind, manager) {
+  var pass = !!(manager && manager.state && manager.state.passthroughCodecs);
+  return _registryCodecCaps(kind, pass ? 'all' : 'any');
+}
+
+function _capabilities(kind, way) {
+  // W3C 5.2/5.3: an unrecognised kind returns NULL — only 'audio' and
+  // 'video' have capabilities. We were falling through to a default
+  // table and reporting codecs for kinds that do not exist.
+  if (kind !== 'audio' && kind !== 'video') return null;
+  // W3C §5.2.7: returns RTCRtpCapabilities = { codecs, headerExtensions }
+  // for the platform's capabilities (NOT for any particular sender).
+  //
+  // codecs: the registry (sdp.js) — nothing is advertised that the wire
+  // tables don't offer — restricted to what media-processing can encode
+  // (the sender: "implemented send codecs") or decode (the receiver:
+  // "implemented receive codecs"), codec_support.js. The receiver
+  // reported the sender's list: a codec FFmpeg decodes but cannot encode
+  // (H.265 without libx265) was missing from it.
+  //
+  // headerExtensions: pulled from sdp.js's DEFAULT_*_EXTENSIONS so the
+  // list matches what we actually advertise in our offers/answers.
+  // Each entry is { uri } per spec.
+  var codecs = _registryCodecCaps(kind, way);
 
   // Header extensions — read from sdp.js so the list stays in lockstep
   // with what we negotiate. SDP.DEFAULT_*_EXTENSIONS is the authoritative
@@ -3899,7 +4094,9 @@ RTCRtpSender.getCapabilities = function(kind) {
   }
 
   return { codecs: codecs, headerExtensions: headerExtensions };
-};
+}
+
+RTCRtpSender.getCapabilities = function(kind) { return _capabilities(kind, 'send'); };
 
 
 /* ========================= RTCRtpReceiver ========================= */
@@ -3910,9 +4107,23 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
   // negotiation). Media arrival later reuses this same object.
   if (!track) {
     try {
-      track = new MediaStreamTrack({ kind: kind });   // options-object ctor
+      // W3C 5.3 (create an RTCRtpReceiver): the label is "remote " + kind.
+      track = new MediaStreamTrack({ kind: kind, label: 'remote ' + kind });   // options-object ctor
       track.muted = true;                             // plain data property
     } catch (e) { track = null; }
+    // THE RECEIVER'S TRACK IS THE TRANSCEIVER'S, FOR GOOD (W3C 5.4
+    // addTransceiver / 5.3: [[ReceiverTrack]] is created with the receiver
+    // and never replaced). connection_manager surfaces this one when a
+    // negotiation first gives the transceiver a track (`_apiTrack`; the
+    // transceiver's `receiver.track` stays null until then — it is what
+    // tells connection_manager the track was surfaced). It created a NEW
+    // track there before, so the track event of a locally created
+    // transceiver carried another track and receiver.track changed under
+    // the application.
+    if (track && internalTransceiver && internalTransceiver.receiver &&
+        !internalTransceiver.receiver.track) {
+      internalTransceiver.receiver._apiTrack = track;
+    }
   }
 
   // WebIDL prototype surface (WPT): methods live on the prototype;
@@ -3937,8 +4148,9 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
       // its rollback.
       if (!manager || !manager.state ||
           !(manager.state.pendingLocalDescription || manager.state.currentLocalDescription)) return null;
-      // Stopped: no transport (see sender.transport).
-      if (internalTransceiver && internalTransceiver.currentDirection === 'stopped') return null;
+      // Stopped: no transport (see sender.transport; close() keeps it).
+      if (internalTransceiver && internalTransceiver.currentDirection === 'stopped' &&
+          !manager.state.closed) return null;
       return manager._getDtlsTransport ? manager._getDtlsTransport() : null;
     },
   });
@@ -4164,10 +4376,26 @@ function RTCRtpReceiver(track, kind, manager, internalTransceiver) {
             }
           }
         }
+        // The codec the peer sends (our description's first, as for video),
+        // and the one of each payload type: Opus, PCMU or PCMA.
+        var _rxAudio = internalTransceiver &&
+          (internalTransceiver.negotiatedRecvCodec || internalTransceiver.negotiatedCodec);
+        var _rxAudioName = (_rxAudio && _rxAudio.name) ? _rxAudio.name.toLowerCase() : 'opus';
+        var _audioCodecForPt = function (pt) {
+          var list = internalTransceiver &&
+            (internalTransceiver._negotiatedRecvCodecs || internalTransceiver._negotiatedCodecs);
+          if (!list || !list.length) return undefined;
+          for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].payloadType === pt) return list[i].name || null;
+          }
+          return null;
+        };
         pipeline = createAudioReceivePipeline({
           track:   self.track,
           manager: manager,
           ssrc:    ssrc,
+          codec:   _rxAudioName,
+          codecForPt: _audioCodecForPt,
           redPayloadType: _rxAudioRedPt,
         });
         _diag('[api-diag] RTCRtpReceiver: audio pipeline started ✓');
@@ -4655,8 +4883,7 @@ RTCRtpReceiver.getCapabilities = function(kind) {
   // W3C 5.2/5.3: an unrecognised kind returns NULL — only 'audio' and
   // 'video' have capabilities. We were falling through to a default
   // table and reporting codecs for kinds that do not exist.
-  if (kind !== 'audio' && kind !== 'video') return null;
-  return RTCRtpSender.getCapabilities(kind);
+  return _capabilities(kind, 'recv');
 };
 
 
@@ -4756,7 +4983,7 @@ function RTCRtpTransceiver(internal, manager) {
           if (willRecv && rTrack.muted) {
             rTrack.muted = false;
             try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'unmute' }); } catch (e1) {}
-          } else if (!willRecv && !rTrack.muted) {
+          } else if (!willRecv && !rTrack.muted && rTrack.readyState !== 'ended') {
             rTrack.muted = true;
             try { rTrack.dispatchEvent && rTrack.dispatchEvent({ type: 'mute' }); } catch (e3) {}
           }
@@ -4888,7 +5115,11 @@ function RTCRtpTransceiver(internal, manager) {
     if (Array.isArray(codecs) && codecs.length) {
       var _kindPfx = internal.kind + '/';
       var _caps = [];
-      try { _caps = (RTCRtpSender.getCapabilities(internal.kind) || {}).codecs || []; } catch (eC) {}
+      // W3C 5.4.1 step 6: codecCapabilities is the UNION of the sender's
+      // and the receiver's capabilities (they differ now: a codec decoded
+      // but not encoded is receive-only); a pass-through connection takes
+      // every registry codec.
+      try { _caps = _codecPrefCaps(internal.kind, manager); } catch (eC) {}
       for (var _ci = 0; _ci < codecs.length; _ci++) {
         var _cc = codecs[_ci];
         var _mt = _cc && _cc.mimeType;
@@ -4952,13 +5183,10 @@ function RTCRtpTransceiver(internal, manager) {
     // for our kind. Compare against RTCRtpReceiver.getCapabilities(kind).
     // Mismatch = InvalidAccessError. We compare on (mimeType, clockRate)
     // — channels/sdpFmtpLine differences are not blocking here.
+    // (The same union as above: the receiver's list alone refused a
+    // send-only codec, which step 6 allows.)
     var supported = null;
-    try {
-      // RTCRtpReceiver is in scope at module level; getCapabilities is static.
-      supported = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
-        ? RTCRtpReceiver.getCapabilities(internal.kind)
-        : null;
-    } catch (e) { supported = null; }
+    try { supported = { codecs: _codecPrefCaps(internal.kind, manager) }; } catch (e) { supported = null; }
     if (supported && Array.isArray(supported.codecs)) {
       for (var ci = 0; ci < codecs.length; ci++) {
         var want = codecs[ci];
@@ -5052,7 +5280,19 @@ function RTCDataChannel(internal, manager) {
   });
 
   // Writable properties
-  this.binaryType = 'arraybuffer';
+  // binaryType is a BinaryType enum attribute (W3C 6.2, WebIDL 3.2.18):
+  // the setter converts to a string and ignores a value that is not one of
+  // the enum's ('blob', 'arraybuffer'); a Symbol throws TypeError.
+  var _binaryType = 'arraybuffer';
+  Object.defineProperty(this, 'binaryType', {
+    enumerable: true,
+    get: function() { return _binaryType; },
+    set: function(v) {
+      if (typeof v === 'symbol') throw new TypeError('binaryType: a Symbol is not a string');
+      var bt = String(v);
+      if (bt === 'blob' || bt === 'arraybuffer') _binaryType = bt;
+    },
+  });
 
   // bufferedAmountLowThreshold: proxy to the internal channel object
   // so the controller's drain handler (which fires the bufferedamountlow
@@ -5358,6 +5598,17 @@ function RTCSessionDescription(init) {
   }
   this.type = init.type != null ? init.type : null;
   this.sdp  = init.sdp  != null ? init.sdp  : '';
+  _readonlyAttributes(this);
+}
+
+// W3C 4.8.1 / 4.8.2: every attribute of RTCSessionDescription and
+// RTCIceCandidate is readonly — assigning one throws TypeError in strict
+// code, as a browser's accessor without a setter does. They were writable
+// data properties: `desc.sdp += ...` munged a description in place.
+function _readonlyAttributes(obj) {
+  Object.keys(obj).forEach(function (k) {
+    Object.defineProperty(obj, k, { writable: false, configurable: false });
+  });
 }
 
 RTCSessionDescription.prototype.toJSON = function() {
@@ -5366,6 +5617,8 @@ RTCSessionDescription.prototype.toJSON = function() {
 
 
 /* ========================= RTCIceCandidate ========================= */
+
+var _HIDE_REMOTE_PRFLX = Symbol('remote peer-reflexive candidate');
 
 function RTCIceCandidate(init) {
   // Backwards compat: legacy callers pass the candidate string directly
@@ -5488,6 +5741,16 @@ function RTCIceCandidate(init) {
   // dictionary members win over (or fill) string-derived values —
   // 'cloned vs signaled' parity per WPT.
   if (_initRelayProtocol != null) this.relayProtocol = _initRelayProtocol;
+  delete this._parseFail;
+  // The library's own remote peer-reflexive candidates (see _normCand):
+  // parsed, then the address hidden. Symbol-keyed, so no dictionary from an
+  // application can ask for it.
+  if (init[_HIDE_REMOTE_PRFLX] === true) {
+    this.candidate = '';
+    this.address = null;
+    this.relatedAddress = null;
+  }
+  _readonlyAttributes(this);
 }
 
 RTCIceCandidate.prototype.toJSON = function() {
@@ -5512,8 +5775,13 @@ function RTCCertificate(generated) {
   // Chrome/Firefox's non-standard but widely available getAlgorithm().
   this._algorithm = generated.algorithm || null;
 
-  this._fps = [{ algorithm: 'sha-256',
-    value: String(generated.fingerprint || '').toLowerCase() }];
+  // Every fingerprint the SDP advertises for it (RFC 8122 §5.1: SHA-256,
+  // and the signature's own hash when that is another — cert.js).
+  this._fps = (generated.fingerprints && generated.fingerprints.length)
+    ? generated.fingerprints.map(function (f) {
+        return { algorithm: f.algorithm, value: String(f.value || '').toLowerCase() };
+      })
+    : [{ algorithm: 'sha-256', value: String(generated.fingerprint || '').toLowerCase() }];
 
   // Non-standard but commonly available — returns the resolved
   // keygenAlgorithm in W3C shape ({name, namedCurve, ...} or
@@ -5621,17 +5889,20 @@ function RTCSctpTransport(manager, gen) {
     // SCTP-DC (RFC 8831) negotiates the per-direction stream count via the
     // INIT/INIT-ACK chunks — values are capped at 65535. Until our SCTP
     // layer has actually completed that handshake (state.sctpAssociation
-    // is non-null), we return null. After, we expose 65535 as the
-    // protocol-level upper bound; sctp.js doesn't currently surface the
-    // negotiated lower value, so 65535 is the most truthful answer we
-    // can give without underreporting.
+    // is non-null), we return null. After, the smaller of the inbound and
+    // outbound streams in use (W3C: [[MaxChannels]] "the minimum of the
+    // negotiated amount of incoming and outgoing SCTP streams"; RFC 9260
+    // §5.1.1), kept through the parked span.
     get: function() {
       if (gen.mode !== 'live') return null;
       // the parked span above (gen.sctpUp): still this object's negotiated value
-      if (!manager.state.sctpAssociation && !(gen.sctpUp && manager.state.sctpState !== 'closed')) return null;
-      return 65535;
+      var assoc = manager.state.sctpAssociation;
+      if (!assoc && !(gen.sctpUp && manager.state.sctpState !== 'closed')) return null;
+      if (assoc && assoc.outboundStreams > 0) _maxChannels = Math.min(assoc.outboundStreams, assoc.inboundStreams);
+      return _maxChannels;
     },
   });
+  var _maxChannels = 65535;
 
   // onstatechange is an event handler attribute on the prototype, an entry
   // in the shared registry the dispatcher at the top of the constructor
@@ -5671,7 +5942,7 @@ function RTCDtlsTransport(manager, gen) {
       if (gen.mode !== 'live') return;
       var errV;
       try {
-        errV = new RTCError({ errorDetail: (info && info.fingerprint) ? 'fingerprint-failure' : 'dtls-failure' },
+        errV = new RTCError({ errorDetail: (info && (info.errorDetail === 'fingerprint-failure' || info.fingerprint)) ? 'fingerprint-failure' : 'dtls-failure' },
                             (info && info.message) || 'DTLS failure');
       } catch (eMk) { errV = { name: 'OperationError', errorDetail: 'dtls-failure' }; }
       // An RTCErrorEvent, as WPT's RTCDtlsTransport-onerror checks
@@ -5819,7 +6090,13 @@ function RTCIceTransport(manager, gen) {
                      !!(st.currentRemoteDescription || st.pendingRemoteDescription);
       if (!haveBoth) return 'unknown';
       var a = _agent();
-      return a ? a.role : 'controlling';
+      if (a) return a.role;
+      // No agent yet (it is made when gathering starts): the role the first
+      // offer decided (connection_manager's trackNegotiationRole). It said
+      // 'controlling' whatever the side — an answerer after
+      // setLocalDescription(pranswer) included.
+      if (st.iceRoleDecided) return st.iceControlling ? 'controlling' : 'controlled';
+      return 'unknown';
     },
   });
 
@@ -5889,8 +6166,25 @@ function RTCIceTransport(manager, gen) {
 
   // One normalizer for the lists AND the selected pair, so identity
   // comparisons across them hold field-for-field (WPT requirement).
-  function _normCand(c) {
+  function _normCand(c, isRemote) {
     if (!c) return null;
+    // W3C 5.6 (RTCIceCandidate of a remote peer-reflexive candidate): the
+    // peer never signalled it, its address was learned from the network —
+    // candidate is the empty string and address / relatedAddress are null;
+    // the other parsed fields (foundation, component, priority, protocol,
+    // port, type) stay. It came out as a "typ prflx" line with no raddr,
+    // which the strict parse rejects: every field null, type too.
+    if (isRemote && c.type === 'prflx') {
+      var _hc = Object.assign({}, c, { candidate: null, sdp: null, raddr: '0.0.0.0', rport: 0,
+                                       relatedAddress: null, relatedPort: null });
+      var _hn = _normCand(_hc, false);
+      if (_hn instanceof RTCIceCandidate) {
+        return new RTCIceCandidate({ candidate: _hn.candidate, sdpMid: _hn.sdpMid,
+          sdpMLineIndex: _hn.sdpMLineIndex, usernameFragment: _hn.usernameFragment,
+          [_HIDE_REMOTE_PRFLX]: true });
+      }
+      return _hn;
+    }
     // THE `candidate` STRING IS THE IDENTITY. W3C 4.8.1 makes it the primary
     // member of RTCIceCandidate — the a=candidate line itself — and it is how
     // applications compare candidates across the two peers:
@@ -5916,7 +6210,10 @@ function RTCIceTransport(manager, gen) {
       var _parts = [
         _fnd,
         (c.component === 2 ? 2 : 1),
-        (c.protocol || 'udp').toUpperCase(),
+        // as sdp.js buildCandidateString writes it (the line the
+        // icecandidate event carried): the candidate string is the identity
+        // applications compare, and 'UDP' here never matched it
+        (c.protocol || 'udp'),
         (c.priority != null ? c.priority : 0),
         (c.ip || c.address || ''),
         (c.port != null ? c.port : 0),
@@ -5974,7 +6271,7 @@ function RTCIceTransport(manager, gen) {
     var a = _agent();
     if (!a || !a.selectedPair) return null;
     var p = a.selectedPair;
-    return { local: _normCand(p.local), remote: _normCand(p.remote) };
+    return { local: _normCand(p.local), remote: _normCand(p.remote, true) };
   };
 
   impl.getLocalParameters = function() {
@@ -6048,7 +6345,10 @@ function RTCDTMFSender(getPipeline, getClosed, getTxState) {
       var p = _pipeline();
       if (p && typeof p.sendDtmf === 'function' && p.dtmfPayloadType != null) return true;
       try {
-        var d = (typeof getDirection === 'function' && getDirection()) || null;
+        // the transceiver's negotiated direction (bug 67: this read a
+        // getDirection that does not exist, so it was always true)
+        var _txs = (typeof getTxState === 'function') ? getTxState() : null;
+        var d = (_txs && _txs.currentDirection) || null;
         if (d === 'recvonly' || d === 'inactive' || d === 'stopped') return false;
       } catch (eD) {}
       return true;
@@ -6362,6 +6662,16 @@ function _idMediaPlayout(kind)       { return 'MP-' + kind; }
 
 /* ── RTP-stream helpers ────────────────────────────────────────────── */
 
+// The members webrtc-stats says "MUST NOT exist for audio" that the
+// entries below would otherwise carry (§ RTCInboundRtpStreamStats,
+// RTCOutboundRtpStreamStats). Removed from an audio entry, keeping the
+// order of the rest.
+var _INBOUND_VIDEO_ONLY = ['framesReceived', 'framesDecoded', 'keyFramesDecoded', 'framesDropped', 'frameWidth', 'frameHeight',
+  'framesPerSecond', 'pliCount', 'firCount'];
+var _OUTBOUND_VIDEO_ONLY = ['framesEncoded', 'keyFramesEncoded', 'framesSent', 'frameWidth', 'frameHeight', 'framesPerSecond',
+  'pliCount', 'firCount', 'qualityLimitationReason', 'qualityLimitationDurations', 'qualityLimitationResolutionChanges',
+  'encodingIndex', 'rid'];
+
 function _inboundRtpEntry(ssrc, stats, mapping, now) {
   var kind = (mapping && mapping.transceiver) ? mapping.transceiver.kind : 'video';
 
@@ -6418,7 +6728,9 @@ function _inboundRtpEntry(ssrc, stats, mapping, now) {
     packetsReceived: stats.packets || 0,
     bytesReceived:   stats.bytes   || 0,
     packetsLost:     stats.packetsLost || 0,
-    jitter:          (stats.jitter || 0) / 90000,   // seconds
+    // seconds (W3C): the stream keeps it in its own RTP clock's units
+    // (media_transport), 48 kHz for Opus — not always 90 kHz
+    jitter:          (stats.jitter || 0) / (stats.clockRate || 90000),
     // Time bookkeeping
     lastPacketReceivedTimestamp: stats.lastPacketAt || 0,
     // Header bytes: we don't separate header from payload in our counter,
@@ -6465,6 +6777,13 @@ function _inboundRtpEntry(ssrc, stats, mapping, now) {
   //   totalSamplesDuration — seconds of audio received
   // Both accumulate from the audio-level extension where present; zero until
   // then, which is a valid reading, not a missing one.
+  // W3C webrtc-stats RTCInboundRtpStreamStats: these "MUST NOT exist for
+  // audio" (framesDecoded, keyFramesDecoded, framesDropped, frameWidth,
+  // frameHeight, framesPerSecond, framesReceived, firCount, pliCount). An
+  // audio inbound-rtp carried them all, as zeros.
+  if (kind === 'audio') {
+    for (var _vi = 0; _vi < _INBOUND_VIDEO_ONLY.length; _vi++) delete entry[_INBOUND_VIDEO_ONLY[_vi]];
+  }
   if (kind === 'audio') {
     entry.totalAudioEnergy     = stats.totalAudioEnergy     || 0;
     entry.totalSamplesDuration = stats.totalSamplesDuration || 0;
@@ -6554,7 +6873,8 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
     // packets via the RTX stream (see connection_manager.handleNack).
     retransmittedPacketsSent: stats.retransmittedPacketsSent || 0,
     retransmittedBytesSent:   stats.retransmittedBytesSent   || 0,
-    // Quality limitation — we don't do adaptive encoding yet, always "none"
+    // Quality limitation: 'none' here; _buildStatsReport fills in the rate
+    // controller's view (media_transport.getQualityLimitation).
     qualityLimitationReason:      'none',
     qualityLimitationDurations:   { none: 0, cpu: 0, bandwidth: 0, other: 0 },
     qualityLimitationResolutionChanges: 0,
@@ -6583,10 +6903,26 @@ function _outboundRtpEntry(ssrc, stats, transceiver, now) {
       _out.encodingIndex = 0;
     }
   } catch (eE) { /* stats must never throw */ }
+  // active (W3C): whether the encoding is configured to be sent —
+  // setParameters' active, mirrored on the internal sender — not a constant.
+  try {
+    var _encs = transceiver && transceiver.sender && transceiver.sender.encodings;
+    var _enc = _encs && _encs[_out.encodingIndex != null ? _out.encodingIndex : 0];
+    if (_enc && _enc.active === false) _out.active = false;
+  } catch (eA) { /* stats must never throw */ }
+  // W3C webrtc-stats RTCOutboundRtpStreamStats: the frame counters, the
+  // frame size and rate, firCount / pliCount and the qualityLimitation*
+  // members "MUST NOT exist for audio". An audio outbound-rtp carried them
+  // (zeros, 'none'). _buildStatsReport adds the rate controller's
+  // qualityLimitation and a layer's rid to video entries only.
+  if (kind === 'audio') {
+    for (var _vo = 0; _vo < _OUTBOUND_VIDEO_ONLY.length; _vo++) delete _out[_OUTBOUND_VIDEO_ONLY[_vo]];
+  }
   return _out;
 }
 
-function _remoteInboundRtpEntry(ssrc, rs, outboundId, kind, now) {
+// clockRate: the outbound stream's (the RR's jitter is in its RTP units).
+function _remoteInboundRtpEntry(ssrc, rs, outboundId, kind, now, clockRate) {
   return {
     id:            _idRemoteInbound(ssrc),
     type:          'remote-inbound-rtp',
@@ -6605,10 +6941,12 @@ function _remoteInboundRtpEntry(ssrc, rs, outboundId, kind, now) {
     // single stray undefined cost the whole file.
     // packetsReceived is not carried in a Receiver Report, so it is omitted.
     packetsLost:   rs.totalLost || 0,
-    jitter:        (rs.jitter       || 0) / 90000,
+    jitter:        (rs.jitter       || 0) / (clockRate || 90000),
     fractionLost:  (rs.fractionLost || 0) / 256,              // 0..1
-    roundTripTime: (rs.roundTripTime || 0) / 1000,            // seconds
-    totalRoundTripTime:      ((rs.roundTripTime || 0) / 1000) * (rs.rttMeasurements || 0),
+    // seconds; absent until an RR has given one (W3C: "left undefined")
+    roundTripTime: rs.rttMeasurements > 0 ? (rs.roundTripTime || 0) / 1000 : undefined,
+    // the sum of the measurements (media_transport keeps it, in ms)
+    totalRoundTripTime:      (rs.totalRoundTripTime || 0) / 1000,
     roundTripTimeMeasurements: rs.rttMeasurements || 0,
   };
 }
@@ -6639,7 +6977,8 @@ function _remoteOutboundRtpEntry(ssrc, ro, inboundId, kind, now) {
     // RTT from remote's perspective (if they report DLSR to us). Not yet
     // computed — would require parsing RR blocks in the SR where mediaSsrc
     // references OUR inbound SSRC (unusual when remote is also recvonly).
-    roundTripTime:              (ro.roundTripTime || 0) / 1000,
+    // (W3C: absent while no RTT has been computed)
+    roundTripTime:              ro.roundTripTimeMeasurements > 0 ? (ro.roundTripTime || 0) / 1000 : undefined,
     totalRoundTripTime:         (ro.totalRoundTripTime || 0) / 1000,
     roundTripTimeMeasurements:  ro.roundTripTimeMeasurements || 0,
   };
@@ -6648,10 +6987,11 @@ function _remoteOutboundRtpEntry(ssrc, ro, inboundId, kind, now) {
 
 /* ── Codec helper ──────────────────────────────────────────────────── */
 
-// Find the fmtp line negotiated for a payload type, across every transceiver's
-// negotiated codec set. Returns null when the codec carries no fmtp.
+// Find the codec negotiated for a payload type, across every transceiver's
+// negotiated codec set (the first match), with its transceiver's kind.
+// Returns null when no set carries the payload type.
 var _fmtpStatsManager = null;
-function _negotiatedFmtpLine(pt) {
+function _negotiatedCodec(pt) {
   var mgr = _fmtpStatsManager;
   if (!mgr || !mgr.state || !mgr.state.transceivers) return null;
   var tcs = mgr.state.transceivers;
@@ -6664,16 +7004,21 @@ function _negotiatedFmtpLine(pt) {
       var list = lists[l];
       if (!list) continue;
       for (var c = 0; c < list.length; c++) {
-        if (list[c] && list[c].payloadType === pt) {
-          if (list[c].sdpFmtpLine) return list[c].sdpFmtpLine;
-          if (list[c].fmtp && SDP.buildFmtpConfig) {
-            var line = SDP.buildFmtpConfig(list[c].fmtp);
-            if (line) return line;
-          }
-          return null;
-        }
+        if (list[c] && list[c].payloadType === pt) return { codec: list[c], kind: tcs[i].kind };
       }
     }
+  }
+  return null;
+}
+// The fmtp line negotiated for a payload type. Returns null when the codec
+// carries no fmtp.
+function _negotiatedFmtpLine(pt) {
+  var nc = _negotiatedCodec(pt);
+  if (!nc) return null;
+  if (nc.codec.sdpFmtpLine) return nc.codec.sdpFmtpLine;
+  if (nc.codec.fmtp && SDP.buildFmtpConfig) {
+    var line = SDP.buildFmtpConfig(nc.codec.fmtp);
+    if (line) return line;
   }
   return null;
 }
@@ -6693,6 +7038,16 @@ function _codecEntry(pt, kind, direction, now) {
     0:   { mimeType: 'unknown',    clockRate: 0 },
   };
   var info = table[pt] || { mimeType: (kind + '/unknown'), clockRate: 90000 };
+  // The negotiated codec's own name, clock rate and channels (W3C
+  // RTCCodecStats): payload types are the descriptions' (102 is H.265 in our
+  // offers, PCMU is 0), so the table is only the fallback for a payload type
+  // no negotiated set carries.
+  try {
+    var _nc = _negotiatedCodec(pt);
+    if (_nc && _nc.codec.name) {
+      info = { mimeType: (_nc.kind || kind) + '/' + _nc.codec.name, clockRate: _nc.codec.clockRate || 0, channels: _nc.codec.channels };
+    }
+  } catch (eN) { /* stats must never throw */ }
   var entry = {
     id:          _idCodec(pt, direction),
     type:        'codec',
@@ -6743,9 +7098,10 @@ function _mediaSourceEntry(track, now, sender) {
       : 0;
   } else {
     // audio
-    if (settings) {
-      entry.sampleRate = settings.sampleRate || 48000;
-    }
+    // (no sampleRate: RTCAudioSourceStats has none — audioLevel,
+    // totalAudioEnergy, totalSamplesDuration, echoReturnLoss,
+    // echoReturnLossEnhancement are its members; it was the track's
+    // setting, a member no dictionary of webrtc-stats defines)
     // audioLevel / totalAudioEnergy / totalSamplesDuration are populated
     // when RTP-5 (RFC 6464 audio level) lands and exposes the per-AudioData
     // RMS via media-processing's nonstandard.computeAudioRms helper.
@@ -6786,6 +7142,13 @@ function _mediaPlayoutEntry(kind, stats, now) {
 
 /* ── Transport ─────────────────────────────────────────────────────── */
 
+// The IANA DTLS-SRTP protection profiles (RFC 5764 §4.1.2, RFC 7714 §14.2).
+var _SRTP_PROFILE_NAMES = {
+  1: 'SRTP_AES128_CM_HMAC_SHA1_80',
+  2: 'SRTP_AES128_CM_HMAC_SHA1_32',
+  7: 'SRTP_AEAD_AES_128_GCM',
+  8: 'SRTP_AEAD_AES_256_GCM',
+};
 function _transportEntry(snapshot, snap, now) {
   // Aggregate bytes across all SSRCs — approximate, but matches what
   // browsers report (pre-SRTP size, per SSRC totalled).
@@ -6814,12 +7177,15 @@ function _transportEntry(snapshot, snap, now) {
     dtlsState:               snapshot.dtlsState || 'new',
     iceState:                snapshot.iceConnectionState || 'new',
     dtlsRole:                snapshot.dtlsRole || 'unknown',
-    // W3C stats: iceRole follows who OFFERED — offerer controlling,
-    // answerer controlled (RFC 8445 6.1); 'unknown' before any local
+    // W3C stats: iceRole is the agent's own role (RFC 8445 6.1.1: a lite
+    // agent is controlled and its full peer controlling, whoever offered;
+    // a role conflict can swap it); offerer controlling, answerer
+    // controlled while there is no agent; 'unknown' before any local
     // description exists.
     iceRole: (function () {
       var d = snapshot.pendingLocalDescription || snapshot.currentLocalDescription;
       if (!d) return 'unknown';
+      if (snap.iceRole) return snap.iceRole;
       return d.type === 'offer' ? 'controlling' : 'controlled';
     })(),
     // W3C: how many times the selected pair has changed — 0 before any
@@ -6828,8 +7194,9 @@ function _transportEntry(snapshot, snap, now) {
     selectedCandidatePairId: snapshot.selectedPair
       ? _idCandidatePair(snapshot.selectedPair)
       : undefined,
-    // Optional — these depend on the DTLS lib exposing the info.
-    srtpCipher:              'AES_CM_128_HMAC_SHA1_80',
+    // The negotiated DTLS-SRTP protection profile, by its name in the IANA
+    // registry (W3C); absent until use_srtp has chosen one.
+    srtpCipher:              _SRTP_PROFILE_NAMES[snapshot.negotiatedSrtpProfile],
     iceLocalUsernameFragment: snapshot.localIceUfrag || undefined,
   };
   if (snapshot.localFingerprint) {
@@ -6838,7 +7205,9 @@ function _transportEntry(snapshot, snap, now) {
               : snapshot.localFingerprint;
     if (lfp) entry.localCertificateId = _idCertificate(lfp);
   }
-  if (snapshot.remoteFingerprint) {
+  // The peer's certificate is known once DTLS has given its DER (the
+  // certificate entry needs it, W3C base64Certificate).
+  if (snapshot.remoteFingerprint && snapshot.remoteCertificates && snapshot.remoteCertificates[0]) {
     var rfp = typeof snapshot.remoteFingerprint === 'object'
               ? snapshot.remoteFingerprint.value
               : snapshot.remoteFingerprint;
@@ -6869,6 +7238,13 @@ function _candidateEntry(cand, kind, now) {
   if (cand.relatedPort)    entry.relatedPort    = cand.relatedPort;
   if (cand.tcpType)        entry.tcpType        = cand.tcpType;
   if (cand.relayProtocol)  entry.relayProtocol  = cand.relayProtocol;
+  // webrtc-stats 7.x (RTCIceCandidateStats.address): the address of a
+  // REMOTE peer-reflexive candidate — learned from the network, never
+  // signalled by the application — is not exposed.
+  if (kind === 'remote' && entry.candidateType === 'prflx') {
+    delete entry.address;
+    delete entry.relatedAddress;
+  }
   return entry;
 }
 
@@ -6941,7 +7317,10 @@ function _candidatePairEntry(snapshot, snap, now) {
     // math using two halves if needed. For typical ICE values (< 2^31) we
     // can just approximate as local*remote-ish. stable-webrtc uses it only
     // for comparing "which pair is best" so relative order is what matters.
-    priority: _computePairPriority(
+    // The agent's own (a BigInt, computed with its role: G is the
+    // controlling side's candidate, whichever that is); the formula below
+    // only for a pair that has none.
+    priority: (typeof pair.priority === 'bigint') ? Number(pair.priority) : _computePairPriority(
       (pair.local  && pair.local.priority)  || 0,
       (pair.remote && pair.remote.priority) || 0,
       pair.controlling !== false   // we're controlled (ICE Lite), but nominate side matters for the formula
@@ -6959,7 +7338,8 @@ function _candidatePairEntry(snapshot, snap, now) {
     packetsSent:              (pair.packetsSent || 0) + mediaPacketsSent,
     packetsReceived:          (pair.packetsReceived || 0) + mediaPacketsReceived,
     // RTT (seconds) — preferred from STUN, falls back to RTCP RR
-    currentRoundTripTime:     rttSeconds,
+    // (W3C: only once a round trip has been measured, as _checkPairEntry)
+    currentRoundTripTime:     rttMeasurements > 0 ? rttSeconds : undefined,
     totalRoundTripTime:       totalRttSeconds,
     roundTripTimeMeasurements: rttMeasurements,
     // STUN check counters (connectivity + consent)
@@ -7009,7 +7389,7 @@ function _checkPairEntry(pair, now) {
     remoteCandidateId:          _idRemoteCandidate(pair.remote),
     state:                      pair.state || 'frozen',
     nominated:                  !!pair.nominated,
-    priority:                   _computePairPriority(
+    priority:                   (typeof pair.priority === 'bigint') ? Number(pair.priority) : _computePairPriority(
                                   (pair.local  && pair.local.priority)  || 0,
                                   (pair.remote && pair.remote.priority) || 0,
                                   pair.controlling !== false),
@@ -7035,10 +7415,15 @@ function _checkPairEntry(pair, now) {
 
 /* ── Data channel ──────────────────────────────────────────────────── */
 
-function _dataChannelEntry(dc, now) {
+// index: the channel's place in the connection's list (it only grows). The
+// stats id comes from it, not from the SCTP stream id: a channel has no
+// stream id until the DTLS role is known, and every such channel was
+// 'DC-null' — one report entry for all of them, renamed once negotiated
+// (W3C: an id identifies one object, and keeps doing so).
+function _dataChannelEntry(dc, now, index) {
   var s = dc._stats || {};
   return {
-    id:                    _idDataChannel(dc.id),
+    id:                    _idDataChannel(index),
     type:                  'data-channel',
     timestamp:             now,
     label:                 dc.label || '',
@@ -7103,7 +7488,11 @@ function _peerConnectionEntry(snapshot, now) {
     for (var i = 0; i < snapshot.dataChannels.length; i++) {
       var dc = snapshot.dataChannels[i];
       if (dc.readyState === 'open' || dc._everOpened) dcOpened++;
-      if (dc.readyState === 'closed') dcClosed++;
+      // W3C: the channels that have LEFT 'open' (closing or closed); one
+      // that never opened is not counted. _everOpened is set by the
+      // controller at the open transition, so a closed channel still counts
+      // as opened.
+      if ((dc.readyState === 'closing' || dc.readyState === 'closed') && dc._everOpened) dcClosed++;
     }
   }
   return {
@@ -7228,7 +7617,8 @@ function _buildStatsReport(manager, filter) {
   // (state.remoteCertificates) — the same bytes we hashed to check the
   // fingerprint, so a consumer can repeat that check from the stats.
   var _remPem = (snapshot.remoteCertificates && snapshot.remoteCertificates[0]) || null;
-  var remoteCert = _certificateEntry(snapshot.remoteFingerprint, false, now, _remPem);
+  // (none before DTLS has given it: base64Certificate is required)
+  var remoteCert = _remPem ? _certificateEntry(snapshot.remoteFingerprint, false, now, _remPem) : null;
   if (remoteCert) report.set(remoteCert.id, remoteCert);
 
   // candidates + candidate-pair (always, if we have a selected pair)
@@ -7445,10 +7835,21 @@ function _buildStatsReport(manager, filter) {
     }
     var oStats = snap.outbound[outSsrc];
     var oEntry = _outboundRtpEntry(outSsrc, oStats, tc, now);
+    // W3C webrtc-stats qualityLimitationReason / Durations, from the rate
+    // controller (media_transport): 'bandwidth' while the congestion
+    // controller holds the stream below what the signaled limits allow, or
+    // the RTP circuit breaker stopped it.
+    if (oEntry.kind === 'video' && typeof manager.getQualityLimitation === 'function') {
+      var _ql = manager.getQualityLimitation(outSsrc, now);
+      if (_ql) {
+        oEntry.qualityLimitationReason = _ql.reason;
+        oEntry.qualityLimitationDurations = _ql.durations;
+      }
+    }
     // W3C outbound-rtp.rid — simulcast layer identifier. Present only
     // when this SSRC belongs to a named simulcast layer; omitted for
     // non-simulcast senders (per spec, dictionary field is optional).
-    if (tcLayer && tcLayer.rid) oEntry.rid = tcLayer.rid;
+    if (oEntry.kind === 'video' && tcLayer && tcLayer.rid) oEntry.rid = tcLayer.rid;
 
     // If remote has sent RR for this SSRC, link to its remote-inbound-rtp.
     var rs = snap.rtcp[outSsrc];
@@ -7468,7 +7869,7 @@ function _buildStatsReport(manager, filter) {
 
     // remote-inbound-rtp (what the remote reports about this outbound stream)
     if (rs) {
-      var rEntry = _remoteInboundRtpEntry(outSsrc, rs, oEntry.id, kindOut, now);
+      var rEntry = _remoteInboundRtpEntry(outSsrc, rs, oEntry.id, kindOut, now, oStats.clockRate);
       report.set(rEntry.id, rEntry);
     }
   }
@@ -7484,7 +7885,7 @@ function _buildStatsReport(manager, filter) {
   // data-channel entries (only when unfiltered — DCs have no SSRC)
   if (filterSet == null && snapshot.dataChannels) {
     for (var dci = 0; dci < snapshot.dataChannels.length; dci++) {
-      var dcEntry = _dataChannelEntry(snapshot.dataChannels[dci], now);
+      var dcEntry = _dataChannelEntry(snapshot.dataChannels[dci], now, dci);
       report.set(dcEntry.id, dcEntry);
     }
   }
@@ -7494,6 +7895,13 @@ function _buildStatsReport(manager, filter) {
     var sctpEntry = _sctpTransportEntry(snapshot, now);
     if (sctpEntry) report.set(sctpEntry.id, sctpEntry);
   }
+
+  // A WebIDL dictionary leaves an absent member out (fix 11): no member is
+  // undefined or null (an unassigned data channel id, an SCTP RTT not yet
+  // measured, a stream without a mid ...).
+  report.forEach(function (e) {
+    for (var k in e) if (e[k] === undefined || e[k] === null) delete e[k];
+  });
 
   return report;
 }

@@ -23,7 +23,7 @@
 
 import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 import { createSecureContext } from 'lemon-tls';
-import { generateCertificate } from './cert.js';
+import { generateCertificate, certificateFingerprints } from './cert.js';
 import * as SDP from './sdp.js';
 
 // Debug logging gate (mirrors api.js / connection_manager.js). '[tc]'
@@ -88,10 +88,13 @@ function ensureLocalIceCreds(state, forceNew) {
 function ensureLocalFingerprint(state) {
   if (state.localFingerprint) return;
   if (!state.cert || !state.key) {
-    var generated = generateCertificate();
+    // The library's own certificate: ECDSA P-256, named explicitly (a
+    // bare { name: 'ECDSA' } is refused, as WebCrypto refuses it).
+    var generated = generateCertificate({ keygenAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' } });
     state.cert = generated.cert;
     state.key = generated.key;
     state.localFingerprint = { algorithm: 'sha-256', value: generated.fingerprint };
+    _setLocalFingerprints(state, generated.fingerprints);
     return;
   }
   try {
@@ -107,6 +110,9 @@ function ensureLocalFingerprint(state) {
         return b.toString(16).padStart(2, '0').toUpperCase();
       }).join(':'),
     };
+    // RFC 8122 §5.1: the signature's own hash too (a P-384 certificate's
+    // SHA-384), when it is another.
+    _setLocalFingerprints(state, certificateFingerprints(certDer));
   } catch (e) {
     // The user-supplied cert/key couldn't be loaded into a TLS context —
     // most commonly a key/cert mismatch, an encrypted PEM without the
@@ -122,23 +128,37 @@ function ensureLocalFingerprint(state) {
         'a freshly-generated self-signed certificate. The supplied cert/key ' +
         'will not be used.');
     }
-    var fallback = generateCertificate();
+    var fallback = generateCertificate({ keygenAlgorithm: { name: 'ECDSA', namedCurve: 'P-256' } });
     state.cert = fallback.cert;
     state.key  = fallback.key;
     state.localFingerprint = { algorithm: 'sha-256', value: fallback.fingerprint };
+    _setLocalFingerprints(state, fallback.fingerprints);
   }
 }
 
+// Every fingerprint of the one certificate (RFC 8122 §5.1), for the SDP,
+// when there is more than its SHA-256 — unless the configuration's
+// certificates already set the list (api.js: every certificate's
+// fingerprints). The SHA-256 one first: sdp.js writes it last.
+function _setLocalFingerprints(state, fps) {
+  if (state.localFingerprints && state.localFingerprints.length) return;
+  if (!fps || fps.length < 2) return;
+  state.localFingerprints = fps.slice();
+}
+
 /**
- * What a=setup value to put in a freshly built SDP.
+ * What a=setup value to put in a freshly built ANSWER.
  *
  * Returns 'active' / 'passive' if our DTLS role has already been decided
  * (because we set a remote description first and learned it from the
  * peer's a=setup). Returns null if the role is not yet decided — the
- * caller falls back to 'actpass' for the offerer-side neutral stance,
- * or echoes the peer's offer for answer-side resolution.
+ * caller echoes the peer's offer for answer-side resolution.
  *
- * Once DTLS is established we MUST keep the same role forever (RFC 8842).
+ * A continued association keeps its roles in every answer (RFC 9429 5.3.2:
+ * "Each a=setup line MUST use an active or passive role value consistent
+ * with the existing DTLS association"; RFC 8842 §5.3: "a value that does
+ * not change the previously negotiated DTLS roles"). An OFFER is always
+ * actpass (JSEP 5.2.1 / 5.2.2, RFC 8842 §5.5), whatever the role.
  *
  * @param {Object} state
  * @returns {'active'|'passive'|null}
@@ -263,6 +283,13 @@ function applyRemoteDescription(state, parsed) {
   // ── ICE creds + DTLS fingerprint + role. ──
   // From the m-section that owns the transport — see transportSection.
   var tSec = transportSection(parsed);
+  // Reduced-size RTCP (RFC 5506 §5) only when the peer's description says
+  // a=rtcp-rsize. RFC 8859 puts it in the IDENTICAL category: under BUNDLE
+  // one value for the transport, read from the transport's section; a
+  // transport section that is not RTP (m=application) has no RTCP to say
+  // it for, so then the first live RTP section. Without it every RTCP
+  // packet we send is compound (media_transport, RFC 3550 §6.1).
+  state.remoteRtcpRsize = _rtcpRsizeOf(parsed, tSec);
   if (tSec) {
     // Detect ICE restart: peer ufrag (or pwd) changed since the last
     // applied remote description. Per RFC 8839 §5, an ICE restart is
@@ -280,8 +307,21 @@ function applyRemoteDescription(state, parsed) {
     }
     state.remoteIceUfrag = tSec.iceUfrag;
     if (tSec.icePwd)      state.remoteIcePwd      = tSec.icePwd;
-    if (tSec.fingerprint) state.remoteFingerprint = tSec.fingerprint;
-    if (tSec.setup && !state.dtlsRole) {
+    if (tSec.fingerprint) {
+      state.remoteFingerprint = tSec.fingerprint;
+      // Every a=fingerprint of the section (RFC 8122 §5.1): the DTLS check
+      // matches the peer's certificate against the set, not the last line.
+      state.remoteFingerprints = (tSec.fingerprints && tSec.fingerprints.length)
+        ? tSec.fingerprints : [tSec.fingerprint];
+    }
+    // A NEW DTLS ASSOCIATION NEGOTIATES ITS ROLES AGAIN (RFC 8842 §5.4: the
+    // offerer becomes client or server "based on the value of the SDP setup
+    // attribute" of the answer that establishes it). Otherwise the first
+    // description's role is kept: a continued association keeps its roles
+    // (JSEP 5.3.2), and an actpass re-offer decides nothing.
+    var _renewRole = !!(state.dtlsRenewPending && state.dtlsRole && tSec.setup &&
+                        tSec.setup !== 'actpass');
+    if (tSec.setup && (!state.dtlsRole || _renewRole)) {
       _diag('[tc] setup decision — mode:', state.mode, 'remote setup:', tSec.setup);
       // An ICE-lite peer is always the ICE-controlled agent: it never
       // initiates connectivity checks, it only responds. It must therefore
@@ -294,8 +334,11 @@ function applyRemoteDescription(state, parsed) {
       //
       // resolveSetup() echoes the offer's a=setup (actpass → active), which
       // is correct for a normal full-ICE answerer but wrong for a lite peer.
-      // Force 'server' in lite mode regardless of what the remote offered.
-      if (state.mode === 'lite') {
+      // Force 'server' in lite mode — unless the remote said passive: it
+      // is then the DTLS server itself, and RFC 4145 §4 / RFC 5763 §5 leave
+      // us one answer, active. Answering passive to passive (what this did)
+      // put both sides waiting for a ClientHello: no DTLS ever.
+      if (state.mode === 'lite' && tSec.setup !== 'passive') {
         state.dtlsRole = 'server';
       } else {
         state.dtlsRole = SDP.resolveSetup(tSec.setup) === 'active' ? 'client' : 'server';
@@ -339,6 +382,18 @@ function applyRemoteDescription(state, parsed) {
   }
 }
 
+// a=rtcp-rsize of the transport (see applyRemoteDescription).
+function _rtcpRsizeOf(parsed, tSec) {
+  if (!tSec) return false;
+  if (tSec.type !== 'application') return !!tSec.rtcpRsize;
+  for (var i = 0; i < parsed.media.length; i++) {
+    var m = parsed.media[i];
+    if (m.type === 'application' || SDP.isRejected(m)) continue;
+    return !!m.rtcpRsize;
+  }
+  return false;
+}
+
 /**
  * Push remote candidates accumulated by applyRemoteDescription into the
  * IceAgent. Split out from applyRemoteDescription because the IceAgent
@@ -362,6 +417,33 @@ function pushCandidatesToIceAgent(state, parsed, iceAgent) {
       iceAgent.addRemoteCandidate(cands[c]);
     }
   }
+  // a=end-of-candidates on the transport's section (RFC 8840 §8.2): the
+  // agent's end-of-candidates (RFC 8838 §8).
+  if (remoteEndOfCandidates(parsed, state.transportMid)) iceAgent.addRemoteCandidate(null);
+}
+
+/**
+ * Has the peer signalled end-of-candidates for the one ICE transport?
+ * The transport's section is the one with mid `transportMid` (the BUNDLE
+ * tag), else the first section not rejected.
+ *
+ * Before, end-of-candidates stopped at the SDP (a=end-of-candidates in
+ * remoteDescription): the IceAgent never heard it, so a session whose
+ * candidates formed no pair could never fail (W3C 4.3.3 'failed' needs
+ * "received an indication that there are no more remote candidates").
+ */
+function remoteEndOfCandidates(parsed, transportMid) {
+  if (!parsed || !parsed.media) return false;
+  var sec = null;
+  for (var i = 0; i < parsed.media.length; i++) {
+    var m = parsed.media[i];
+    if (SDP.isRejected(m)) continue;
+    if (transportMid != null) {
+      if (String(m.mid) === String(transportMid)) { sec = m; break; }
+    } else { sec = m; break; }
+  }
+  if (!sec && transportMid != null) return remoteEndOfCandidates(parsed, null);
+  return !!(sec && sec.endOfCandidates);
 }
 
 /**
@@ -492,18 +574,120 @@ function transportOwnerChange(prevMid, answerParsed) {
 }
 
 
+/* ========================= DTLS association ========================= */
+
+/**
+ * Ensure state has a local a=tls-id value (RFC 8842 §4). Generated once, on
+ * the first createOffer / createAnswer, and kept: an unchanged value (with
+ * an unchanged fingerprint set) says the DTLS association continues, so it
+ * changes only when a new association is negotiated (an answer to an offer
+ * that asks for one: state.pendingLocalTlsId, sdp_offer_answer).
+ */
+function ensureLocalTlsId(state) {
+  if (!state.localTlsId) state.localTlsId = SDP.generateTlsId();
+}
+
+// The fingerprint set of a section as one comparable key: every (hash
+// function, value) pair, the function's name case-insensitive (RFC 8122 §5:
+// hash-func is a token compared as such, IANA names are lower case) and the
+// value case-insensitive (RFC 8122 §5: "UHEX", compared case-insensitively),
+// sorted (a set: the order of the lines carries no meaning).
+function _fingerprintSetKey(sec) {
+  var fps = (sec.fingerprints && sec.fingerprints.length)
+    ? sec.fingerprints : (sec.fingerprint ? [sec.fingerprint] : []);
+  var keys = [];
+  for (var i = 0; i < fps.length; i++) {
+    if (!fps[i]) continue;
+    var k = String(fps[i].algorithm || '').toLowerCase() + ' ' + String(fps[i].value || '').toUpperCase();
+    if (keys.indexOf(k) < 0) keys.push(k);
+  }
+  keys.sort();
+  return keys.join(',');
+}
+
+/**
+ * Does a remote description ask for a NEW DTLS association, and if it does,
+ * is it part of an ICE restart?
+ *
+ * RFC 8842 §3.1: a new DTLS association follows an offer / answer that
+ * modifies, adds or removes a fingerprint value, or changes the a=tls-id
+ * value. JSEP (RFC 9429) 5.11: "If the remote DTLS fingerprint has been
+ * changed or the value of the a=tls-id attribute has changed, tear down the
+ * DTLS connection ... If a DTLS connection needs to be torn down but the
+ * answer does not indicate an ICE restart or, in the case of
+ * have-remote-pranswer, new ICE credentials, an error MUST be generated";
+ * 5.8.3, for a re-offer: a tls-id different from that presently in use
+ * "MUST be part of an ICE restart, together with new ufrag and password
+ * values". RFC 8842 §6 says why: the new association needs ICE candidates
+ * not used for the old one, which only an ICE restart gives.
+ *
+ * `baseline` is the remote description presently in use (the current remote
+ * description, or the provisional answer in have-remote-pranswer); with none
+ * (the first negotiation) there is no association to change. A tls-id is
+ * compared only when both carry one: a peer that does not use the attribute
+ * (RFC 8842 §4: "If an offer or answer does not contain a tls-id") is judged
+ * by its fingerprint set alone.
+ *
+ * THE DTLS SETUP ROLE. `ourRole` is our role in the association ('client'
+ * | 'server', null before one is negotiated); the description's a=setup
+ * (active / passive; actpass and holdconn name no role) says which role it
+ * leaves us. When that differs:
+ *   - both descriptions carry the same tls-id and the fingerprint set is
+ *     unchanged: the association is continued (RFC 8842 §4: "An unchanged
+ *     local tls-id attribute value, in combination with non-changed
+ *     fingerprints, indicates that the endpoint intends to reuse the
+ *     existing DTLS association"), and JSEP 5.8.3 wants the setup value
+ *     "consistent with the selected role of the current DTLS connection,
+ *     if one exists and is being continued" — {roleConflict: true}, an
+ *     error;
+ *   - otherwise (the description carries no tls-id): RFC 8842 §4, "If an
+ *     offer or answer does not contain a tls-id attribute ..., a
+ *     modification of ... DTLS setup role ... MUST be treated as an
+ *     indication that an endpoint wants to establish a new DTLS
+ *     association" — a new association, as a fingerprint change is.
+ *
+ * @param {Object|null} baseline — parsed remote description presently in use
+ * @param {Object} parsed — the parsed remote description being applied
+ * @param {string|null} [ourRole] — state.dtlsRole
+ * @returns {{iceRestart: boolean}|{roleConflict: true}|null} null when the
+ *          association continues
+ */
+function dtlsAssociationChange(baseline, parsed, ourRole) {
+  var old = transportSection(baseline);
+  var neu = transportSection(parsed);
+  if (!old || !neu) return null;
+  var fpChanged = _fingerprintSetKey(old) !== _fingerprintSetKey(neu);
+  var tlsChanged = !!(old.tlsId && neu.tlsId && old.tlsId !== neu.tlsId);
+  // The role the description's a=setup leaves us (RFC 4145 §4).
+  var leaves = neu.setup === 'active' ? 'server' : (neu.setup === 'passive' ? 'client' : null);
+  var roleChanged = !!(ourRole && leaves && leaves !== ourRole);
+  if (!fpChanged && !tlsChanged) {
+    if (!roleChanged) return null;
+    if (old.tlsId && neu.tlsId) return { roleConflict: true };
+  }
+  // An ICE restart changes both the ufrag and the password (RFC 8839
+  // §4.4.1.1.1; JSEP 5.8.3 "together with new ufrag and password values").
+  var iceRestart = !!(neu.iceUfrag && neu.icePwd &&
+                      neu.iceUfrag !== old.iceUfrag && neu.icePwd !== old.icePwd);
+  return { iceRestart: iceRestart };
+}
+
+
 /* ========================= Exports ========================= */
 
 export {
   // Local creds + fingerprint
   ensureLocalIceCreds,
   ensureLocalFingerprint,
+  ensureLocalTlsId,
+  dtlsAssociationChange,
   dtlsRoleForSdp,
 
   // Remote-description extraction
   applyRemoteDescription,
   pushCandidatesToIceAgent,
   addTrickleCandidate,
+  remoteEndOfCandidates,
 
   // Transport ownership
   bundleTransportMid,

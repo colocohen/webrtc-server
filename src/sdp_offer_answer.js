@@ -520,6 +520,14 @@ class SdpOfferAnswer extends EventEmitter {
       var noRemoteErr = new DOMException('No remote offer', 'InvalidStateError');
       return cb(noRemoteErr);
     }
+    // W3C 4.4.1 createAnswer: only with a remote offer pending
+    // (have-remote-offer / have-local-pranswer). After a completed
+    // negotiation (stable, the remote offer now current) this answered the
+    // old offer again.
+    var _sigA = this._sharedState.signalingState;
+    if (_sigA !== 'have-remote-offer' && _sigA !== 'have-local-pranswer') {
+      return cb(new DOMException('createAnswer: cannot create an answer in signalingState ' + _sigA, 'InvalidStateError'));
+    }
 
     var _selfA = this;
     this._yieldBeforeWork(function () {
@@ -571,20 +579,24 @@ class SdpOfferAnswer extends EventEmitter {
     }
 
     // W3C §4.4.1.5 — implicit form: when no description (or no .type) is
-    // provided, generate one based on the current signalingState.
-    //   stable | have-local-offer        → createOffer (re-offer)
-    //   have-remote-offer | -pranswer    → createAnswer
-    //   anything else                    → InvalidStateError
+    // provided, the type is "offer" in stable, have-local-offer and
+    // have-remote-pranswer, else "answer":
+    //   stable | have-local-offer | have-remote-pranswer → createOffer
+    //     (which rejects InvalidStateError in have-remote-pranswer)
+    //   have-remote-offer | have-local-pranswer          → createAnswer
+    //     (the answer after our own pranswer is the final one)
+    //   anything else (closed)                           → InvalidStateError
     if (!desc || desc.type === undefined) {
       var sigState = this._sharedState.signalingState;
-      if (sigState === 'stable' || sigState === 'have-local-offer') {
+      if (sigState === 'stable' || sigState === 'have-local-offer' ||
+          sigState === 'have-remote-pranswer') {
         this.createOffer({}, function (err, generated) {
           if (err) return cb(err);
           self._applySetLocal(generated, cb);
         });
         return;
       } else if (sigState === 'have-remote-offer' ||
-                 sigState === 'have-remote-pranswer') {
+                 sigState === 'have-local-pranswer') {
         this.createAnswer({}, function (err, generated) {
           if (err) return cb(err);
           self._applySetLocal(generated, cb);
@@ -594,6 +606,25 @@ class SdpOfferAnswer extends EventEmitter {
         var stateErrImpl = new DOMException('Cannot implicit-setLocal in state: ' + sigState, 'InvalidStateError');
         return cb(stateErrImpl);
       }
+    }
+
+    // W3C §4.4.1.5 steps 7-8: a TYPE with an empty sdp (and no last-created
+    // description of that type — api.js substitutes one when there is) is
+    // the implicit form for that type: an offer is created; an answer or
+    // pranswer is created by createAnswer, which in a state with no remote
+    // offer rejects with InvalidStateError. (A TypeError "missing sdp" here
+    // answered `setLocalDescription({type: 'answer'})` in stable, where
+    // the spec and browsers reject with InvalidStateError.)
+    if (!desc.sdp && (desc.type === 'offer' || desc.type === 'answer' || desc.type === 'pranswer')) {
+      var wantedType = desc.type;
+      var make = wantedType === 'offer'
+        ? function (f) { self.createOffer({}, f); }
+        : function (f) { self.createAnswer({}, f); };
+      make(function (err, generated) {
+        if (err) return cb(err);
+        self._applySetLocal({ type: wantedType, sdp: generated.sdp }, cb);
+      });
+      return;
     }
 
     this._applySetLocal(desc, cb);
@@ -670,6 +701,22 @@ class SdpOfferAnswer extends EventEmitter {
       var _tcsC = state.transceivers || [];
       for (var _ci = 0; _ci < _tcsC.length; _ci++) {
         if (_tcsC[_ci]) _tcsC[_ci]._offerRolledBack = false;
+      }
+
+      // EVERY APPLIED LOCAL OFFER ASSOCIATES ITS m-SECTIONS (W3C 4.4.1.5:
+      // "If description is of type "offer", set transceiver.[[Mid]]" for each
+      // transceiver it associates; JSEP 5.9). The association step runs from
+      // the signalingState cascade, inside applyStateUpdates above, which two
+      // applies got wrong: (1) an offer over a pending local offer —
+      // have-local-offer to have-local-offer is no change, so no cascade: a
+      // transceiver added after the first offer kept mid null through its
+      // re-offer; (2) the first offer after a rollback — the cascade ran
+      // while the window above was still open and skipped every transceiver
+      // the rollback released: mid null again, where Chrome 158 gives both
+      // their mid. Run once more now the window is closed (the step only
+      // marks and binds what is not associated yet).
+      if (desc.type === 'offer' && typeof _selfL._deps.markAssociated === 'function') {
+        _selfL._deps.markAssociated();
       }
 
       // The restart obligation is discharged now that OUR offer is applied.
@@ -1132,6 +1179,22 @@ class SdpOfferAnswer extends EventEmitter {
             'setRemoteDescription: media section ' + _rmI + ' lacks a=rtcp-mux ' +
             'but rtcpMuxPolicy is "require"', 'InvalidAccessError');
         }
+        // RFC 5761 §4 (RFC 8834 §4.4): with RTP and RTCP multiplexed,
+        // payload types 64-95 collide with RTCP packet types and MUST NOT
+        // be used. Such a section was accepted, and the answer echoed it.
+        var _rmCs = _rmM.codecs || [];
+        for (var _rmC = 0; _rmC < _rmCs.length; _rmC++) {
+          var _rmPts = [_rmCs[_rmC].payloadType, _rmCs[_rmC].rtxPayloadType,
+                        _rmCs[_rmC].redPayloadType, _rmCs[_rmC].flexfecPayloadType];
+          for (var _rmP = 0; _rmP < _rmPts.length; _rmP++) {
+            if (_rmPts[_rmP] >= 64 && _rmPts[_rmP] <= 95) {
+              throw new DOMException(
+                'setRemoteDescription: media section ' + _rmI + ' uses payload type ' +
+                _rmPts[_rmP] + ', which collides with RTCP under rtcp-mux (RFC 5761 §4)',
+                'InvalidAccessError');
+            }
+          }
+        }
       }
     }
    // pranswer shares the answer grammar
@@ -1164,6 +1227,50 @@ class SdpOfferAnswer extends EventEmitter {
       throw err;
     }
 
+    // ── 1a. A NEW DTLS ASSOCIATION NEEDS AN ICE RESTART. ──
+    // RFC 9429 (JSEP) 5.11: "If the remote DTLS fingerprint has been changed
+    // or the value of the a=tls-id attribute has changed, tear down the DTLS
+    // connection ... If a DTLS connection needs to be torn down but the
+    // answer does not indicate an ICE restart or, in the case of
+    // have-remote-pranswer, new ICE credentials, an error MUST be
+    // generated." 5.8.3 says the same of a re-offer (and of the response to
+    // one), and RFC 8842 §6 why: the new association needs candidates the
+    // old one did not use. Compared with the remote description presently
+    // in use: the provisional answer in have-remote-pranswer, else the
+    // current one. W3C 4.4.1.5: an invalid description rejects with
+    // InvalidAccessError (WPT protocol/fingerprint-change-requires-ice-restart).
+    // We applied such a description and went on verifying the old
+    // association's certificate against the new fingerprint.
+    var _dtlsChange = null;
+    if (!isLocal) {
+      var _dtlsBase = (state.signalingState === 'have-remote-pranswer')
+        ? state.parsedRemoteSdp : state.parsedCurrentRemoteSdp;
+      // The DTLS setup role too (TransportController.dtlsAssociationChange):
+      // with the same a=tls-id and fingerprints the association continues
+      // and a=setup must keep its roles (JSEP 5.8.3: "MUST be consistent
+      // with the selected role of the current DTLS connection"; 'If any of
+      // the preceding checks failed, processing MUST stop and an error MUST
+      // be returned'); without a tls-id a role change asks for a new
+      // association (RFC 8842 §4), which needs an ICE restart like any
+      // other. Both were applied: the first role kept, a passive re-offer
+      // to our server answered passive.
+      _dtlsChange = TransportController.dtlsAssociationChange(_dtlsBase, parsed, state.dtlsRole);
+      if (_dtlsChange && _dtlsChange.roleConflict) {
+        throw new DOMException(
+          'setRemoteDescription: a=setup changes the DTLS role of the ' +
+          'association its a=tls-id and fingerprints continue (RFC 9429 ' +
+          '5.8.3: the setup value must be consistent with the current role)',
+          'InvalidAccessError');
+      }
+      if (_dtlsChange && !_dtlsChange.iceRestart) {
+        throw new DOMException(
+          'setRemoteDescription: the DTLS fingerprint, a=tls-id or (without ' +
+          'a=tls-id) DTLS role changed without an ICE restart (RFC 9429 5.11, ' +
+          'RFC 8842 §4: a new DTLS association needs new ICE credentials)',
+          'InvalidAccessError');
+      }
+    }
+
     // ── 1b. Snapshot for rollback (W3C §4.4.1.5/6). Taken AFTER validation
     // (so a failed transition doesn't strand a stale snapshot) but BEFORE
     // any state mutation. rollback() restores from this; clears it after.
@@ -1171,8 +1278,15 @@ class SdpOfferAnswer extends EventEmitter {
     // Snapshot only on offer commits — answers transition the chain from
     // have-X-offer → stable, after which rollback isn't applicable per spec
     // (rollback is only valid in have-local-offer or have-remote-offer).
+    // An offer applied over an offer of the same side (have-local-offer /
+    // have-remote-offer: a new offer before the answer) KEEPS the snapshot
+    // of the stable state: rollback returns to 'stable' (JSEP 5.7, W3C
+    // 4.4.1.6), not to the first offer. Retaking it here rolled back to
+    // the earlier offer — signalingState stayed have-*-offer.
     if (desc.type === 'offer') {
-      this._preCommitSnapshot = this._takeSnapshot();
+      if (state.signalingState === 'stable' || !this._preCommitSnapshot) {
+        this._preCommitSnapshot = this._takeSnapshot();
+      }
     } else {
       // An answer was just committed — we're in 'stable' on the other side
       // of the negotiation. Any prior offer-side snapshot is no longer
@@ -1180,6 +1294,24 @@ class SdpOfferAnswer extends EventEmitter {
       this._preCommitSnapshot = null;
     }
     if (_remoteMms !== undefined) state.remoteMaxMessageSize = _remoteMms;
+    // The new DTLS association (1a) comes up when the negotiation completes
+    // (the final answer, cm's onAnswerCommitted). A remote offer decides it
+    // alone (an offer replacing an offer replaces the decision) and gets an
+    // answer with a new a=tls-id (RFC 8842 §5.3: "If the answerer
+    // determines ... that a new DTLS association is to be established, the
+    // answerer MUST insert ... a new unique attribute value"; JSEP 5.3.2).
+    // An answer after a provisional one keeps what the provisional decided.
+    if (!isLocal) {
+      if (desc.type === 'offer') {
+        state.dtlsRenewPending = !!_dtlsChange;
+        // The value in use stays in localTlsId until the answer commits
+        // (cm's onAnswerCommitted): an offer replacing this one, or a
+        // rollback, keeps the association and the value.
+        state.pendingLocalTlsId = _dtlsChange ? SDP.generateTlsId() : null;
+      } else if (_dtlsChange) {
+        state.dtlsRenewPending = true;
+      }
+    }
 
     // ── 2. Update description slots. ──
     if (desc.type === 'offer' || desc.type === 'pranswer') {
@@ -1374,11 +1506,24 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
         remoteRidExtId:         state.remoteRidExtId,
         remoteRepairedRidExtId: state.remoteRepairedRidExtId,
         remoteExtensions:       state.remoteExtensions,
+        // Reduced-size RTCP (RFC 5506) as the undone description said it.
+        remoteRtcpRsize:        state.remoteRtcpRsize,
         remoteIceLite:          state.remoteIceLite,
         // The peer's identity and the DTLS role derived from its a=setup: a
         // fingerprint left behind by an undone offer would still be trusted.
         remoteFingerprint:      state.remoteFingerprint,
+        remoteFingerprints:     state.remoteFingerprints,
         dtlsRole:               state.dtlsRole,
+        // A new DTLS association decided by the undone description, and the
+        // a=tls-id its answer would have carried (RFC 8842 §5.3).
+        dtlsRenewPending:       state.dtlsRenewPending,
+        pendingLocalTlsId:      state.pendingLocalTlsId,
+        // The ufrag cm compares the next remote offer with to see an ICE
+        // restart: createAnswer records the offer's (cm.js
+        // prepareForCreateAnswer). Kept after a rollback, the same restart
+        // offer applied again looked like no restart, and its answer reused
+        // the old credentials (RFC 8839 §4.4.1.1.2, JSEP 5.3.2).
+        lastRemoteIceUfrag:     state._lastRemoteIceUfrag,
       },
       preCommitSnapshot:         this._preCommitSnapshot,
     };
@@ -1460,9 +1605,14 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       state.remoteRidExtId        = _pp.remoteRidExtId;
       state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
       state.remoteExtensions      = _pp.remoteExtensions;
+      state.remoteRtcpRsize       = _pp.remoteRtcpRsize;
       state.remoteIceLite         = _pp.remoteIceLite;
       state.remoteFingerprint     = _pp.remoteFingerprint;
+      state.remoteFingerprints    = _pp.remoteFingerprints;
       state.dtlsRole              = _pp.dtlsRole;
+      state.dtlsRenewPending      = _pp.dtlsRenewPending;
+      state.pendingLocalTlsId     = _pp.pendingLocalTlsId;
+      state._lastRemoteIceUfrag   = _pp.lastRemoteIceUfrag;
     }
     this._preCommitSnapshot = snap.preCommitSnapshot;
   }
@@ -1639,6 +1789,12 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
           var eocSdp = out.join(sepE);
           this._sharedState[_rdField] =
             { type: this._sharedState[_rdField].type, sdp: eocSdp };
+        }
+        // ... and the ICE agent's end-of-candidates (RFC 8838 §8), once the
+        // transport's section has it (see remoteEndOfCandidates).
+        var _eocAgent = this._deps.getIceAgent && this._deps.getIceAgent();
+        if (_eocAgent && TransportController.remoteEndOfCandidates(prs, this._sharedState.transportMid)) {
+          _eocAgent.addRemoteCandidate(null);
         }
       }
       return cb(null);
@@ -2165,9 +2321,14 @@ transceiverMids:           state.transceivers.map(function (t) { return t.mid; }
       state.remoteRidExtId        = _pp.remoteRidExtId;
       state.remoteRepairedRidExtId = _pp.remoteRepairedRidExtId;
       state.remoteExtensions      = _pp.remoteExtensions;
+      state.remoteRtcpRsize       = _pp.remoteRtcpRsize;
       state.remoteIceLite         = _pp.remoteIceLite;
       state.remoteFingerprint     = _pp.remoteFingerprint;
+      state.remoteFingerprints    = _pp.remoteFingerprints;
       state.dtlsRole              = _pp.dtlsRole;
+      state.dtlsRenewPending      = _pp.dtlsRenewPending;
+      state.pendingLocalTlsId     = _pp.pendingLocalTlsId;
+      state._lastRemoteIceUfrag   = _pp.lastRemoteIceUfrag;
     }
 
     // ── ICE creds: restore + sync iceAgent. ──

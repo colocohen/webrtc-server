@@ -106,6 +106,56 @@ function extractLocalUfrag(msg) {
 }
 
 
+// Whether a STUN message carries a USERNAME attribute (any value).
+function hasUsername(msg) {
+  const msgLen = (msg[2] << 8) | msg[3];
+  const end = Math.min(20 + msgLen, msg.length);
+  let p = 20;
+  while (p + 4 <= end) {
+    const attrType = (msg[p] << 8) | msg[p + 1];
+    const attrLen  = (msg[p + 2] << 8) | msg[p + 3];
+    if (attrType === 0x0006) return true;
+    p += 4 + attrLen;
+    if (attrLen % 4 !== 0) p += 4 - (attrLen % 4);
+  }
+  return false;
+}
+
+
+/* ========================= What a peer connection sends ========================= */
+
+// A datagram of one of the WebRTC protocols on the port (RFC 7983 §7): STUN
+// (0-3) of the method ICE uses, Binding (RFC 8445 §7), DTLS (20-63), RTP /
+// RTCP (128-191). Anything else on a port shared with TURN or QUIC (RFC
+// 9443 §3) is theirs, never a peer connection's — TURN ChannelData (64-79),
+// TURN's own STUN methods (RFC 8656: Allocate, Refresh, Send, Data,
+// CreatePermission, ChannelBind), QUIC (64-127, 192-255) — even from a
+// 5-tuple a session holds: a client whose TURN traffic and ICE checks leave
+// one socket (Chrome's shared socket) would lose its allocation to the fast
+// path otherwise. (A STUN-range datagram without the magic cookie is left to
+// the agent, as before: its decoder drops it.)
+//
+// A Binding REQUEST without USERNAME is not an ICE check either: every check
+// carries one (RFC 8445 §7.2.2), so it is a plain STUN client's (RFC 8489
+// §6), e.g. the srflx keepalive of a browser whose STUN server shares the
+// port — the agent would answer it 400, the STUN server never see it. Binding
+// responses (to our checks) and indications (keepalives, RFC 8445 §11) carry
+// no USERNAME and stay the agent's.
+function isWebRtcPacket(msg) {
+  if (!msg || msg.length === 0) return false;
+  const b = msg[0];
+  if (b <= 3) {
+    if (msg.length < 20 || msg[4] !== 0x21 || msg[5] !== 0x12 || msg[6] !== 0xA4 || msg[7] !== 0x42) return true;
+    const t = (msg[0] << 8) | msg[1];
+    const method = ((t & 0x3E00) >> 2) | ((t & 0x00E0) >> 1) | (t & 0x000F);
+    if (method !== 0x001) return false;
+    const isRequest = (t & 0x0110) === 0;
+    return !isRequest || hasUsername(msg);
+  }
+  return (b >= 20 && b <= 63) || (b >= 128 && b <= 191);
+}
+
+
 /* ========================= WebRTCRouter ========================= */
 
 function WebRTCRouter(options) {
@@ -433,6 +483,8 @@ function WebRTCRouter(options) {
   // false if no match was found.
   this.dispatch = function(msg, rinfo) {
     if (closed) return false;
+    // Not a WebRTC protocol (TURN, QUIC — see isWebRtcPacket): not ours.
+    if (!isWebRtcPacket(msg)) return false;
 
     const key = rinfo.address + ':' + rinfo.port;
 
@@ -500,6 +552,7 @@ function WebRTCRouter(options) {
   this.hasSession = function(rinfo, msg) {
     if (closed) return false;
     if (msg !== undefined && msg !== null) {
+      if (!isWebRtcPacket(msg)) return false;
       const ufrag = (msg.length >= 20 && msg[0] <= 3) ? extractLocalUfrag(msg) : null;
       if (ufrag) return !!byUfrag[ufrag];
     }
@@ -582,9 +635,25 @@ function WebRTCRouter(options) {
       if (key === 'announcedAddresses') {
         if (v === null) { next = null; touched = true; continue; }
         if (!Array.isArray(v)) throw new TypeError('setConfiguration: announcedAddresses must be an array of IP addresses, or null');
+        // An entry is an IP address, or { ip, port, tcpPort } (the form the
+        // constructor and the agents take: the address announced with ports
+        // of its own) — what getConfiguration returns, so that it round-trips.
         for (let i = 0; i < v.length; i++) {
-          if (typeof v[i] !== 'string' || !net.isIP(v[i])) {
-            throw new TypeError('setConfiguration: announcedAddresses[' + i + '] is not an IP address: ' + v[i]);
+          const a = v[i];
+          if (typeof a === 'string') {
+            if (!net.isIP(a)) throw new TypeError('setConfiguration: announcedAddresses[' + i + '] is not an IP address: ' + a);
+          } else if (a && typeof a === 'object') {
+            if (typeof a.ip !== 'string' || !net.isIP(a.ip)) {
+              throw new TypeError('setConfiguration: announcedAddresses[' + i + '].ip is not an IP address: ' + a.ip);
+            }
+            for (const pk of ['port', 'tcpPort']) {
+              const pv = a[pk];
+              if (pv != null && !(Number.isInteger(pv) && pv >= 0 && pv <= 65535)) {
+                throw new TypeError('setConfiguration: announcedAddresses[' + i + '].' + pk + ' is not a port: ' + pv);
+              }
+            }
+          } else {
+            throw new TypeError('setConfiguration: announcedAddresses[' + i + '] is not an IP address: ' + a);
           }
         }
         next = v.slice();

@@ -47,10 +47,16 @@ import {
   NackGenerator,
   TransportCCFeedbackGenerator,
   RtxStream,
-  buildPLI, buildRR, buildSR, buildNACK, buildREMB, buildBYE,
-  parseRTCPCompound,
+  buildPLI, buildRR, buildSR, buildNACK, buildREMB, buildBYE, buildSDES,
+  buildCompound, parseRTCPCompound,
   parseTransportCC, parseREMB,
+  buildTMMBN, tmmbrBoundingSet, tmmbrNetBitrate,
 } from 'rtp-packet';
+import * as SDP from './sdp.js';
+import {
+  remoteBandwidthLimits, allocateRates, estimateLimited, RateHysteresis, RtpCircuitBreaker,
+  rtcpTimedOut, tmmbrLimit,
+} from './rate_controller.js';
 
 
 // Synthetic packet-loss simulation (off by default). Enable with the
@@ -67,6 +73,42 @@ if (_DROP_RTP_PCT > 0 && typeof console !== 'undefined' && console.warn) {
 
 // Minimum spacing of keyframe requests (PLI) for one SSRC — see requestKeyframe.
 var PLI_MIN_INTERVAL_MS = 300;
+
+// Rate control (RFC 8834 §7; rate_controller.js).
+// A stream's packet rate before it has been measured (JSEP's assumption in
+// its AS → TIAS conversion, RFC 8829 §5.10: 50 packets a second).
+var DEFAULT_PACKET_RATE = 50;
+// The round-trip time before one is measured, for the TMMBR raise delay.
+var DEFAULT_RTT_MS = 1000;
+// Our RTCP reporting interval (the timer below): the circuit breakers' Td.
+var RTCP_INTERVAL_MS = 1000;
+
+// An RR with no report blocks (RFC 3550 §6.4.2, RC=0): what opens a
+// compound packet whose sender has nothing to report.
+function _emptyRR(ssrc) {
+  var b = Buffer.alloc(8);
+  b[0] = 0x80; b[1] = 201; b.writeUInt16BE(1, 2); b.writeUInt32BE(ssrc >>> 0, 4);
+  return b;
+}
+
+// The RTX payload type paired with media payload type `pt` on this
+// transport: the one whose a=fmtp apt= names it in the remote description
+// (we send with the remote's numbering; RFC 8843 §9.1 keeps a payload
+// type's meaning the same across the BUNDLE group). null when none does.
+function _negotiatedRtxPt(state, pt) {
+  var apt = state.remoteRtxApt;
+  if (!apt) return null;
+  for (var k in apt) if (apt[k] === pt) return +k;
+  return null;
+}
+
+// Wall-clock milliseconds with a fractional part (the same clock as
+// Date.now(); performance.timeOrigin + performance.now()).
+function _preciseNow() {
+  return (typeof performance !== 'undefined' && performance.now)
+    ? ((performance.timeOrigin || 0) + performance.now())
+    : Date.now();
+}
 
 // Do two byte views overlap in memory?
 function _sharesMemory(a, b) {
@@ -130,6 +172,28 @@ class MediaTransport extends EventEmitter {
     this._rtcpTimer        = null;
     this._tccFeedbackTimer = null;
     this._nackFeedbackTimer = null;
+
+    // Rate control (RFC 8834 §7, rate_controller.js). The senders whose
+    // encoders it drives (registerRateSender; in registration order), the
+    // hysteresis over what it applied, the TMMBR state of each SSRC of ours
+    // (RFC 5104 §4.2: the bounding set, the set in force — a raise waits
+    // 2 * RTT after the TMMBN that announced it —, whether a TMMBN is owed),
+    // one RTP circuit breaker per SSRC we send (RFC 8083), the RTCP timeout
+    // breaker's clock, the packet-rate meters, and each SSRC's quality
+    // limitation (W3C webrtc-stats qualityLimitationReason / Durations).
+    this._rateSenders = Object.create(null);
+    this._rateOrder   = [];
+    // ssrc -> { id, kind, mid, controllable, frameIntervalMs } of the
+    // registered senders' layers, as of the last updateRates (the RTCP
+    // handlers read it; they do not call into the senders).
+    this._rateLayers  = Object.create(null);
+    this._hysteresis  = new RateHysteresis();
+    this._tmmbr       = Object.create(null);
+    this._breakers    = Object.create(null);
+    this._cbLastRtcpAt   = null;
+    this._cbSendingSince = null;
+    this._prMeter     = Object.create(null);
+    this._qualityLimit = Object.create(null);
   }
 
 
@@ -168,6 +232,12 @@ class MediaTransport extends EventEmitter {
       }
       return;
     }
+
+    // RTP circuit breaker (RFC 8083 §4.5): a stream it stopped sends
+    // nothing, from our encoders or injected (an SFU's forwarded packets,
+    // which no encoder of ours can slow down). Dropped before the stamper:
+    // no transport-wide sequence number is spent on a packet never sent.
+    if (rtpPacket && rtpPacket.length >= 12 && this._ceased(rtpPacket.readUInt32BE(8))) return;
 
     // Apply outgoing header extensions (transport-cc seq, abs-send-time).
     // The stamper owns the per-session counter state and centralizes all
@@ -264,8 +334,20 @@ class MediaTransport extends EventEmitter {
     // to produce the SR rtpTimestamp that corresponds to the SR's own
     // NTP timestamp (RFC 3550 §6.4.1) — required for receiver-side A/V
     // sync (RtpToNtpEstimator / StreamSynchronization in libwebrtc).
-    o.lastSentRtpTimestamp = rtpPacket.readUInt32BE(4);
-    o.lastSentAt           = o.lastPacketAt;
+    //
+    // Only a packet that moves the stream's RTP timeline FORWARD sets the
+    // pair (RFC 3550 §6.4.1: the SR's timestamp is on the timeline of the
+    // data packets, at the SR's instant). A forwarder also sends older
+    // packets late — an SFU passing on a packet its sender repaired after
+    // a NACK, a reordered one — and pairing such a packet's old timestamp
+    // with the time it left put the SR's mapping behind by the repair's
+    // delay (68 ms measured at 30 ms + 3 % loss), the receiver's A/V sync
+    // reading a jump. mediasoup keeps the highest timestamp the same way.
+    var _sentTs = rtpPacket.readUInt32BE(4);
+    if (o.lastSentRtpTimestamp == null || ((_sentTs - o.lastSentRtpTimestamp) | 0) >= 0) {
+      o.lastSentRtpTimestamp = _sentTs;
+      o.lastSentAt           = o.lastPacketAt;
+    }
 
     if (!state._diagSendRtpCount) state._diagSendRtpCount = 0;
     state._diagSendRtpCount++;
@@ -329,6 +411,7 @@ class MediaTransport extends EventEmitter {
     var state = this._state;
     var rtx = state.rtxStreams[mediaSsrc];
     if (!rtx) return;   // no RTX negotiated for this stream
+    if (this._ceased(mediaSsrc)) return;   // stopped by the circuit breaker
 
     var srtp = this._deps.getSrtpSession();
     var ice = this._deps.getIceAgent();
@@ -345,13 +428,6 @@ class MediaTransport extends EventEmitter {
     for (var i = 0; i < lostSeqs.length; i++) {
       var lostSeq = lostSeqs[i];
 
-      // Throttle: don't retransmit the same (ssrc, seq) pair faster than
-      // once per 100ms. Protects against NACK storms doubling our upstream.
-      if (!state.nackThrottle.shouldSend(mediaSsrc, lostSeq)) {
-        throttled++;
-        continue;
-      }
-
       var origPkt = state.senderBuffer.get(mediaSsrc, lostSeq);
       if (!origPkt) {
         // Packet evicted from the ring buffer (too old) — can't help.
@@ -359,6 +435,35 @@ class MediaTransport extends EventEmitter {
         continue;
       }
 
+      // Throttle: don't retransmit the same (ssrc, seq) pair twice within
+      // one round trip (the window follows the RTT measured from RR, 100 ms
+      // until there is one), as libwebrtc's RtpPacketHistory::VerifyRtt and
+      // mediasoup's RtpStreamSend do. A request that comes later is the
+      // receiver's retry for a retransmission that was itself lost. Asked
+      // only for a packet we have: a request for one not in history (an SFU
+      // still waiting for it upstream) sent nothing, and must not hold back
+      // the retry that finds it.
+      if (!state.nackThrottle.shouldSend(mediaSsrc, lostSeq)) {
+        throttled++;
+        continue;
+      }
+
+      // RFC 4588 §4/§8.6: a retransmission's payload type is the RTX type
+      // associated (apt=) with the ORIGINAL packet's payload type, read from
+      // the packet itself as libwebrtc's RTPSender does. The stream-level
+      // type is only the fallback: every remote description re-registers it
+      // as the partner of the m-line's FIRST video codec, so a stream sending
+      // another codec (an SFU forwarding H.264 on an m-line that lists VP8
+      // first) had its RTX type flipped to the wrong one by any later
+      // renegotiation, and the receiver discarded every retransmission
+      // (mediasoup demo, H.264 at 3 % loss: the viewers present before a
+      // third peer joined re-NACKed each lost packet about 11 times and
+      // were frozen 15-20 s of 20).
+      var rtxPt = _negotiatedRtxPt(state, origPkt[1] & 0x7F);
+      if (rtxPt != null && rtxPt !== rtx.pt()) {
+        this.setRtxMapping(mediaSsrc, rtx.ssrc(), rtxPt);   // keeps the RTX sequence
+        rtx = state.rtxStreams[mediaSsrc];
+      }
       var rtxPacket = rtx.wrap(origPkt);
       if (!rtxPacket) continue;
 
@@ -532,9 +637,23 @@ class MediaTransport extends EventEmitter {
     // injected packets (sendRtp path); this wires the lookup. The RTX
     // ssrc shares the m-line's mid — stamp it too, or Chrome's bundle
     // demux drops the retransmits the same way it dropped the media.
-    if (info.rtxSsrc != null && info.rtxPayloadType != null &&
-        typeof this.setRtxMapping === 'function') {
-      this.setRtxMapping(ssrc, info.rtxSsrc, info.rtxPayloadType);
+    //
+    // The mid goes on the RTX ssrc whether or not the payload type comes
+    // with it: a caller whose RTX mapping is left to the negotiation (an
+    // sfu-server consumer bound before the viewer's description pairs an
+    // RTX type with its codec passes rtxSsrc alone) got none, so each
+    // retransmission kept the mid of the packet it repairs as stored —
+    // for a forwarded stream the PRODUCER's mid — and a browser's BUNDLE
+    // demux (RFC 8843 §9.2: by MID before any SSRC binding) handed every
+    // consumer's retransmissions to whichever m-line has that mid: one
+    // receiver got its sibling's packets under wrong sequence numbers,
+    // the other none (mediasoup demo, H.264 at 3 % loss: 1 000-2 200 RTX
+    // against 0 on the two video streams of one viewer, both frozen
+    // 30-38 s of 40).
+    if (info.rtxSsrc != null) {
+      if (info.rtxPayloadType != null && typeof this.setRtxMapping === 'function') {
+        this.setRtxMapping(ssrc, info.rtxSsrc, info.rtxPayloadType);
+      }
       if (info.mid != null && state.headerStamper &&
           typeof state.headerStamper.setMidForSsrc === 'function') {
         state.headerStamper.setMidForSsrc(info.rtxSsrc, info.mid);
@@ -556,6 +675,21 @@ class MediaTransport extends EventEmitter {
     if (!srtp || !ice) return;
     var srtcp = srtp.encryptRtcp(rtcpPacket);
     if (srtcp) ice.send(srtcp);
+  }
+
+  /**
+   * Send one RTCP feedback packet (PLI, generic NACK, transport-cc) of
+   * ours. Reduced-size (alone, RFC 5506) only when the peer negotiated
+   * a=rtcp-rsize (state.remoteRtcpRsize, RFC 5506 §5); otherwise a compound
+   * packet (RFC 3550 §6.1): an empty RR and the SDES CNAME from the
+   * feedback's sender SSRC, then the feedback. These went out alone
+   * whatever the peer had said.
+   */
+  _sendFeedback(fb) {
+    var state = this._state;
+    if (state.remoteRtcpRsize) { this.sendRtcp(fb); return; }
+    var sender = fb.readUInt32BE(4);
+    this.sendRtcp(buildCompound([_emptyRR(sender), buildSDES(sender, state.localCname || ''), fb]));
   }
 
   /**
@@ -644,7 +778,7 @@ class MediaTransport extends EventEmitter {
     this._diag('[pli-tx] localSsrc=' + localSsrc + ' remote=' + remoteSsrc +
                ' mid=' + (mapping && mapping.mid) +
                ' allocatedMids=' + Object.keys(state.localSsrcs || {}).join(','));
-    this.sendRtcp(buildPLI(localSsrc, remoteSsrc));
+    this._sendFeedback(buildPLI(localSsrc, remoteSsrc));
   }
 
 
@@ -675,12 +809,42 @@ class MediaTransport extends EventEmitter {
       // ('rtcp' is mostly a debug/observability event).
       this.emit('rtcp', rtcp, rinfo, parsed);
     }
+
+    // One TMMBN per SSRC for the TMMBRs of this packet (RFC 5104 §4.2.2.2:
+    // "Only a single TMMBN SHALL be sent, even if more than one TMMBR
+    // message is received" before it goes), then the rates.
+    this._sendPendingTmmbn();
+    if (parsedList.length) this.updateRates();
   }
 
   _handleRtcpSubpacket(parsed) {
     var state = this._state;
 
+    // RTCP timeout circuit breaker (RFC 8083 §4.1, §5): an SR / RR with a
+    // block on one of our SSRCs (below, _handleReportBlocks) or a
+    // reduced-size feedback packet ("MUST be counted as received packets
+    // for the RTCP timeout circuit breaker") shows the peer and the return
+    // path are there.
+    if (parsed.name === 'NACK' || parsed.name === 'PLI' || parsed.name === 'FIR' ||
+        parsed.name === 'TransportCC' || parsed.name === 'REMB' ||
+        parsed.name === 'TMMBR' || parsed.name === 'TMMBN') {
+      this._cbLastRtcpAt = Date.now();
+    }
+
+    // TMMBR (RFC 5104 §4.2.1): a limit on one of our SSRCs.
+    if (parsed.name === 'TMMBR' && parsed.entries) this._handleTmmbr(parsed);
+
+    // BYE: the tuples its SSRCs owned leave the bounding sets (§4.2.1.2).
+    if (parsed.name === 'BYE' && parsed.ssrcs) this._tmmbrOwnersLeft(parsed.ssrcs);
+
     // SR: remote-outbound stats + DLSR bookkeeping for our outgoing RR.
+    if (parsed.name === 'SR' && state.rtxRtcpStats && state.rtxRtcpStats[parsed.ssrc]) {
+      // The retransmission stream's own SR (RFC 4588 §6.1: SRs for both
+      // streams): only the LSR / DLSR its report block echoes.
+      var _rxs = state.rtxRtcpStats[parsed.ssrc];
+      _rxs.lastSR = (((parsed.ntpTimestampMsw & 0xFFFF) << 16) | ((parsed.ntpTimestampLsw >>> 16) & 0xFFFF)) >>> 0;
+      _rxs.lastSRTime = Date.now();
+    }
     if (parsed.name === 'SR' && state.rtpStats[parsed.ssrc]) {
       this._handleSr(parsed);
     }
@@ -746,6 +910,37 @@ class MediaTransport extends EventEmitter {
     }
   }
 
+  // The retransmission stream as a stream of its own (RFC 4588 §4: its
+  // sequence numbers are its own, "one higher than the sequence number of
+  // the preceding packet sent in the retransmission stream"), for its
+  // report block (§6.2): expected / received per RFC 3550 A.1 / A.3 and
+  // the jitter per A.8, in the original's clock (§4: the same clock rate),
+  // which §4 warns "does not reflect the actual network jitter".
+  _countRtxStream(ssrc, seq, ts, primarySsrc) {
+    var state = this._state;
+    if (!state.rtxRtcpStats) state.rtxRtcpStats = {};
+    var x = state.rtxRtcpStats[ssrc];
+    if (!x) {
+      x = state.rtxRtcpStats[ssrc] = { rtcpPackets: 0, baseSeq: seq, highestSeq: seq, cycles: 0,
+                                        jitter: 0, lastArrival: 0, lastTs: 0, lastSR: 0, lastSRTime: 0,
+                                        primarySsrc: null };
+    }
+    if (primarySsrc != null) x.primarySsrc = primarySsrc;
+    x.rtcpPackets++;
+    var d = seq - x.highestSeq;
+    if (d > 32768) d -= 65536; else if (d < -32768) d += 65536;
+    if (d > 0) { if (seq < x.highestSeq) x.cycles++; x.highestSeq = seq; }
+    var p = x.primarySsrc != null ? state.rtpStats[x.primarySsrc] : null;
+    var cr = p && p.clockRate;
+    var now = Date.now();
+    if (cr && x.lastArrival !== 0) {
+      var tsDelta = (ts - x.lastTs) | 0;
+      x.jitter += (Math.abs((now - x.lastArrival) * (cr / 1000) - tsDelta) - x.jitter) / 16;
+    }
+    x.lastArrival = now;
+    x.lastTs = ts;
+  }
+
   _handleSr(parsed) {
     // SR sender-info tracks what the REMOTE peer is sending to US.
     // Maps to W3C 'remote-outbound-rtp' (their outbound == our inbound).
@@ -797,10 +992,12 @@ class MediaTransport extends EventEmitter {
     // from us. For each block, mediaSsrc identifies one of OUR outbound
     // streams. We ignore blocks whose mediaSsrc isn't in outboundStats.
     var state = this._state;
+    var _worstLoss = -1;
     for (var ri = 0; ri < parsed.reports.length; ri++) {
       var rep = parsed.reports[ri];
       var targetSsrc = rep.mediaSsrc;
       if (!state.outboundStats[targetSsrc]) continue;
+      if ((rep.fractionLost || 0) > _worstLoss) _worstLoss = rep.fractionLost || 0;
 
       var rs = state.rtcpStats[targetSsrc];
       if (!rs) rs = state.rtcpStats[targetSsrc] = {};
@@ -841,8 +1038,394 @@ class MediaTransport extends EventEmitter {
           // buffers) that a fresh RTT is in. The jitter buffer uses RTT
           // to extend its loss-declaration wait window so RTX-recovered
           // packets have time to slot back into order.
+          // Our retransmissions to this peer: one per round trip at most.
+          state.nackThrottle.setWindowMs(rttMs);
+
           this.emit('rtt:update', rttMs);
+          this._breakerFor(targetSsrc).updateRtt(rttMs);
         }
+      }
+
+      // RTP circuit breakers (RFC 8083 §4.2-§4.4) on the block, and the
+      // RTCP timeout's clock (§4.1: any SSRC of ours on the 5-tuple).
+      this._cbLastRtcpAt = Date.now();
+      var _o = state.outboundStats[targetSsrc];
+      var _cb = this._breakerFor(targetSsrc);
+      var _res = _cb.onReport({ fractionLost: rep.fractionLost || 0, highestSeq: rep.highestSeq || 0 },
+                              { packets: _o.packets || 0, bytes: _o.bytes || 0 }, Date.now());
+      if (_res) this._onBreaker(targetSsrc, _res, _cb);
+      // The report's loss to the sender's encoder (Opus packetlossperc):
+      // the registered sender's optional onPacketLoss(ssrc, 0..1).
+      var _rl = this._rateLayerOf(targetSsrc);
+      var _rsd = _rl && this._rateSenders[_rl.id];
+      if (_rsd && typeof _rsd.onPacketLoss === 'function') {
+        try { _rsd.onPacketLoss(targetSsrc, (rep.fractionLost || 0) / 256); } catch (eL) {}
+      }
+    }
+    // Loss for the estimator when no transport-cc runs (its loss-based
+    // rule; ignored otherwise): the worst of this report's blocks on ours.
+    if (_worstLoss >= 0) state.bandwidthEstimator.observeReceiverReportLoss(_worstLoss);
+  }
+
+
+  /* ====================== Rate control (RFC 8834 §7) ====================== */
+
+  /**
+   * Register a sender whose encoder the rate controller drives (api.js's
+   * RTCRtpSender, when its pipeline starts). `desc`:
+   *   kind          'audio' | 'video'
+   *   mid           its section's mid (the peer's b=TIAS / b=AS for it)
+   *   controllable  true when the media comes from our encoder (false:
+   *                 nothing to reconfigure; the circuit breaker still stops
+   *                 it)
+   *   frameIntervalMs  Tf for its circuit breakers
+   *   describe()    -> { priority, layers: [{ ssrc, maxBitrate, scale,
+   *                    active }] }, read on every update
+   *   apply(ssrc, { bitrate, enabled })   one layer's new rate / on-off
+   *   onPacketLoss(ssrc, fraction)   optional: each receiver report's
+   *                 fraction lost (0..1) on one of its SSRCs
+   * Replaces an entry under the same id.
+   */
+  registerRateSender(id, desc) {
+    if (id == null || !desc) return;
+    id = String(id);
+    if (!this._rateSenders[id]) this._rateOrder.push(id);
+    this._rateSenders[id] = desc;
+    this.updateRates();
+  }
+
+  /** The sender went away (pipeline stopped): forget it and its layers. */
+  unregisterRateSender(id) {
+    if (id == null) return;
+    id = String(id);
+    if (!this._rateSenders[id]) return;
+    delete this._rateSenders[id];
+    this._rateOrder.splice(this._rateOrder.indexOf(id), 1);
+    var ks = Object.keys(this._rateLayers);
+    for (var i = 0; i < ks.length; i++) {
+      if (this._rateLayers[ks[i]].id === id) this._hysteresis.forget(ks[i]);
+    }
+    this.updateRates();
+  }
+
+  // The registered sender of one of our SSRCs (the cache updateRates
+  // keeps), or null.
+  _rateLayerOf(ssrc) {
+    return this._rateLayers[ssrc >>> 0] || null;
+  }
+
+  // Packets per second of one SSRC of ours, measured over >= 500 ms
+  // (DEFAULT_PACKET_RATE before that).
+  _packetRate(ssrc, now) {
+    var o = this._state.outboundStats[ssrc];
+    var m = this._prMeter[ssrc];
+    if (!o) return m ? m.pps : DEFAULT_PACKET_RATE;
+    if (!m) { this._prMeter[ssrc] = { at: now, packets: o.packets || 0, pps: DEFAULT_PACKET_RATE }; return DEFAULT_PACKET_RATE; }
+    if (now - m.at >= 500) {
+      m.pps = ((o.packets || 0) - m.packets) * 1000 / (now - m.at);
+      if (!(m.pps > 0)) m.pps = DEFAULT_PACKET_RATE;
+      m.at = now;
+      m.packets = o.packets || 0;
+    }
+    return m.pps;
+  }
+
+  _breakerFor(ssrc) {
+    ssrc = ssrc >>> 0;
+    var cb = this._breakers[ssrc];
+    var rl = this._rateLayerOf(ssrc);
+    if (!cb) {
+      cb = this._breakers[ssrc] = new RtpCircuitBreaker({
+        frameIntervalMs: rl ? rl.frameIntervalMs : null,
+        ownIntervalMs: RTCP_INTERVAL_MS,
+      });
+    }
+    // Its encoder can cut its rate tenfold: a video stream of ours (an
+    // injected stream cannot be slowed, audio has no tenth to go to).
+    cb.canReduce = !!(rl && rl.controllable && rl.kind === 'video');
+    return cb;
+  }
+
+  _ceased(ssrc) {
+    var cb = this._breakers[ssrc >>> 0];
+    return !!(cb && cb.state === 'tripped');
+  }
+
+  // A circuit breaker changed state: an internal 'circuitbreaker' event (for
+  // tests and diagnostics; the application sees the state through getStats'
+  // qualityLimitationReason only, W3C defining no event). The rates follow
+  // once the RTCP packet is handled (handleIncomingRtcp).
+  _onBreaker(ssrc, what, cb) {
+    this._diag('[mt-diag] RTP circuit breaker ssrc=' + ssrc + ' ' + what +
+               ' (' + (cb.reason || 'cleared') + ')');
+    this.emit('circuitbreaker', { ssrc: ssrc >>> 0, state: cb.state, reason: cb.reason || null });
+  }
+
+  /**
+   * Let streams the circuit breaker stopped send again (RFC 8083 §4.5: on
+   * the application's request — api.js calls this from setParameters with
+   * the encoding active — or on a new path, an ICE restart). A breaker whose
+   * reaction has not yet lasted the interval that triggered it stays
+   * tripped. ssrcs: the streams; omitted, every one.
+   */
+  resetCircuitBreakers(ssrcs) {
+    var now = Date.now();
+    var keys = ssrcs ? ssrcs.map(function (x) { return String(x >>> 0); }) : Object.keys(this._breakers);
+    var any = false;
+    for (var i = 0; i < keys.length; i++) {
+      var cb = this._breakers[keys[i]];
+      if (!cb || cb.state === 'ok') continue;
+      if (cb.reset(now)) {
+        any = true;
+        this.emit('circuitbreaker', { ssrc: Number(keys[i]), state: 'ok', reason: null });
+      }
+    }
+    if (any) { this._cbSendingSince = null; this.updateRates(); }
+  }
+
+  // RFC 8083 §4.1, from the RTCP timer: sending, and no report for three
+  // intervals (Tmin 5 s) → every stream we send stops.
+  _checkRtcpTimeout(now) {
+    var state = this._state;
+    var sending = [];
+    var ks = Object.keys(state.outboundStats);
+    for (var i = 0; i < ks.length; i++) {
+      var o = state.outboundStats[ks[i]];
+      if (o && o.packets > 0 && now - o.lastPacketAt <= 2 * RTCP_INTERVAL_MS && !this._ceased(Number(ks[i]))) {
+        sending.push(Number(ks[i]));
+      }
+    }
+    if (!sending.length) { this._cbSendingSince = null; return; }
+    if (this._cbSendingSince == null) this._cbSendingSince = now;
+    if (!rtcpTimedOut(now, this._cbLastRtcpAt, this._cbSendingSince, RTCP_INTERVAL_MS)) return;
+    var hold = now - Math.max(this._cbSendingSince, this._cbLastRtcpAt || 0);
+    for (var j = 0; j < sending.length; j++) {
+      var cb = this._breakerFor(sending[j]);
+      cb.trip('rtcp-timeout', now, hold);
+      this._diag('[mt-diag] RTP circuit breaker ssrc=' + sending[j] + ' cease (rtcp-timeout)');
+      this.emit('circuitbreaker', { ssrc: sending[j], state: cb.state, reason: cb.reason });
+    }
+    // (the RTCP tick runs updateRates next)
+  }
+
+  // The peer's section for one of our SSRCs, and what it negotiated for
+  // TMMBR (sdp.js sectionTmmbr).
+  _tmmbrInfo(ssrc) {
+    var state = this._state;
+    var mid = null;
+    var rl = this._rateLayerOf(ssrc);
+    if (rl) mid = rl.mid;
+    if (mid == null && state.localSsrcs) {
+      var ks = Object.keys(state.localSsrcs);
+      for (var i = 0; i < ks.length; i++) {
+        var e = state.localSsrcs[ks[i]];
+        if (!e) continue;
+        var hit = e.id != null && (e.id >>> 0) === (ssrc >>> 0);
+        for (var li = 0; !hit && e.layers && li < e.layers.length; li++) {
+          hit = e.layers[li] && e.layers[li].ssrc != null && (e.layers[li].ssrc >>> 0) === (ssrc >>> 0);
+        }
+        if (hit) { mid = ks[i]; break; }
+      }
+    }
+    var sec = (mid != null && state.parsedRemoteSdp) ? SDP.getMediaByMid(state.parsedRemoteSdp, String(mid)) : null;
+    return SDP.sectionTmmbr(sec);
+  }
+
+  // The longest RTT known (RFC 5104 §4.2.1.2: "the longest round trip time
+  // known to the media sender"), DEFAULT_RTT_MS before any.
+  _longestRtt() {
+    var rs = this._state.rtcpStats || {};
+    var best = null;
+    var ks = Object.keys(rs);
+    for (var i = 0; i < ks.length; i++) {
+      var r = rs[ks[i]] && rs[ks[i]].roundTripTime;
+      if (typeof r === 'number' && r >= 0 && (best === null || r > best)) best = r;
+    }
+    return best === null ? DEFAULT_RTT_MS : best;
+  }
+
+  _tmmbrRecompute(ssrc, t, tuples, now) {
+    var info = this._tmmbrInfo(ssrc);
+    var bs = tmmbrBoundingSet(tuples, info.smaxpr == null ? undefined : info.smaxpr);
+    t.bounding = bs.map(function (b) { return { ssrc: b.ssrc, bitrate: b.bitrate, overhead: b.overhead }; });
+    var pr = this._packetRate(ssrc, now);
+    if (tmmbrNetBitrate(t.bounding, pr) <= tmmbrNetBitrate(t.effective, pr)) {
+      // Tighter (or the same): in force at once.
+      t.effective = t.bounding;
+      t.raiseAt = null;
+    } else {
+      // Looser: RFC 5104 §4.2.1.2 — "it SHALL wait before actually doing
+      // so", 2 * RTT + T_Dither_Max (0: point to point, RFC 4585 §3.4).
+      t.raiseAt = now + 2 * this._longestRtt();
+    }
+    t.notify = true;
+  }
+
+  // RFC 5104 §4.2.1.2, at the media sender: a new bounding set from the
+  // previous one and the new tuple (an owner's new tuple replaces its old).
+  // RFC 8834 §5.1.6: a WebRTC sender "MUST follow bandwidth limitations set
+  // by a TMMBR message received for their SSRC" — followed whether or not
+  // "ccm tmmbr" was negotiated (a limit only ever lowers what we send);
+  // answered with a TMMBN only when it was (RFC 5104 §7.2).
+  _handleTmmbr(parsed) {
+    var state = this._state;
+    var now = Date.now();
+    for (var i = 0; i < parsed.entries.length; i++) {
+      var e = parsed.entries[i];
+      var ssrc = e.ssrc >>> 0;
+      if (!state.outboundStats[ssrc] && !this._rateLayerOf(ssrc)) continue;   // not ours
+      var t = this._tmmbr[ssrc] || (this._tmmbr[ssrc] = { bounding: [], effective: [], raiseAt: null, notify: false });
+      var owner = parsed.senderSsrc >>> 0;
+      var tuples = t.bounding.filter(function (b) { return b.ssrc !== owner; });
+      tuples.push({ ssrc: owner, bitrate: e.bitrate, overhead: e.overhead });
+      this._tmmbrRecompute(ssrc, t, tuples, now);
+    }
+  }
+
+  _tmmbrOwnersLeft(byeSsrcs) {
+    var now = Date.now();
+    var gone = byeSsrcs.map(function (x) { return x >>> 0; });
+    var ks = Object.keys(this._tmmbr);
+    for (var i = 0; i < ks.length; i++) {
+      var t = this._tmmbr[ks[i]];
+      var left = t.bounding.filter(function (b) { return gone.indexOf(b.ssrc) < 0; });
+      if (left.length === t.bounding.length) continue;
+      // "SHALL transmit a new TMMBN containing the previously determined
+      // set of bounding tuples but with the tuple belonging to the departed
+      // owner removed" — and, with none left, an empty one.
+      this._tmmbrRecompute(Number(ks[i]), t, left, now);
+    }
+  }
+
+  _sendPendingTmmbn() {
+    var ks = Object.keys(this._tmmbr);
+    for (var i = 0; i < ks.length; i++) {
+      var t = this._tmmbr[ks[i]];
+      if (!t.notify) continue;
+      t.notify = false;
+      var ssrc = Number(ks[i]);
+      if (!this._tmmbrInfo(ssrc).negotiated) continue;
+      // RFC 5104 §4.2.2: sender SSRC = the media sender (this stream),
+      // media SSRC 0, one entry per bounding tuple with its owner.
+      this._sendFeedback(buildTMMBN(ssrc, t.bounding));
+    }
+  }
+
+  // W3C webrtc-stats qualityLimitationReason / qualityLimitationDurations
+  // for one SSRC of ours: the reason now, the seconds spent in each.
+  _setQualityLimitation(ssrc, reason, now) {
+    var q = this._qualityLimit[ssrc];
+    if (!q) q = this._qualityLimit[ssrc] = { reason: 'none', since: now, durations: { none: 0, cpu: 0, bandwidth: 0, other: 0 } };
+    if (q.reason === reason) return;
+    q.durations[q.reason] += (now - q.since) / 1000;
+    q.reason = reason;
+    q.since = now;
+  }
+
+  /**
+   * The quality limitation of one SSRC of ours at `now` (ms): { reason,
+   * durations } with the current state's time counted, or null when the
+   * rate controller has never looked at it.
+   */
+  getQualityLimitation(ssrc, now) {
+    var q = this._qualityLimit[ssrc >>> 0];
+    if (!q) return null;
+    var d = { none: q.durations.none, cpu: q.durations.cpu, bandwidth: q.durations.bandwidth, other: q.durations.other };
+    d[q.reason] += Math.max(0, (now == null ? Date.now() : now) - q.since) / 1000;
+    return { reason: q.reason, durations: d };
+  }
+
+  /**
+   * Run the rate controller (rate_controller.js): the connection's target
+   * — min(estimate, the peer's b=CT, the sum of what each sender may get) —
+   * split across the registered senders and their layers, each layer
+   * capped by its maxBitrate, its section's b=TIAS / b=AS, its SSRC's TMMBR
+   * limit and its circuit breaker; then the changes the hysteresis lets
+   * through, applied to the encoders. Called after every RTCP packet, on
+   * every RTCP tick and when a sender registers or changes its parameters.
+   */
+  updateRates() {
+    var state = this._state;
+    if (state.closed) return;
+    var now = Date.now();
+    var self = this;
+
+    // TMMBR raises whose wait is over.
+    var tk = Object.keys(this._tmmbr);
+    for (var ti = 0; ti < tk.length; ti++) {
+      var tt = this._tmmbr[tk[ti]];
+      if (tt.raiseAt != null && now >= tt.raiseAt) { tt.effective = tt.bounding; tt.raiseAt = null; }
+    }
+
+    this._rateLayers = Object.create(null);
+    if (!this._rateOrder.length) return;
+    var limits = remoteBandwidthLimits(state.parsedRemoteSdp);
+    var senders = [];
+    var byKey = Object.create(null);
+    for (var i = 0; i < this._rateOrder.length; i++) {
+      var id = this._rateOrder[i];
+      var d = this._rateSenders[id];
+      var desc = null;
+      try { desc = d.describe(); } catch (e) { desc = null; }
+      if (!desc || !desc.layers) continue;
+      var dmid = d.mid != null ? String(d.mid) : null;
+      var layers = [];
+      for (var j = 0; j < desc.layers.length; j++) {
+        var l = desc.layers[j];
+        if (l.ssrc == null) continue;
+        var ssrc = l.ssrc >>> 0;
+        var key = String(ssrc);
+        this._rateLayers[ssrc] = { id: id, kind: d.kind, mid: dmid, controllable: !!d.controllable,
+                                   frameIntervalMs: d.frameIntervalMs > 0 ? d.frameIntervalMs : null };
+        var cap = null;
+        var tl = tmmbrLimit(this._tmmbr[ssrc], this._packetRate(ssrc, now));
+        if (tl !== Infinity) cap = tl;
+        var cb = this._breakers[ssrc];
+        if (cb && cb.state === 'reduced' && cb.reducedCapBps != null) cap = cap === null ? cb.reducedCapBps : Math.min(cap, cb.reducedCapBps);
+        var prev = this._hysteresis.applied(key);
+        layers.push({
+          key: key, maxBitrate: l.maxBitrate || 0, scale: l.scale || 1,
+          active: l.active !== false && !(cb && cb.state === 'tripped'),
+          capBps: cap, enabled: prev ? prev.enabled : undefined,
+        });
+        byKey[key] = { d: d, ssrc: ssrc };
+      }
+      senders.push({
+        id: id, kind: d.kind, mid: dmid, priority: desc.priority,
+        sectionCapBps: (dmid != null && Object.prototype.hasOwnProperty.call(limits.tiasByMid, dmid))
+          ? limits.tiasByMid[dmid] : null,
+        layers: layers,
+      });
+    }
+    var want = allocateRates({ estimateBps: state.bandwidthEstimator.getEstimate(), ctBps: limits.ctBps, senders: senders });
+    var hard = allocateRates({ estimateBps: Infinity, ctBps: limits.ctBps, senders: senders });
+    var changes = this._hysteresis.decide(want.layers, hard.layers, now);
+    for (var c = 0; c < changes.length; c++) {
+      var ch = changes[c];
+      var who = byKey[ch.key];
+      if (!who || !who.d.controllable) continue;
+      try { who.d.apply(who.ssrc, { bitrate: ch.bitrate, enabled: ch.enabled }); } catch (e) {
+        this._diag('[mt-diag] rate apply failed ssrc=' + who.ssrc + ': ' + (e && e.message || e));
+      }
+    }
+    // Video streams the congestion controller holds below what the signaled
+    // limits alone allow: qualityLimitationReason 'bandwidth' ("congestion
+    // cues during bandwidth estimation"); one the circuit breaker stopped,
+    // or holds at a tenth of its rate (§4.3, a reaction to loss and RTT)
+    // where that cap is what binds, too — the breaker's cap is in `hard` as
+    // well, so estimateLimited alone missed the reduction. A signaled limit
+    // (maxBitrate, b=AS, TMMBR) is not congestion.
+    for (var si = 0; si < senders.length; si++) {
+      var sd = senders[si];
+      if (sd.kind !== 'video') continue;
+      var lim = estimateLimited(sd, want, hard);
+      for (var li = 0; li < sd.layers.length; li++) {
+        var ly = sd.layers[li];
+        var lcb = self._breakers[Number(ly.key)];
+        var hl = hard.layers[ly.key];
+        var held = !!(lcb && (lcb.state === 'tripped' ||
+          (lcb.state === 'reduced' && lcb.reducedCapBps != null && hl && hl.enabled && hl.bitrate >= lcb.reducedCapBps - 1)));
+        self._setQualityLimitation(Number(ly.key), (lim || held) ? 'bandwidth' : 'none', now);
       }
     }
   }
@@ -858,6 +1441,21 @@ class MediaTransport extends EventEmitter {
    * through decryption a second time.
    */
   handleIncomingRtp(buf, rinfo) {
+    // The transport-cc arrival time (draft-holmer-rmcat-transport-wide-cc
+    // §3.1: the receive time of each packet, reported in 250 µs units) is
+    // taken HERE, as the datagram reaches the transport, at sub-millisecond
+    // resolution. It used to be Date.now() after decryption and parsing:
+    // whole milliseconds, plus this packet's own handling. The sender's
+    // delay-based estimator read the noise as queueing; measured through
+    // the mediasoup shim (H.264 simulcast, 30 ms + 3 % loss), producers'
+    // estimates collapsed from
+    // 5-6 Mbps to ~1.4 Mbps mid-call, the top layer paused for ~16 s and
+    // every re-enable was a keyframe on all layers (9-34 keyframes per
+    // viewer in 40 s against 0 with mediasoup, whose worker stamps
+    // receive time in microseconds; libwebrtc uses the socket's). Node
+    // gives no kernel receive timestamp, so a packet still waits for the
+    // ones read before it.
+    this._rxAt = _preciseNow();
     var srtp = this._deps.getSrtpSession();
     if (!srtp) return;
 
@@ -872,6 +1470,7 @@ class MediaTransport extends EventEmitter {
     }
 
     this._handleIncomingRtpInner(rtp, rinfo, /*isRecovered=*/false, buf.length);
+    this._rxAt = null;
   }
 
   /**
@@ -890,6 +1489,7 @@ class MediaTransport extends EventEmitter {
     if (tccExtId == null || !parsed.extensions || !parsed.extensions[tccExtId]) return;
     var tccBuf = parsed.extensions[tccExtId];
     if (tccBuf.length >= 2) {
+      if (this._rxAt != null) arrival = this._rxAt;   // see handleIncomingRtp
       var tccSeq = tccBuf.readUInt16BE(0);
       // ONE generator for the whole transport. The sequence number is
       // transport-wide — shared by every SSRC on the transport — so a
@@ -1183,6 +1783,7 @@ class MediaTransport extends EventEmitter {
       if (_mapping.primarySsrc == null) {
         _mapping.primarySsrc = this._deps.findPrimaryForRtx(_mapping);
       }
+      this._countRtxStream(ssrc, seq, ts, _mapping.primarySsrc);
       var primaryStats = _mapping.primarySsrc != null
                          ? state.rtpStats[_mapping.primarySsrc]
                          : null;
@@ -1274,6 +1875,17 @@ class MediaTransport extends EventEmitter {
     s.packets++;
     s.bytes += byteLen;
     s.lastPacketAt = Date.now();
+    // RTCP's count of what arrived ON THIS STREAM (RFC 3550 §6.4.1, A.3:
+    // "including any late or duplicate packets"). A packet recovered from
+    // the RTX stream (RFC 4588) or rebuilt from FEC did not arrive on it:
+    // RFC 4588 §3 keeps retransmissions out of the original stream
+    // precisely so that its "RTCP statistics" stay correct, and §6.2 has
+    // the retransmission stream reported in a block of its own. Counting
+    // the repairs here made our RRs report ~0 % loss to a sender whose
+    // link lost 3 % (Chrome's loss-based estimate and its Opus loss input
+    // read it). packets (W3C packetsReceived, "includes retransmissions")
+    // and packetsLost (getStats) keep counting them.
+    if (!isRecovered) s.rtcpPackets = (s.rtcpPackets || 0) + 1;
 
     // FIRST PACKET ON THIS SSRC → the receiver's track is now receiving media,
     // so unmute it (W3C 5.3). This is the only correct moment: negotiation
@@ -1331,8 +1943,17 @@ class MediaTransport extends EventEmitter {
         s.clockRate = _recvForClock.codec.clockRate;
       }
     }
+    // A packet recovered from RTX (RFC 4588) is no arrival of this stream:
+    // it came on the RTX stream, a NACK round trip after its siblings, and
+    // its transit time says nothing about the original's jitter. Counted
+    // in, every repair added a transit spike (10-50 ms reported against
+    // the ~1 ms of the same link without repairs). RFC 3550 §A.8 computes
+    // the jitter over the stream's own packets; mediasoup likewise leaves
+    // repaired packets out of it.
     var arrival = Date.now();
-    if (s.lastArrival !== 0 && s.clockRate) {
+    if (isRecovered) {
+      // nothing: neither a sample nor the reference for the next one
+    } else if (s.lastArrival !== 0 && s.clockRate) {
       // `| 0` folds the 32-bit RTP timestamp wraparound into a signed
       // delta (RFC 1982 serial arithmetic), so a wrap between two
       // consecutive packets doesn't produce a ~2^32 spike.
@@ -1340,8 +1961,10 @@ class MediaTransport extends EventEmitter {
       var d = Math.abs((arrival - s.lastArrival) * (s.clockRate / 1000) - tsDelta);
       s.jitter += (d - s.jitter) / 16;
     }
-    s.lastArrival = arrival;
-    s.lastTs = ts;
+    if (!isRecovered) {
+      s.lastArrival = arrival;
+      s.lastTs = ts;
+    }
 
     // ── NACK generation (RFC 4585) ──
     //
@@ -1381,7 +2004,27 @@ class MediaTransport extends EventEmitter {
     }
     if (nackGen) {
       var isKeyframe = s.peekKeyframeFn ? s.peekKeyframeFn(parsed.payload) : false;
+      var nackBefore = nackGen.stats();
       nackGen.observePacket(extSeq, isKeyframe, isRecovered);
+      // A gap this packet revealed is NACKed now, not at the next tick of
+      // the feedback timer (up to nackFeedbackIntervalMs later: measured
+      // median 49 ms, p90 98 ms). libwebrtc's NackRequester asks for the
+      // batch of first NACKs from OnReceivedPacket, and mediasoup's
+      // NackGenerator sends from ReceivePacket; only retries wait for the
+      // timer (RFC 4585 §3.2 leaves the timing to the receiver; an early
+      // NACK is what makes a repair arrive before the decoder needs it).
+      // Also on a new highest seq while first NACKs wait out the reordering
+      // gate (sendAtSeq), which a later packet clears. For an SFU this is
+      // the upstream leg of every viewer's repair: with the tick's delay,
+      // a packet lost from the producer reached the viewers ~150 ms after
+      // their first NACK, and 60 of 64 freezes (~220 ms each) in a 40 s
+      // H.264 run at 30 ms + 3 % loss were waiting on one.
+      var nackAfter = nackGen.stats();
+      if (nackAfter.missing > nackBefore.missing ||
+          (nackAfter.missing > 0 && nackAfter.reorderMedian > 0 &&
+           nackAfter.highestExtSeq > nackBefore.highestExtSeq)) {
+        this._drainNackGenerator(ssrc, nackGen);
+      }
     }
 
     // Transport-CC feedback generation (_recordTransportCc).
@@ -1502,11 +2145,67 @@ class MediaTransport extends EventEmitter {
 
       var ssrcs = Object.keys(state.rtpStats);
       var remoteSsrcList = [];
+      // One report block (RFC 3550 §6.4.1) from a stream's counters:
+      // received is what arrived on the stream itself (A.3).
+      function _reportBlock(localSsrc, remoteSsrc, stats, received) {
+        var expected = (stats.cycles * 65536 + stats.highestSeq) - stats.baseSeq + 1;
+        var expectedInterval = expected - (stats._lastReportedExpected || 0);
+        var receivedInterval = received - (stats._lastReportedReceived || 0);
+        var lostInterval = expectedInterval - receivedInterval;
+        var fractionLost = 0;
+        if (expectedInterval > 0 && lostInterval > 0) {
+          // × 256, not << 8: the shift is a 32-bit one, and a loss over
+          // 2^23 packets in an interval (a peer jumping its sequence
+          // numbers) came out negative.
+          fractionLost = Math.min(255, Math.floor((lostInterval * 256) / expectedInterval));
+        }
+        stats._lastReportedExpected = expected;
+        stats._lastReportedReceived = received;
+        // DLSR (Delay since Last SR) — RFC 3550 §6.4.1, in 1/65536 s units.
+        var dlsr = 0;
+        if (stats.lastSRTime) {
+          var elapsedMs = Date.now() - stats.lastSRTime;
+          if (elapsedMs < 0) elapsedMs = 0;
+          dlsr = Math.min(0xFFFFFFFF, Math.floor(elapsedMs * 65.536));
+        }
+        // The cumulative loss is "expected less received", signed (late
+        // and duplicate packets can make it negative), and clamped at
+        // 0x7FFFFF / -0x800000 rather than wrapped (RFC 3550 A.3).
+        var lost = Math.max(-0x800000, Math.min(0x7FFFFF, expected - received));
+        return buildRR({
+          ssrc: localSsrc, mediaSsrc: remoteSsrc,
+          fractionLost: fractionLost,
+          totalLost: lost,
+          highestSeq: (stats.cycles * 65536 + stats.highestSeq) >>> 0,
+          jitter: Math.floor(stats.jitter),
+          lastSR: stats.lastSR || 0,
+          delaySinceLastSR: dlsr,
+        });
+      }
+      // This interval's reports go out as ONE compound packet (RFC 3550
+      // §6.1): it begins with a report (SR, else RR), and carries an SDES
+      // CNAME for every SSRC reporting in it; feedback (REMB) follows. Each
+      // report used to go out on its own, with no SDES at all.
+      var rrs = [], srs = [], reporters = [];
+      function _reporter(x) { if (reporters.indexOf(x >>> 0) < 0) reporters.push(x >>> 0); }
 
       for (var i = 0; i < ssrcs.length; i++) {
         var remoteSsrc = parseInt(ssrcs[i], 10);
         var stats = state.rtpStats[remoteSsrc];
         var mapping = state.remoteSsrcMap[remoteSsrc];
+        // A source no stream is bound to gets no report block. Its packets
+        // reached no receiver (BUNDLE demux, RFC 8843 §9.2, could not place
+        // them), and a report block on an SSRC is what tells a libwebrtc
+        // sender to stop putting MID and RID / repaired-RID on it
+        // (RTPSender's ssrc_has_acked_ / rtx_ssrc_has_acked_): an SSRC
+        // whose first packets came before we could bind it (a simulcast
+        // layer's RTX stream whose first packets came before its
+        // extension ids were known) was reported on, lost its
+        // repaired-RID, and could never be bound after; every
+        // retransmission of that layer was dropped
+        // (mediasoup demo, H.264 at 3 % loss: 300-400 RTX packets of an r2
+        // left unbound, its viewers frozen 16-20 s of 40).
+        if (!mapping) continue;
         var localSsrc = 1;
         if (mapping && state.localSsrcs[mapping.mid]) {
           localSsrc = state.localSsrcs[mapping.mid].id;
@@ -1534,34 +2233,25 @@ class MediaTransport extends EventEmitter {
 
         // Compute fractionLost over the last RR interval (RFC 3550 §6.4.1):
         //   fraction = (expectedInterval - receivedInterval) / expectedInterval * 256
-        var expected = (stats.cycles * 65536 + stats.highestSeq) - stats.baseSeq + 1;
-        var expectedInterval = expected - (stats._lastReportedExpected || 0);
-        var receivedInterval = stats.packets - (stats._lastReportedReceived || 0);
-        var lostInterval = expectedInterval - receivedInterval;
-        var fractionLost = 0;
-        if (expectedInterval > 0 && lostInterval > 0) {
-          fractionLost = Math.min(255, Math.floor((lostInterval << 8) / expectedInterval));
-        }
-        stats._lastReportedExpected = expected;
-        stats._lastReportedReceived = stats.packets;
+        rrs.push(_reportBlock(localSsrc, remoteSsrc, stats, stats.rtcpPackets || 0));
+      }
 
-        // DLSR (Delay since Last SR) — RFC 3550 §6.4.1, in 1/65536 s units.
-        var dlsr = 0;
-        if (stats.lastSRTime) {
-          var elapsedMs = Date.now() - stats.lastSRTime;
-          if (elapsedMs < 0) elapsedMs = 0;
-          dlsr = Math.min(0xFFFFFFFF, Math.floor(elapsedMs * 65.536));
+      // The retransmission streams (RFC 4588 §6.2: "the receiver sends
+      // report blocks for the original and the retransmission streams in
+      // the same RR packet"), from the local SSRC of their original.
+      var rtxSsrcs = Object.keys(state.rtxRtcpStats || {});
+      for (var xi = 0; xi < rtxSsrcs.length; xi++) {
+        var rx = state.rtxRtcpStats[rtxSsrcs[xi]];
+        var pmap = rx.primarySsrc != null ? state.remoteSsrcMap[rx.primarySsrc] : null;
+        var rxLocal = (pmap && state.localSsrcs[pmap.mid]) ? state.localSsrcs[pmap.mid].id : null;
+        if (rxLocal == null) {
+          var _xk = Object.keys(state.localSsrcs);
+          for (var _xj = 0; _xj < _xk.length && rxLocal == null; _xj++) {
+            var _xc = state.localSsrcs[_xk[_xj]];
+            if (_xc && Number.isFinite(_xc.id) && _xc.id > 0) rxLocal = _xc.id;
+          }
         }
-
-        self.sendRtcp(buildRR({
-          ssrc: localSsrc, mediaSsrc: remoteSsrc,
-          fractionLost: fractionLost,
-          totalLost: stats.packetsLost,
-          highestSeq: (stats.cycles * 65536 + stats.highestSeq) >>> 0,
-          jitter: Math.floor(stats.jitter),
-          lastSR: stats.lastSR,
-          delaySinceLastSR: dlsr,
-        }));
+        rrs.push(_reportBlock(rxLocal != null ? rxLocal : 1, parseInt(rtxSsrcs[xi], 10), rx, rx.rtcpPackets));
       }
 
       // Single REMB covers all known remote SSRCs in one shot.
@@ -1573,6 +2263,7 @@ class MediaTransport extends EventEmitter {
       // therefore silently capped any HD/screenshare sender at 2 Mbps.
       // Default lifted to 10 Mbps and made configurable via
       // state.rembBitrateBps for deployments that want a real ceiling.
+      var remb = null;
       if (remoteSsrcList.length > 0) {
         var localSsrc2 = 1;
         var firstMapping = state.remoteSsrcMap[remoteSsrcList[0]];
@@ -1580,7 +2271,7 @@ class MediaTransport extends EventEmitter {
           localSsrc2 = state.localSsrcs[firstMapping.mid].id;
         }
         var rembBps = state.rembBitrateBps || 10000000;
-        self.sendRtcp(buildREMB(localSsrc2, remoteSsrcList, rembBps));
+        remb = buildREMB(localSsrc2, remoteSsrcList, rembBps);
       }
 
       // SR (Sender Report) for every outbound stream. Lets the remote
@@ -1628,7 +2319,7 @@ class MediaTransport extends EventEmitter {
           packetCount:  oSt.packets,
           octetCount:   oSt.bytes,
         });
-        self.sendRtcp(srBuf);
+        srs.push(srBuf);
 
         // Cache middle32 so we can match DLSR from incoming RR.
         // The `>>> 0` is essential — JavaScript bitwise produces signed
@@ -1638,6 +2329,15 @@ class MediaTransport extends EventEmitter {
         if (!state.lastOwnSR) state.lastOwnSR = {};
         state.lastOwnSR.middle32 = (((ntpSec & 0xFFFF) << 16) | ((ntpFrac >>> 16) & 0xFFFF)) >>> 0;
         state.lastOwnSR.at       = sent;
+      }
+
+      var reports = srs.concat(rrs);
+      if (reports.length > 0) {
+        for (var ri = 0; ri < reports.length; ri++) _reporter(reports[ri].readUInt32BE(4));
+        var compound = reports.slice();
+        for (var ci = 0; ci < reporters.length; ci++) compound.push(buildSDES(reporters[ci], state.localCname || ''));
+        if (remb) compound.push(remb);
+        self.sendRtcp(buildCompound(compound));
       }
 
       // First-round PLI burst — kick the encoder on the remote side so
@@ -1654,6 +2354,11 @@ class MediaTransport extends EventEmitter {
           if (mappingJ && !mappingJ.isRtx && !mappingJ.isFec) self.requestKeyframe(remoteSsrcJ);
         }
       }
+
+      // RTP circuit breaker: the RTCP timeout (RFC 8083 §4.1); and the
+      // rates (a TMMBR raise due, a new remote description's b= lines).
+      self._checkRtcpTimeout(Date.now());
+      self.updateRates();
     }, 1000);
 
     if (this._rtcpTimer.unref) this._rtcpTimer.unref();
@@ -1685,7 +2390,7 @@ class MediaTransport extends EventEmitter {
         var pendingCount = gen.pending();
         var fbPacket = gen.buildFeedback();
         if (fbPacket) {
-          self.sendRtcp(fbPacket);
+          self._sendFeedback(fbPacket);
           _tccDiagCount++;
           if (_tccDiagCount <= 3 || _tccDiagCount % 50 === 0) {
             self._diag('[cm-diag] TCC feedback #' + _tccDiagCount +
@@ -1703,8 +2408,8 @@ class MediaTransport extends EventEmitter {
   /**
    * NACK feedback timer.
    *
-   * Drains every per-SSRC NackGenerator on a fixed cadence (default 100ms,
-   * same as transport-cc). For each generator with pending gaps, calls
+   * Drains every per-SSRC NackGenerator on a fixed cadence (default 40 ms,
+   * nackFeedbackIntervalMs). For each generator with pending gaps, calls
    * buildFeedback() to get a 16-bit seq list, wraps it in an RFC 4585
    * generic NACK RTCP packet, and sends it.
    *
@@ -1712,18 +2417,19 @@ class MediaTransport extends EventEmitter {
    * beyond what keyframe-aware eviction can recover, fire a PLI for that
    * mid and acknowledge so the flag clears for the next interval.
    *
-   * Cadence rationale: 100ms is a compromise. Lower (20-50ms) gives faster
-   * recovery but more RTCP and CPU; higher (200ms+) delays recovery to the
-   * point of being noticeable. libwebrtc uses ~20ms; mediasoup uses 25ms.
-   * We err toward less RTCP because the NackGenerator does its own
-   * retry-after-RTT throttling, so a slower drain doesn't double-NACK.
+   * Cadence: a gap's first NACK does not wait for this timer (the receive
+   * path drains the generator when one appears); the timer sends the
+   * retries, each due one RTT after the last, so it runs at mediasoup's
+   * 40 ms (libwebrtc's NackRequester: 20 ms). At 100 ms a retry left up to
+   * 100 ms past its round trip. It costs no extra RTCP: the generator's
+   * RTT gate decides what is due, the timer only how late it is noticed.
    */
   startNackFeedbackTimer() {
     if (this._nackFeedbackTimer) return;
     var self = this;
     var state = this._state;
-    var _nackOutDiagCount = 0;
-    var _nackPliDiagCount = 0;
+    this._nackOutDiagCount = 0;
+    this._nackPliDiagCount = 0;
 
     this._nackFeedbackTimer = setInterval(function () {
       if (state.closed || !self._deps.getSrtpSession()) {
@@ -1737,54 +2443,66 @@ class MediaTransport extends EventEmitter {
         var ssrc = parseInt(keys[i], 10);
         var gen = gens[ssrc];
         if (!gen) continue;
-
-        // Drain the generator. seqs is already 16-bit wire-format.
-        var seqs = gen.buildFeedback(Date.now());
-        if (seqs.length > 0) {
-          // RFC 4585: NACK feedback's senderSsrc names the entity emitting
-          // the feedback. Pick the one bound to the matching m-section;
-          // fallback to 1 if no mapping exists yet.
-          var mapping = state.remoteSsrcMap[ssrc];
-          var localSenderSsrc = 1;
-          if (mapping && state.localSsrcs[mapping.mid]) {
-            localSenderSsrc = state.localSsrcs[mapping.mid].id;
-          }
-          self.sendRtcp(buildNACK(localSenderSsrc, ssrc, seqs));
-
-          var st = state.rtpStats[ssrc];
-          if (st) st.nackCount = (st.nackCount || 0) + 1;
-
-          _nackOutDiagCount++;
-          if (_nackOutDiagCount <= 3 || _nackOutDiagCount % 50 === 0) {
-            self._diag('[cm-diag] NACK out #' + _nackOutDiagCount +
-              ' ssrc=' + ssrc +
-              ' seqs=[' + seqs[0] + '..' + seqs[seqs.length - 1] + ']' +
-              ' (' + seqs.length + ')');
-          }
-        }
-
-        // PLI escalation: NACK list overflowed past what we can recover
-        // by keyframe-aware eviction. Generator asks for a fresh keyframe.
-        // The `ssrc` here is the per-stream SSRC the NackGenerator is
-        // bound to (one generator per inbound primary stream — see
-        // _handleIncomingRtpInner above where state.nackGenerators[ssrc]
-        // is created). Send PLI directly to it; this matches libwebrtc's
-        // model of one RtpRtcp module per stream, each driving its own
-        // PLI feedback to its own remote_ssrc_.
-        if (gen.needKeyframe()) {
-          self.requestKeyframe(ssrc);
-          gen.acknowledgeKeyframeRequested();
-          _nackPliDiagCount++;
-          if (_nackPliDiagCount <= 5 || _nackPliDiagCount % 20 === 0) {
-            self._diag('[cm-diag] NACK→PLI escalation #' + _nackPliDiagCount +
-              ' ssrc=' + ssrc +
-              ' (NACK list overflow, requesting keyframe)');
-          }
-        }
+        self._drainNackGenerator(ssrc, gen);
       }
     }, state.nackFeedbackIntervalMs);
 
     if (this._nackFeedbackTimer.unref) this._nackFeedbackTimer.unref();
+  }
+
+  /**
+   * Send what one NackGenerator has due (first NACKs, and retries a round
+   * trip old), and the PLI its overflow asks for. From the feedback timer,
+   * and from the receive path the moment a gap appears.
+   */
+  _drainNackGenerator(ssrc, gen) {
+    var state = this._state;
+    if (state.closed || !this._deps.getSrtpSession()) return;
+    if (this._nackOutDiagCount == null) { this._nackOutDiagCount = 0; this._nackPliDiagCount = 0; }   // before the timer's first start
+
+    // Drain the generator. seqs is already 16-bit wire-format.
+    var seqs = gen.buildFeedback(Date.now());
+    if (seqs.length > 0) {
+      // RFC 4585: NACK feedback's senderSsrc names the entity emitting
+      // the feedback. Pick the one bound to the matching m-section;
+      // fallback to 1 if no mapping exists yet.
+      var mapping = state.remoteSsrcMap[ssrc];
+      var localSenderSsrc = 1;
+      if (mapping && state.localSsrcs[mapping.mid]) {
+        localSenderSsrc = state.localSsrcs[mapping.mid].id;
+      }
+      this._sendFeedback(buildNACK(localSenderSsrc, ssrc, seqs));
+
+      var st = state.rtpStats[ssrc];
+      if (st) st.nackCount = (st.nackCount || 0) + 1;
+
+      this._nackOutDiagCount++;
+      if (this._nackOutDiagCount <= 3 || this._nackOutDiagCount % 50 === 0) {
+        this._diag('[cm-diag] NACK out #' + this._nackOutDiagCount +
+          ' ssrc=' + ssrc +
+          ' seqs=[' + seqs[0] + '..' + seqs[seqs.length - 1] + ']' +
+          ' (' + seqs.length + ')');
+      }
+    }
+
+    // PLI escalation: NACK list overflowed past what we can recover
+    // by keyframe-aware eviction. Generator asks for a fresh keyframe.
+    // The `ssrc` here is the per-stream SSRC the NackGenerator is
+    // bound to (one generator per inbound primary stream — see
+    // _handleIncomingRtpInner above where state.nackGenerators[ssrc]
+    // is created). Send PLI directly to it; this matches libwebrtc's
+    // model of one RtpRtcp module per stream, each driving its own
+    // PLI feedback to its own remote_ssrc_.
+    if (gen.needKeyframe()) {
+      this.requestKeyframe(ssrc);
+      gen.acknowledgeKeyframeRequested();
+      this._nackPliDiagCount++;
+      if (this._nackPliDiagCount <= 5 || this._nackPliDiagCount % 20 === 0) {
+        this._diag('[cm-diag] NACK→PLI escalation #' + this._nackPliDiagCount +
+          ' ssrc=' + ssrc +
+          ' (NACK list overflow, requesting keyframe)');
+      }
+    }
   }
 
 
@@ -1840,7 +2558,9 @@ class MediaTransport extends EventEmitter {
     }
     delete state.rtxStreams[ssrc];
     if (bye.length > 0 && !state.closed) {
-      try { this.sendRtcp(buildBYE(bye)); } catch (e) {}
+      // A compound packet too (RFC 3550 §6.1, §6.6): an empty RR and the
+      // SDES CNAME before the BYE. A BYE alone is not one.
+      try { this.sendRtcp(buildCompound([_emptyRR(bye[0]), buildSDES(bye[0], state.localCname || ''), buildBYE(bye)])); } catch (e) {}
     }
   }
 
@@ -1938,6 +2658,15 @@ class MediaTransport extends EventEmitter {
    */
   getEstimatedBandwidth() {
     return this._state.bandwidthEstimator.getEstimate();
+  }
+
+  /**
+   * The RTP circuit breaker of one SSRC of ours: { state: 'ok' | 'reduced'
+   * | 'tripped', reason }, or null before its first report.
+   */
+  getCircuitBreakerState(ssrc) {
+    var cb = this._breakers[ssrc >>> 0];
+    return cb ? { state: cb.state, reason: cb.reason } : null;
   }
 
 

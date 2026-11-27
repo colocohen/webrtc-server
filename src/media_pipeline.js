@@ -23,6 +23,7 @@ import { VideoEncoder, VideoDecoder, AudioEncoder, AudioDecoder, MediaStreamTrac
 import { REDPacketizer, REDDepacketizer } from 'rtp-packet';
 import { H265Packetizer, H265Depacketizer } from 'rtp-packet';
 import { DtmfPacketizer } from 'rtp-packet';
+import { G711Packetizer, G711Depacketizer } from 'rtp-packet';
 import {
   VP8Packetizer, VP8Depacketizer,
   VP9Packetizer, VP9Depacketizer,
@@ -149,6 +150,30 @@ function _createRtpTimeline(rtpState, clockRate) {
     rtpState.lastRtpTs  = ts;
     rtpState.lastSentAt = _monotonicMs();
   };
+}
+
+/**
+ * RTP ticks -> microseconds, for what a receive pipeline hands on.
+ *
+ * A depacketizer's chunk carries the RTP timestamp in clock ticks; W3C
+ * WebCodecs' EncodedVideoChunk / EncodedAudioChunk (and so the decoded
+ * VideoFrame / AudioData, and the encoded frame's `timestamp`, W3C
+ * webrtc-encoded-transform: "the media presentation timestamp in
+ * microseconds") are in microseconds. Unwrapped (RFC 3550 §5.1, 32-bit
+ * wrap), relative to the first packet; `baseUs` continues an earlier
+ * clock (a codec switch on the same SSRC changes the clock rate).
+ */
+function _createTickClock(clockRate, baseUs) {
+  var first = null, lastRaw = 0, ext = 0, base = baseUs || 0;
+  var clock = function (raw) {
+    raw = raw >>> 0;
+    if (first === null) { first = raw; lastRaw = raw; ext = 0; }
+    else { ext += ((raw - lastRaw) | 0); lastRaw = raw; }
+    clock.lastUs = base + Math.round(ext * 1e6 / clockRate);
+    return clock.lastUs;
+  };
+  clock.lastUs = base;
+  return clock;
 }
 
 /**
@@ -639,6 +664,17 @@ function createVideoSendPipeline(opts) {
   // spec means "unbounded", which we interpret as "use our default".
   var bitrate     = opts.bitrate   ||
                     (opts.maxBitrate   > 0 ? opts.maxBitrate   : DEFAULT_BITRATE);
+  // Rate control (rate_controller.js, RFC 8834 §7): the application's
+  // maxBitrate (0: none) and the controller's target (null: none yet). The
+  // encoder runs at the target, never above maxBitrate; without a target,
+  // at the rate above (as before rate control existed).
+  var appMaxBitrate = opts.maxBitrate > 0 ? opts.maxBitrate : 0;
+  var _baseBitrate  = bitrate;
+  var rateTarget    = null;
+  function _effectiveBitrate() {
+    if (rateTarget == null) return appMaxBitrate > 0 ? appMaxBitrate : _baseBitrate;
+    return appMaxBitrate > 0 ? Math.min(rateTarget, appMaxBitrate) : rateTarget;
+  }
   var framerate   = opts.framerate ||
                     (opts.maxFramerate > 0 ? opts.maxFramerate : DEFAULT_FRAMERATE);
   var scaleDown   = opts.scaleResolutionDownBy > 0 ? opts.scaleResolutionDownBy : 1;
@@ -709,6 +745,10 @@ function createVideoSendPipeline(opts) {
   // subscription below) so both _processChunkForSend and onFrame can see
   // it without relying on var hoisting.
   var active = true;
+  // The rate controller's on/off for this stream (setRateTarget): a
+  // simulcast layer the budget cannot carry, or one the RTP circuit breaker
+  // stopped. Separate from `active`, which is the application's.
+  var ccEnabled = true;
 
   // Encoded-streams state. Before takeStreams() is called, the encoder's
   // output feeds the packetizer directly (the "default pipe"). After
@@ -754,7 +794,7 @@ function createVideoSendPipeline(opts) {
   function _processChunkForSend(chunk) {
     // mayEncode() again here: after takeStreams() the app can write chunks
     // that never went through onFrame's gate.
-    if (stopped || !active || !mayEncode()) return;
+    if (stopped || !active || !ccEnabled || !mayEncode()) return;
     if (!manager.state.srtpSession) return;   // SRTP not ready — drop
 
     var o = manager.state.outboundStats[ssrc];
@@ -934,7 +974,7 @@ function createVideoSendPipeline(opts) {
     if (opts.onSourceFrame) {
       try { opts.onSourceFrame(); } catch (e) { /* never let stats throw into the pipeline */ }
     }
-    if (stopped || !active || !mayEncode()) {
+    if (stopped || !active || !ccEnabled || !mayEncode()) {
       // Must close the VideoFrame we received even when dropping, otherwise
       // the source's VideoFrame buffer pool starves.
       try { if (frame && typeof frame.close === 'function') frame.close(); } catch (e) {}
@@ -1063,16 +1103,20 @@ function createVideoSendPipeline(opts) {
     var changed = false;
     // Track separately whether the change requires the decoder to re-latch
     // (i.e. a new keyframe). Only resolution changes need that — bitrate
-    // and framerate are "soft" parameters that libvpx adjusts on the fly
-    // without losing decoder state, and forcing a keyframe on every
+    // and framerate are "soft" parameters, and forcing a keyframe on every
     // adaptive bitrate nudge produces ~1 keyframe/sec bursts that
     // dominate the wire and cause the remote jitter buffer to see spikes.
+    // (The FFmpeg-backed encoder restarts on any configure() and emits a
+    // key frame regardless: see setRateTarget below.)
     var needsKeyframe = false;
 
     if (typeof params.maxBitrate === 'number' && params.maxBitrate > 0 &&
-        params.maxBitrate !== bitrate) {
-      bitrate = params.maxBitrate;
-      changed = true;
+        params.maxBitrate !== appMaxBitrate) {
+      // The application's cap; the encoder runs at the rate controller's
+      // target under it (or at it, with no target yet).
+      appMaxBitrate = params.maxBitrate;
+      var _nb = _effectiveBitrate();
+      if (_nb !== bitrate) { bitrate = _nb; changed = true; }
     }
     if (typeof params.maxFramerate === 'number' && params.maxFramerate > 0 &&
         params.maxFramerate !== framerate) {
@@ -1112,6 +1156,45 @@ function createVideoSendPipeline(opts) {
   }
 
   /**
+   * The rate controller's decision for this stream (rate_controller.js,
+   * via RTCRtpSender): `bitrate` the encoder's target (bps; never above the
+   * application's maxBitrate), `enabled` whether to encode at all.
+   *
+   * A bitrate change does not ask for a key frame (the comment in
+   * reconfigure above). Turning a stream back on does: its receiver has had
+   * nothing for a while, as at a direction change (_createSendGate).
+   *
+   * KNOWN LIMIT (webrtc-server-rs PORTING.md, bug 99): media-processing's
+   * VideoEncoder runs FFmpeg, which takes an encoder's bitrate only when it
+   * opens (no encoder AVOption is a runtime one; the CLI's 'c' / sendcmd /
+   * zmq reach filters only), so its configure() restarts the process and
+   * the new stream begins with a key frame and a decoderConfig: every rate
+   * change here costs a key frame (verified: VP8 / VP9 / H.264). The rate
+   * controller's hysteresis keeps them rare. The Rust port retargets the
+   * encoder in place.
+   */
+  function setRateTarget(t) {
+    if (stopped || !t) return;
+    if (typeof t.enabled === 'boolean' && t.enabled !== ccEnabled) {
+      ccEnabled = t.enabled;
+      if (ccEnabled) pendingKeyFrame = true;
+    }
+    if (typeof t.bitrate === 'number' && t.bitrate > 0) {
+      rateTarget = t.bitrate;
+      var nb = _effectiveBitrate();
+      if (nb !== bitrate) {
+        bitrate = nb;
+        try { encoder.configure(_encoderConfig()); }
+        catch (e) {
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('[media_pipeline] encoder.configure (rate) failed:', e && e.message || e);
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Encoded-streams handoff (called by RTCRtpSender.createEncodedStreams).
    * Per spec, can only be called once per sender. After this call:
    *   - encoder output stops flowing directly to the wire; it enters
@@ -1132,6 +1215,8 @@ function createVideoSendPipeline(opts) {
     stop:            stop,
     requestKeyFrame: requestKeyFrame,
     reconfigure:     reconfigure,
+    setRateTarget:   setRateTarget,
+    getTargetBitrate: function () { return bitrate; },
     readable:        readable,
     writable:        writable,
     takeStreams:     takeStreams,
@@ -1342,6 +1427,13 @@ function createVideoSendSimulcastPipeline(opts) {
     }
   }
 
+  // The rate controller's decision for one layer (see the single-layer
+  // setRateTarget). Unknown rid: ignored.
+  function setRateTargetForRid(rid, t) {
+    var idx = findLayerIdx(rid);
+    if (idx >= 0) layerPipelines[idx].setRateTarget(t);
+  }
+
   // Encoded streams for simulcast — layer[0]'s readable/writable serve the
   // primary layer. Per-layer access for apps that want all layers will be
   // added when there's a concrete use case; today the common patterns
@@ -1352,6 +1444,7 @@ function createVideoSendSimulcastPipeline(opts) {
     requestKeyFrameForRid: requestKeyFrameForRid,
     reconfigure:           reconfigure,
     reconfigureLayer:      reconfigureLayer,
+    setRateTargetForRid:   setRateTargetForRid,
     readable:              layerPipelines[0].readable,
     writable:              layerPipelines[0].writable,
     takeStreams:           function () { return layerPipelines[0].takeStreams(); },
@@ -1388,6 +1481,12 @@ export {
  *                             AUDIO (Opus)
  * ══════════════════════════════════════════════════════════════════════ */
 
+// G.711 (RFC 3551 §4.5.14, 8 kHz mono; RFC 7874 §3: mandatory for WebRTC
+// endpoints, and offered by sdp.js's registry) used to be missing here: the
+// pipelines were Opus only, so a negotiated PCMU / PCMA stream went into
+// the Opus depacketizer and decoder, and our sender sent Opus on a payload
+// type the peer had not agreed to. The encoder takes the track at its own
+// rate and resamples to 8 kHz mono (media-processing's 'ulaw' / 'alaw').
 var AUDIO_CODECS = {
   OPUS: {
     Packetizer:   OpusPacketizer,
@@ -1395,6 +1494,20 @@ var AUDIO_CODECS = {
     decoderCodec: 'opus',
     clockRate:    48000,
     numberOfChannels: 2,
+  },
+  PCMU: {
+    Packetizer:   G711Packetizer,
+    Depacketizer: G711Depacketizer,
+    decoderCodec: 'ulaw',
+    clockRate:    8000,
+    numberOfChannels: 1,
+  },
+  PCMA: {
+    Packetizer:   G711Packetizer,
+    Depacketizer: G711Depacketizer,
+    decoderCodec: 'alaw',
+    clockRate:    8000,
+    numberOfChannels: 1,
   },
 };
 
@@ -1411,6 +1524,8 @@ var AUDIO_CODECS = {
  * @param {object} opts.manager     ConnectionManager
  * @param {number} opts.ssrc        Outgoing SSRC
  * @param {number} [opts.payloadType=111]   Opus default PT in WebRTC
+ * @param {number} [opts.dtmfPayloadType]  telephone-event PT (RFC 4733) at
+ *                  the codec's clock rate; null: no DTMF
  * @param {number} [opts.bitrate=40000]
  * @returns {{stop: Function}}
  */
@@ -1427,8 +1542,20 @@ function createAudioSendPipeline(opts) {
   // RTCRtpSender (if > 0), else Opus default. Opus supports 6-510 kbps.
   var bitrate     = opts.bitrate ||
                     (opts.maxBitrate > 0 ? opts.maxBitrate : 40000);
+  // Rate control: as the video pipeline (appMaxBitrate, rateTarget).
+  var appMaxBitrate = opts.maxBitrate > 0 ? opts.maxBitrate : 0;
+  var _baseBitrate  = bitrate;
+  var rateTarget    = null;
+  function _effectiveBitrate() {
+    if (rateTarget == null) return appMaxBitrate > 0 ? appMaxBitrate : _baseBitrate;
+    return appMaxBitrate > 0 ? Math.min(rateTarget, appMaxBitrate) : rateTarget;
+  }
 
-  var codecInfo = AUDIO_CODECS.OPUS;
+  var codecName = (opts.codec || 'opus').toUpperCase();
+  var codecInfo = AUDIO_CODECS[codecName];
+  if (!codecInfo) {
+    throw new Error('createAudioSendPipeline: unsupported codec: ' + codecName);
+  }
 
   // RED (RFC 2198): when the negotiated codec carries a redPayloadType,
   // the wire packets are RED-wrapped — current opus frame + previous
@@ -1460,6 +1587,7 @@ function createAudioSendPipeline(opts) {
 
   var stopped = false;
   var active  = true;
+  var ccEnabled = true;   // the rate controller's on/off (see the video pipeline)
   // Negotiated-direction gate; audio has no keyframes, nothing to do on resume.
   var mayEncode = _createSendGate(manager, ssrc, opts.transceiver, null);
 
@@ -1487,7 +1615,7 @@ function createAudioSendPipeline(opts) {
   var _lastVoiceActivity = false;
 
   function _processChunkForSend(chunk) {
-    if (stopped || !active || !mayEncode()) return;
+    if (stopped || !active || !ccEnabled || !mayEncode()) return;
     if (!manager.state.srtpSession) return;
     // libwebrtc-style: a DTMF tone replaces the audio frames. Checked BEFORE
     // packetize(): the tone shares this SSRC's sequence space, and
@@ -1621,32 +1749,79 @@ function createAudioSendPipeline(opts) {
   // a different one arrives (first frame for mono sources — before
   // anything was encoded, so the FFmpeg restart cost is paid once and
   // effectively at startup).
+  //
+  // The sample rate likewise (W3C WebCodecs: an AudioData must match the
+  // configured rate): G.711's encoder takes the track at its own rate and
+  // resamples to 8 kHz, and Opus takes 8 / 12 / 16 / 24 / 48 kHz input
+  // (RFC 6716 §2.1.4) — the RTP clock stays the codec's either way.
   var _configuredChannels = codecInfo.numberOfChannels;
-  function _configureEncoder(channels) {
+  var _configuredRate = (codecName === 'OPUS') ? codecInfo.clockRate : 48000;
+
+  // The encoder's expected packet loss (Opus packetlossperc, W3C WebCodecs
+  // OpusEncoderConfig; libopus OPUS_SET_PACKET_LOSS_PERC), from the loss
+  // the peer's receiver reports give for this stream. RFC 7587 §3.3: the
+  // encoder decides on in-band FEC from "an externally provided estimate
+  // of the channel's packet loss rate". As libwebrtc's AudioEncoderOpusImpl
+  // (OnReceivedUplinkPacketLossFraction): each report's fraction lost goes
+  // through an exponential filter of time constant 10 s (alpha 0.9999 per
+  // ms, the first sample taken as is), clamped to 0..0.2, and the encoder
+  // gets it in whole percent; it starts at 0. A new percent reconfigures
+  // the encoder (the same configuration, another packetlossperc).
+  var _lossPerc = 0;
+  var _lossFiltered = -1;
+  var _lossAt = 0;
+  function setPacketLoss(fraction, nowMs) {
+    if (stopped || codecName !== 'OPUS' || !(fraction >= 0)) return;
+    var now = (typeof nowMs === 'number') ? nowMs : Date.now();
+    if (_lossFiltered < 0) _lossFiltered = fraction;
+    else {
+      var a = Math.pow(0.9999, Math.max(0, now - _lossAt));
+      _lossFiltered = a * _lossFiltered + (1 - a) * fraction;
+    }
+    _lossAt = now;
+    var perc = Math.floor(Math.min(Math.max(_lossFiltered, 0), 0.2) * 100 + 0.5);
+    if (perc === _lossPerc) return;
+    _lossPerc = perc;
+    try { _configureEncoder(_configuredChannels, _configuredRate); }
+    catch (e) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[media_pipeline] audio encoder.configure (packet loss) failed:', e && e.message || e);
+      }
+    }
+  }
+  function _configureEncoder(channels, rate) {
     _configuredChannels = channels;
-    encoder.configure({
+    _configuredRate = rate;
+    var cfg = {
       codec:            codecInfo.decoderCodec,
-      sampleRate:       codecInfo.clockRate,
+      sampleRate:       rate,
       numberOfChannels: channels,
       bitrate:          bitrate,
-      opus:             _opusFmtp || undefined,
-    });
+    };
+    if (codecName === 'OPUS') {
+      var _o = {};
+      if (_opusFmtp) for (var _k in _opusFmtp) _o[_k] = _opusFmtp[_k];
+      _o.packetlossperc = _lossPerc;
+      cfg.opus = _o;
+    }
+    encoder.configure(cfg);
   }
-  _configureEncoder(codecInfo.numberOfChannels);
+  _configureEncoder(codecInfo.numberOfChannels, _configuredRate);
 
   var onData = function (audioData) {
-    if (stopped || !active || !mayEncode()) {
+    if (stopped || !active || !ccEnabled || !mayEncode()) {
       try { if (audioData && typeof audioData.close === 'function') audioData.close(); } catch (e) {}
       return;
     }
     // Follow the track's real channel layout (see RFC 7587 note above).
     var _ch = audioData && audioData.numberOfChannels;
-    if (_ch && _ch !== _configuredChannels) {
+    var _sr = audioData && audioData.sampleRate;
+    if ((_ch && _ch !== _configuredChannels) || (_sr && _sr !== _configuredRate)) {
       if (typeof console !== 'undefined' && console.log) {
-        console.log('[media_pipeline] audio track is ' + _ch + '-channel ' +
-          '(SDP notation says ' + codecInfo.numberOfChannels + ') — reconfiguring encoder to follow the track');
+        console.log('[media_pipeline] audio track is ' + (_ch || _configuredChannels) + '-channel ' +
+          (_sr || _configuredRate) + ' Hz (SDP notation says ' + codecInfo.numberOfChannels + ') — reconfiguring encoder to follow the track');
       }
-      try { _configureEncoder(_ch); }
+      try { _configureEncoder(_ch || _configuredChannels, _sr || _configuredRate); }
       catch (e) {
         if (typeof console !== 'undefined' && console.error) {
           console.error('[media_pipeline] audio encoder reconfigure failed:', e && e.message || e);
@@ -1701,9 +1876,10 @@ function createAudioSendPipeline(opts) {
 
     var changed = false;
     if (typeof params.maxBitrate === 'number' && params.maxBitrate > 0 &&
-        params.maxBitrate !== bitrate) {
-      bitrate = params.maxBitrate;
-      changed = true;
+        params.maxBitrate !== appMaxBitrate) {
+      appMaxBitrate = params.maxBitrate;
+      var _nb = _effectiveBitrate();
+      if (_nb !== bitrate) { bitrate = _nb; changed = true; }
     }
     if (typeof params.active === 'boolean') active = params.active;
 
@@ -1714,10 +1890,31 @@ function createAudioSendPipeline(opts) {
         // FEC, DTX, ...). Reconfiguring from the codec defaults instead
         // turned those off and switched a mono encoder to stereo — and
         // back on the next frame, an encoder restart each way.
-        _configureEncoder(_configuredChannels);
+        _configureEncoder(_configuredChannels, _configuredRate);
       } catch (e) {
         if (typeof console !== 'undefined' && console.error) {
           console.error('[media_pipeline] audio encoder.configure failed:', e && e.message || e);
+        }
+      }
+    }
+  }
+
+  // The rate controller's decision (see the video pipeline's). G.711 has
+  // one rate: only `enabled` applies.
+  function setRateTarget(t) {
+    if (stopped || !t) return;
+    if (typeof t.enabled === 'boolean') ccEnabled = t.enabled;
+    if (codecName !== 'OPUS') return;
+    if (typeof t.bitrate === 'number' && t.bitrate > 0) {
+      rateTarget = t.bitrate;
+      var nb = _effectiveBitrate();
+      if (nb !== bitrate) {
+        bitrate = nb;
+        try { _configureEncoder(_configuredChannels, _configuredRate); }
+        catch (e) {
+          if (typeof console !== 'undefined' && console.error) {
+            console.error('[media_pipeline] audio encoder.configure (rate) failed:', e && e.message || e);
+          }
         }
       }
     }
@@ -1734,6 +1931,10 @@ function createAudioSendPipeline(opts) {
   return {
     stop:        stop,
     reconfigure: reconfigure,
+    setRateTarget: setRateTarget,
+    setPacketLoss: setPacketLoss,
+    getPacketLossPerc: function () { return _lossPerc; },
+    getTargetBitrate: function () { return bitrate; },
     readable:    readable,
     writable:    writable,
     takeStreams: takeStreams,
@@ -1750,7 +1951,12 @@ function createAudioSendPipeline(opts) {
       var dp = new DtmfPacketizer({
         ssrc: ssrc,
         payloadType: opts.dtmfPayloadType,
-        clockRate: 48000,
+        // The audio's clock (RFC 4733 §2.1): the event's timestamp is on
+        // this SSRC's timeline and its duration in the same ticks. It was
+        // 48000 for every codec, so a G.711 stream's tones ran 6x long
+        // (a 100 ms tone: 4800 ticks at 8 kHz). api.js negotiates the
+        // telephone-event payload type of this clock rate.
+        clockRate: codecInfo.clockRate,
         // The audio packetizer's real counter is _seq (see _packetizerSeq).
         // Reading `sequenceNumber`, which rtp-packet does not have, numbered
         // the tone 0, 1, 2… on the audio SSRC: a jump back in the stream's
@@ -1829,19 +2035,30 @@ function createAudioReceivePipeline(opts) {
   var manager = opts.manager;
   var ssrc    = opts.ssrc;
 
-  var codecInfo = AUDIO_CODECS.OPUS;
+  var codecName = (opts.codec || 'opus').toUpperCase();
+  var codecInfo = AUDIO_CODECS[codecName];
+  if (!codecInfo) {
+    throw new Error('createAudioReceivePipeline: unsupported codec: ' + codecName);
+  }
 
   var stopped          = false;
   var streamsTaken     = false;
   var autoDecodeActive = false;
   var decoder          = null;
+  // RTP ticks -> µs (see _createTickClock), and the payload type of the
+  // packet being depacketized (a chunk does not carry it).
+  var toUs  = _createTickClock(codecInfo.clockRate);
+  var curPt = null;
 
 
   /* ── Depacketizer ──────────────────────────────────────────────────── */
 
-  var depacketizer = new codecInfo.Depacketizer({
-    output: function (chunk) {
+  function _makeDepacketizer() {
+   return new codecInfo.Depacketizer({
+    output: function (c) {
       if (stopped) return;
+      var chunk = { type: c.type || 'key', data: c.data, timestamp: toUs(c.timestamp),
+                    rtpTimestamp: c.timestamp >>> 0, payloadType: curPt };
       if (streamsTaken || opts.autoDecode === false) {
         _enqueueToReadable(chunk);
       } else {
@@ -1853,7 +2070,32 @@ function createAudioReceivePipeline(opts) {
         console.error('[media_pipeline] audio depacketizer:', err && err.message || err);
       }
     },
-  });
+   });
+  }
+  var depacketizer = _makeDepacketizer();
+
+  // The payload type of the packets decides the codec, as on the video
+  // side (see createVideoReceivePipeline's _followPayloadType): a peer may
+  // switch between the negotiated Opus and G.711 with no renegotiation. A
+  // payload type the negotiation does not carry, or one that is not an
+  // audio codec (telephone-event, CN), is dropped: it used to reach the
+  // Opus decoder. RED is unwrapped before this (its own payload type).
+  function _followPayloadType(pt) {
+    if (typeof opts.codecForPt !== 'function') return true;
+    var name = opts.codecForPt(pt);
+    if (name === undefined) return true;
+    if (name === null) return false;
+    name = String(name).toUpperCase();
+    if (name === codecName) return true;
+    if (!AUDIO_CODECS[name]) return false;
+    codecName = name;
+    codecInfo = AUDIO_CODECS[name];
+    try { depacketizer.close(); } catch (e) {}
+    depacketizer = _makeDepacketizer();
+    if (decoder) { try { decoder.close(); } catch (e) {} decoder = null; }
+    toUs = _createTickClock(codecInfo.clockRate, toUs.lastUs);
+    return true;
+  }
 
 
   /* ── JitterBuffer ───────────────────────────────────────────────────── */
@@ -1865,7 +2107,11 @@ function createAudioReceivePipeline(opts) {
   // packets bypass it, so a peer that stops sending RED mid-call keeps
   // working.
   var redDepacketizer = (opts.redPayloadType != null)
-    ? new REDDepacketizer({ output: function (pp) { depacketizer.depacketize(pp); } })
+    ? new REDDepacketizer({ output: function (pp) {
+        if (!_followPayloadType(pp.payloadType)) return;
+        curPt = pp.payloadType;
+        depacketizer.depacketize(pp);
+      } })
     : null;
 
   var jitterBuffer = new JitterBuffer({
@@ -1875,7 +2121,8 @@ function createAudioReceivePipeline(opts) {
       try {
         if (redDepacketizer && parsedPacket.payloadType === opts.redPayloadType) {
           redDepacketizer.depacketize(parsedPacket);
-        } else {
+        } else if (_followPayloadType(parsedPacket.payloadType)) {
+          curPt = parsedPacket.payloadType;
           depacketizer.depacketize(parsedPacket);
         }
       }
@@ -1918,8 +2165,8 @@ function createAudioReceivePipeline(opts) {
   function _enqueueToReadable(chunk) {
     if (!_readableController) return;
     var encoded = {
-      type:      'key',                     // Opus frames are all self-contained
-      timestamp: chunk.timestamp,
+      type:      'key',                     // audio frames are all self-contained
+      timestamp: chunk.timestamp,           // µs (see _createTickClock)
       // WebRTC Opus uses a 20ms ptime by default (negotiated via
       // a=fmtp:111 minptime=10;useinbandfec=1). The decoder uses
       // `duration` to size each OGG page's granule advancement — if
@@ -1931,8 +2178,10 @@ function createAudioReceivePipeline(opts) {
       getMetadata: function () {
         return {
           synchronizationSource: ssrc,
-          payloadType:           chunk.payloadType || 111,
+          // the packet's own (it was always 111, whatever was negotiated)
+          payloadType:           chunk.payloadType,
           contributingSources:   [],
+          rtpTimestamp:          chunk.rtpTimestamp,
         };
       },
     };
@@ -1943,20 +2192,15 @@ function createAudioReceivePipeline(opts) {
 
   /* ── WritableStream → decoder ──────────────────────────────────────── */
 
-  // The depacketizer (and the readable, as RTCEncodedAudioFrame) carry the
-  // RTP timestamp in clock ticks; an EncodedAudioChunk's timestamp is in
-  // microseconds (W3C WebCodecs). The ticks went to the decoder as they
-  // were, so 20 ms packets were 960 "µs" apart: the decoded AudioData (and
-  // what an echo re-encoded from them) ran ~21x too slow on the wire —
-  // Chrome concealed 98 % of an echoed stream. Unwrapped (RFC 3550 §5.1,
-  // 32-bit wrap), relative to the first packet.
-  var _tsFirst = null, _tsLastRaw = 0, _tsExt = 0;
+  // An EncodedAudioChunk's timestamp is in microseconds (W3C WebCodecs).
+  // The ticks went to the decoder as they were, so 20 ms packets were 960
+  // "µs" apart: the decoded AudioData (and what an echo re-encoded from
+  // them) ran ~21x too slow on the wire — Chrome concealed 98 % of an
+  // echoed stream. The conversion is done where the depacketizer's chunk
+  // comes out (_createTickClock), so the readable carries µs too, and a
+  // frame written back (readable.pipeTo(writable)) is decoded as it is.
   function _toDecoderChunk(chunk) {
-    var raw = chunk.timestamp >>> 0;
-    if (_tsFirst === null) { _tsFirst = raw; _tsLastRaw = raw; _tsExt = 0; }
-    else { _tsExt += ((raw - _tsLastRaw) | 0); _tsLastRaw = raw; }
-    return { type: chunk.type || 'key', data: chunk.data,
-      timestamp: Math.round(_tsExt * 1e6 / codecInfo.clockRate) };
+    return { type: chunk.type || 'key', data: chunk.data, timestamp: chunk.timestamp };
   }
 
   var writable = new WritableStream({
@@ -2015,23 +2259,24 @@ function createAudioReceivePipeline(opts) {
         }
       },
     });
-    decoder.configure({
+    var cfg = {
       codec:            codecInfo.decoderCodec,
       sampleRate:       codecInfo.clockRate,
       numberOfChannels: codecInfo.numberOfChannels,
-      // WebRTC delivers Opus as raw frames in the RTP payload (RFC 7587),
-      // not as an OGG/WebM-wrapped container stream. Tell the decoder
-      // to expect raw frames so it can internally wrap them in OGG
-      // before handing to FFmpeg — FFmpeg's decoder pipeline requires
-      // a container, there is no supported way to feed it raw Opus
-      // packets via stdin directly.
-      rawFrames:        true,
       // s16, not the library's f32 default (Chrome's): half the bytes
       // through the FFmpeg pipes and in every AudioData, for audio that is
       // usually re-encoded right away. Consumers read it through copyTo
       // (any format), so nothing downstream depends on f32.
       outputFormat:     's16',
-    });
+    };
+    // WebRTC delivers Opus as raw frames in the RTP payload (RFC 7587),
+    // not as an OGG/WebM-wrapped container stream. Tell the decoder
+    // to expect raw frames so it can internally wrap them in OGG
+    // before handing to FFmpeg — FFmpeg's decoder pipeline requires
+    // a container, there is no supported way to feed it raw Opus
+    // packets via stdin directly.
+    if (codecName === 'OPUS') cfg.rawFrames = true;
+    decoder.configure(cfg);
   }
 
 
@@ -2203,6 +2448,10 @@ function createVideoReceivePipeline(opts) {
   var decoderConfigured   = false;
   var decoderDims         = null;    // {width,height} the decoder is configured at
   var decoder             = null;    // lazy — built on first write to writable
+  // RTP ticks -> µs (see _createTickClock: every video format clocks at
+  // 90 kHz), and the payload type of the packet being depacketized.
+  var toUs  = _createTickClock(90000);
+  var curPt = null;
 
 
   /* ── Depacketizer ──────────────────────────────────────────────────── */
@@ -2217,8 +2466,14 @@ function createVideoReceivePipeline(opts) {
 
   function _makeDepacketizer() {
    return new codecInfo.Depacketizer({
-    output: function (chunk) {
+    output: function (c) {
       if (stopped) return;
+      // µs, as EncodedVideoChunk and the encoded frame's timestamp are (W3C
+      // WebCodecs, webrtc-encoded-transform); the ticks went to the decoder
+      // as microseconds, so every decoded VideoFrame's timestamp ran 11x
+      // slow (90 000 a second). The RTP timestamp stays in the metadata.
+      var chunk = { type: c.type, data: c.data, timestamp: toUs(c.timestamp),
+                    rtpTimestamp: c.timestamp >>> 0, payloadType: curPt };
 
       // framesReceived (W3C webrtc-stats, video inbound-rtp): "total
       // number of complete frames received on this RTP stream". This is
@@ -2301,6 +2556,7 @@ function createVideoReceivePipeline(opts) {
     output:  function (parsedPacket) {
       if (stopped) return;
       if (!_followPayloadType(parsedPacket.payloadType)) return;
+      curPt = parsedPacket.payloadType;
       try { depacketizer.depacketize(parsedPacket); }
       catch (e) { /* depacketizer already reports via error callback */ }
     },
@@ -2364,13 +2620,15 @@ function createVideoReceivePipeline(opts) {
     // Build an RTCEncodedVideoFrame-ish object per spec shape.
     var encoded = {
       type:      chunk.type,              // 'key' | 'delta'
-      timestamp: chunk.timestamp,          // microseconds (monotonic)
+      timestamp: chunk.timestamp,          // microseconds (see _createTickClock)
       data:      chunk.data,               // Buffer (user can view as ArrayBuffer)
       getMetadata: function () {
         return {
           synchronizationSource: ssrc,
-          payloadType:           chunk.payloadType || 96,
+          // the packet's own (it was always 96, whatever was negotiated)
+          payloadType:           chunk.payloadType,
           contributingSources:   [],
+          rtpTimestamp:          chunk.rtpTimestamp,
           // TODO: width, height, frameId, dependencies, spatialIndex, temporalIndex
         };
       },

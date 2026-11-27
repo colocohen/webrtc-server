@@ -11,6 +11,7 @@ import { EventEmitter } from 'node:events';
 import { DTLSSession } from 'lemon-tls';
 import { pem as PEM } from 'cryptographic-formats';
 import * as SDP from './sdp.js';
+import * as CodecSupport from './codec_support.js';
 import { IceAgent } from 'turn-server';
 import { SctpAssociation } from './sctp.js';
 
@@ -149,6 +150,14 @@ var DEPACKETIZERS = {
 
 var MEDIA_STALL_MUTE_MS = parseInt(process.env.WEBRTC_MEDIA_STALL_MS || '3000', 10);
 
+// config.startBitrate: a positive number of bits per second, clamped into
+// the estimator's bounds (50 kbps .. 10 Mbps); anything else keeps the
+// default 500 kbps.
+function _startBitrate(v) {
+  if (typeof v !== 'number' || !(v > 0) || !isFinite(v)) return 500 * 1000;
+  return Math.min(10 * 1000 * 1000, Math.max(50 * 1000, Math.round(v)));
+}
+
 function ConnectionManager(config) {
   try {
     if (process.env.WEBRTC_DEBUG === '1' || process.env.WEBRTC_DEBUG === 'true') {
@@ -239,6 +248,11 @@ function ConnectionManager(config) {
     bundlePolicy: config.bundlePolicy || 'balanced',
     mode: resolvedMode,
     announcedAddresses: config.announcedAddresses || null,
+    // Non-standard: the application forwards / supplies encoded media
+    // itself (an SFU, createEncodedStreams), so every codec the RTP layer
+    // can packetize is negotiated, not only those media-processing can
+    // encode and decode (codec_support.js).
+    passthroughCodecs: !!config.passthroughCodecs,
 
     // Identity
     // JSEP (RFC 8829 §5.2.1): <sess-id> MUST be representable by a
@@ -300,6 +314,21 @@ function ConnectionManager(config) {
     // was supplied) — all of them go into the SDP; see api.js.
     localFingerprints: (config && config._certificateFingerprints) || null,
     remoteFingerprint: null,
+    // Every a=fingerprint of the remote transport section (RFC 8122 §5.1).
+    remoteFingerprints: null,
+    // Our a=tls-id (RFC 8842 §4): generated with the first description, kept
+    // while the DTLS association continues. pendingLocalTlsId is the new
+    // value an answer to an offer asking for a new association carries,
+    // until that answer commits (sdp_offer_answer _commitDescription).
+    localTlsId: null,
+    pendingLocalTlsId: null,
+    // A remote description asked for a new DTLS association (a changed
+    // fingerprint set or a=tls-id, with an ICE restart): it is brought up
+    // when the negotiation completes (onAnswerCommitted → renewDtlsAssociation).
+    dtlsRenewPending: false,
+    // The new association waits for the ICE restart's first selected pair
+    // (see renewDtlsAssociation).
+    dtlsAwaitNewPair: false,
     dtlsSession: null,
     dtlsBuffer: [],
 
@@ -394,7 +423,14 @@ function ConnectionManager(config) {
     // value. Exposed via getEstimatedBandwidth() so api.js and user code
     // can react by re-configuring encoders.
     bandwidthEstimator: new BandwidthEstimator({
-      startBps: 500 * 1000,         // 500 kbps initial estimate
+      // Non-standard config.startBitrate (bps): where the estimate starts
+      // before any feedback, within the bounds below. An SFU knows a
+      // better starting point than our 500 kbps (mediasoup's
+      // initialAvailableOutgoingBitrate, 600 kbps by default): from too
+      // low a start its viewers begin on a low simulcast layer and climb
+      // through a keyframe per layer, slowly while the loss rule holds
+      // the estimate (loss between 2 and 10 %).
+      startBps: _startBitrate(config.startBitrate),
       minBps:   50 * 1000,          // never go below 50 kbps
       maxBps:   10 * 1000 * 1000,   // cap at 10 Mbps (well above VP8 typical max)
     }),
@@ -442,15 +478,17 @@ function ConnectionManager(config) {
     // NACK generators — receive-side counterpart to the SenderBuffer/
     // RtxStream/NackThrottle trio above. One generator per primary
     // incoming SSRC, populated lazily in handleIncomingRtp when a packet
-    // on a non-RTX SSRC arrives. Drained every nackFeedbackIntervalMs
-    // (same cadence as transport-cc, since both are fast-feedback).
+    // on a non-RTX SSRC arrives. A gap's first NACK goes out from the
+    // receive path; retries are drained every nackFeedbackIntervalMs
+    // (mediasoup's NackGenerator timer, 40 ms; libwebrtc's is 20 ms), so a
+    // retry leaves within that much of its round trip.
     //
     // The generator owns its own gap detection, RTT-aware retry timing,
     // reordering tolerance (libwebrtc-style histogram), and PLI
     // escalation logic. The drain timer just reads its 16-bit seq list
     // and ships it as RTCP NACK; no wire-format knowledge here.
     nackGenerators: {},
-    nackFeedbackIntervalMs: 100,
+    nackFeedbackIntervalMs: 40,
     // Track the transport-cc RTP header extension ID negotiated *by the
     // remote* (may differ from the one we stamp on outgoing packets).
     // Set from SDP on each setRemoteDescription; null means no transport-cc
@@ -467,6 +505,10 @@ function ConnectionManager(config) {
     // first observed value per SSRC.
     remoteRidExtId:         null,
     remoteRepairedRidExtId: null,
+    // The peer's a=rtcp-rsize (RFC 5506 §5), from its transport section on
+    // each setRemoteDescription: reduced-size RTCP negotiated. Without it
+    // every RTCP packet we send is a compound one (RFC 3550 §6.1).
+    remoteRtcpRsize:        false,
 
     // Playout telemetry — per-kind ('audio', 'video') aggregates populated
     // by receive pipelines when the decoder emits frames/audioData. Used
@@ -515,6 +557,9 @@ function ConnectionManager(config) {
         state.localGatheredCandidates = [];
       }
       if (iceRestart && iceAgent && typeof iceAgent.restart === 'function') {
+        // A new path may end what stopped the RTP circuit breakers (RFC
+        // 8083 §4.5: the flow "would traverse a different path").
+        mediaTransport.resetCircuitBreakers();
         iceAgent.restart();
         iceAgent.setLocalParameters({
           ufrag: state.localIceUfrag,
@@ -555,7 +600,12 @@ function ConnectionManager(config) {
       ensureFingerprint();
       prepareIceForSdp();
       cb(null, {
-        setup:          setupForRole() || 'actpass',
+        // RFC 9429 5.2.1 "The role value in the offer MUST be actpass", for
+        // subsequent offers too (5.2.2; RFC 8842 §5.5: "the offerer MUST
+        // insert ... an actpass attribute value"). Re-offers carried our
+        // role (active / passive). The answer keeps the role of a continued
+        // association (5.3.2), checked when it is applied.
+        setup:          'actpass',
         // Candidates to embed at SDP-build time. Lite: the agent's sync
         // gather result (unchanged behavior). Full: the roster gathered
         // so far — JSEP §5.2.2 requires subsequent offers to carry every
@@ -640,6 +690,7 @@ function ConnectionManager(config) {
       ensureIceCredentials(_remoteRestart);
       if (_remoteRestart) {
         state.localGatheredCandidates = [];
+        mediaTransport.resetCircuitBreakers();   // a new path (see above)
         if (iceAgent && typeof iceAgent.restart === 'function') {
           iceAgent.restart();
           iceAgent.setLocalParameters({
@@ -660,6 +711,11 @@ function ConnectionManager(config) {
           }
           for (var _rci = 0; _rci < state.remoteCandidates.length; _rci++) {
             iceAgent.addRemoteCandidate(state.remoteCandidates[_rci]);
+          }
+          // ... and the end-of-candidates that came before createAnswer (in
+          // the offer, or trickled — restart() cleared the agent's).
+          if (TransportController.remoteEndOfCandidates(state.parsedRemoteSdp, state.transportMid)) {
+            iceAgent.addRemoteCandidate(null);
           }
           // AND GATHER. Same omission the offer path had (fix 42): restart()
           // only arms the agent. Without this the ANSWERER of a restart
@@ -721,6 +777,9 @@ function ConnectionManager(config) {
      * Used by setRemoteDescription so its handler sees the transceivers
      * the description created (see the note in setState).
      */
+    // An offer applied over a pending one (no signalingState change, so
+    // no cascade): its transceivers are associated all the same.
+    markAssociated: function () { _markAssociatedFromApplied(); },
     holdSignalingEvent: function () { state._holdSignalingEvent = true; },
     /**
      * Run the retirement sweep NOW. Called at the end of a description
@@ -812,7 +871,17 @@ function ConnectionManager(config) {
     // for its answer? The peer may already have moved — and aborted the
     // old SCTP association — before that answer reaches us.
     isTransportMoveExpected:     function () {
-      if (state.signalingState !== 'have-local-offer' || state.transportMid == null) return false;
+      // A NEW DTLS ASSOCIATION MAY FOLLOW TOO (renewDtlsAssociation): a
+      // remote offer that asked for one, not answered yet, or our pending
+      // ICE restart offer, whose answer may come from a new peer (a
+      // handover, RFC 9429 5.11). The old peer, closing, ABORTs the old
+      // association first; the answer decides as for a move.
+      if (state.dtlsRenewPending) return true;
+      if (state.signalingState !== 'have-local-offer') return false;
+      var _lt = TransportController.transportSection(state.parsedLocalSdp);
+      var _ct = TransportController.transportSection(state.parsedCurrentLocalSdp);
+      if (_lt && _ct && _lt.iceUfrag && _ct.iceUfrag && _lt.iceUfrag !== _ct.iceUfrag) return true;
+      if (state.transportMid == null) return false;
       var next = TransportController.bundleTransportMid(state.parsedLocalSdp);
       return next != null && next !== state.transportMid;
     },
@@ -1263,6 +1332,9 @@ function ConnectionManager(config) {
       // listeners work regardless of whether they subscribed before or after
       // the ICE agent was created.
       ev.emit('selectedcandidatepairchange', pair);
+      // The ICE restart a new DTLS association waited for has its pair: the
+      // cascade (3) starts the handshake on it.
+      if (state.dtlsAwaitNewPair) setState({ dtlsAwaitNewPair: false });
     });
 
     // Agent emits 'candidateerror' when srflx/relay gathering fails (STUN
@@ -1406,6 +1478,10 @@ function ConnectionManager(config) {
     }
     for (var i = 0; i < state.remoteCandidates.length; i++) {
       iceAgent.addRemoteCandidate(state.remoteCandidates[i]);
+    }
+    // ... and an end-of-candidates already signalled (see remoteEndOfCandidates).
+    if (TransportController.remoteEndOfCandidates(state.parsedRemoteSdp, state.transportMid)) {
+      iceAgent.addRemoteCandidate(null);
     }
 
     return iceAgent;
@@ -2112,7 +2188,7 @@ function ConnectionManager(config) {
     // 3. DTLS: ICE connected + role known → start handshake
     //    Trigger: ICE agent emits 'connected'
     if ((state.iceConnectionState === 'connected' || state.iceConnectionState === 'completed') &&
-        state.dtlsState === 'new' && state.dtlsRole !== null) {
+        state.dtlsState === 'new' && state.dtlsRole !== null && !state.dtlsAwaitNewPair) {
       setState({ dtlsState: 'connecting' });
       startDtls();
     }
@@ -2241,12 +2317,12 @@ function ConnectionManager(config) {
 
   /* ====================== SDP Operations ====================== */
 
-  // Map our stored DTLS role → the a=setup value to put in SDP.
-  // Returns null if we don't have a role yet (first offer), so the caller can
-  // fall back to 'actpass' or resolveSetup(remote).
+  // Map our stored DTLS role → the a=setup value to put in an ANSWER.
+  // Returns null if we don't have a role yet, so the caller can fall back to
+  // resolveSetup(remote). Offers are always actpass (prepareForCreateOffer).
   //
-  // Once DTLS is established, we MUST keep using the same role forever (RFC
-  // 8842). Otherwise Chrome throws:
+  // A continued association keeps its roles in every answer (JSEP 5.3.2,
+  // RFC 8842 §5.3). Otherwise Chrome throws:
   //   "Failed to set SSL role for the transport"
   function setupForRole() {
     return TransportController.dtlsRoleForSdp(state);
@@ -2502,7 +2578,8 @@ function ConnectionManager(config) {
       for (var i = 0; i < state.transceivers.length; i++) {
         var tc = state.transceivers[i];
         var tr = tc.receiver && tc.receiver.track;
-        if (!tr || tr.muted === true) continue;
+        // (an ended track is not muted again: see the recvonly branch)
+        if (!tr || tr.muted === true || tr.readyState === 'ended') continue;
         var _dir = tc.currentDirection || tc.direction || '';
         if (_dir !== 'sendrecv' && _dir !== 'recvonly') continue;   // negotiation owns it
         // When did this transceiver last see a packet? Scan its remote SSRCs.
@@ -2734,13 +2811,31 @@ function ConnectionManager(config) {
     // sha-1 is technically still allowed by RFC 8122 but actively
     // discouraged — Chrome announces sha-256 by default. We support it
     // here for interop with legacy peers but don't recommend it.
-    var algo = String(state.remoteFingerprint.algorithm || '').toLowerCase();
-    var hashFn = null;
-    if      (algo === 'sha-256') hashFn = sha256_sync;
-    else if (algo === 'sha-384') hashFn = sha384_sync;
-    else if (algo === 'sha-512') hashFn = sha512_sync;
-    else if (algo === 'sha-1')   hashFn = sha1_sync;
-    else return { ok: false, reason: 'unsupported fingerprint algorithm: ' + algo };
+    //
+    // SEVERAL FINGERPRINTS (RFC 8122 §5.1): a peer with several
+    // certificates announces one a=fingerprint per certificate (and per
+    // hash function). "An endpoint MUST select the set of fingerprints that
+    // use its most preferred hash function (out of those offered by the
+    // peer) and verify that each certificate used matches one fingerprint
+    // out of that set." Only the last line was checked, so a peer that
+    // presented its other certificate failed DTLS. Preference: the
+    // strongest hash we have.
+    var HASH_PREF = [['sha-512', sha512_sync], ['sha-384', sha384_sync],
+                     ['sha-256', sha256_sync], ['sha-1', sha1_sync]];
+    var announced = (state.remoteFingerprints && state.remoteFingerprints.length)
+      ? state.remoteFingerprints : [state.remoteFingerprint];
+    var algo = null, hashFn = null;
+    for (var hp = 0; hp < HASH_PREF.length && !hashFn; hp++) {
+      for (var ai = 0; ai < announced.length; ai++) {
+        if (String(announced[ai] && announced[ai].algorithm || '').toLowerCase() === HASH_PREF[hp][0]) {
+          algo = HASH_PREF[hp][0]; hashFn = HASH_PREF[hp][1]; break;
+        }
+      }
+    }
+    if (!hashFn) {
+      return { ok: false, reason: 'unsupported fingerprint algorithm: ' +
+               String(state.remoteFingerprint.algorithm || '').toLowerCase() };
+    }
 
     // Compute the digest and format as colon-separated hex (RFC 8122 §5).
     var digest = hashFn(leafDer);
@@ -2751,20 +2846,21 @@ function ConnectionManager(config) {
     }
     var computedFp = parts.join(':').toUpperCase();
 
-    // Normalize announced value — strip whitespace, uppercase.
-    var announcedFp = String(state.remoteFingerprint.value || '')
-      .toUpperCase()
-      .replace(/\s+/g, '');
-
-    if (computedFp !== announcedFp) {
-      return {
-        ok: false,
-        reason: 'fingerprint mismatch (algo=' + algo +
-                ' computed=' + computedFp.substring(0, 17) + '...' +
-                ' announced=' + announcedFp.substring(0, 17) + '...)',
-      };
+    // Normalize each announced value of the selected hash — strip
+    // whitespace, uppercase — and look for ours among them.
+    var announcedFp = null;
+    for (var fi = 0; fi < announced.length; fi++) {
+      if (String(announced[fi] && announced[fi].algorithm || '').toLowerCase() !== algo) continue;
+      var v = String(announced[fi].value || '').toUpperCase().replace(/\s+/g, '');
+      if (v === computedFp) return { ok: true };
+      if (announcedFp === null) announcedFp = v;
     }
-    return { ok: true };
+    return {
+      ok: false,
+      reason: 'fingerprint mismatch (algo=' + algo +
+              ' computed=' + computedFp.substring(0, 17) + '...' +
+              ' announced=' + announcedFp.substring(0, 17) + '...)',
+    };
   }
 
 
@@ -2780,8 +2876,72 @@ function ConnectionManager(config) {
     var change = TransportController.transportOwnerChange(state.transportMid, parsed);
     var owner = TransportController.bundleTransportMid(parsed);
     if (owner != null) state.transportMid = owner;
-    if (change) migrateTransport(change);
+    // The a=tls-id our answer carried for a new association is the one in
+    // use from now on (RFC 8842 §5.3).
+    if (state.pendingLocalTlsId) {
+      state.localTlsId = state.pendingLocalTlsId;
+      state.pendingLocalTlsId = null;
+    }
+    var renew = state.dtlsRenewPending;
+    state.dtlsRenewPending = false;
+    if (change) migrateTransport(change);   // a new association there too
+    else if (renew) renewDtlsAssociation();
     else dcController.abandonParked();   // an ABORT parked for a move that did not happen
+  }
+
+  /**
+   * Tear the DTLS association down and bring up a new one on the same
+   * transport: the negotiation that just completed changed the peer's
+   * fingerprint set or its a=tls-id, together with an ICE restart
+   * (sdp_offer_answer refuses the change without one).
+   *
+   * RFC 9429 (JSEP) 5.11: "If the remote DTLS fingerprint has been changed
+   * or the value of the a=tls-id attribute has changed, tear down the DTLS
+   * connection" and "If no valid DTLS connection exists, prepare to start a
+   * DTLS connection, using the specified roles and fingerprints, on any
+   * underlying ICE components, once they are active." RFC 8842 §5.4: the
+   * offerer that becomes the DTLS client establishes it, a server waits for
+   * the ClientHello. The typical case is a handover: the same offerer, a new
+   * answerer with its own certificate (WPT protocol/handover-*).
+   *
+   * As migrateTransport, without its ICE recheck (the ICE restart is under
+   * way): the old session closed (close_notify) and its handlers made inert,
+   * SRTP off until the new keys, dtlsState back to 'new', a new SCTP
+   * association with the data channels kept. The new handshake waits for
+   * the restart's first selected pair (IceAgent.restart keeps the old pair
+   * for media meanwhile, and reports 'connected' on it): a first flight sent
+   * over the old pair goes to the old peer.
+   */
+  function renewDtlsAssociation() {
+    if (state.closed || state._pcClosing) return;
+    _diag('[cm-diag] new DTLS association (remote fingerprint / tls-id changed ' +
+          'with an ICE restart; dtlsState was ' + state.dtlsState + ')');
+    _dropDtlsAssociation();
+    state.remoteCertificates = null;
+    var upd = {};
+    if (iceAgent && !iceAgent.selectedPair) upd.dtlsAwaitNewPair = true;
+    if (state.dtlsState !== 'new') upd.dtlsState = 'new';
+    setState(upd);
+    dcController.moveToNewTransport();
+  }
+
+  // The DTLS association's teardown, shared by migrateTransport and
+  // renewDtlsAssociation: the old session dropped first (from here its
+  // handlers are inert — the identity guards in startDtls) and closed, its
+  // buffered datagrams with it, and SRTP off until the new handshake's keys.
+  function _dropDtlsAssociation() {
+    var old = state.dtlsSession;
+    if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
+    if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
+    state.dtlsSession = null;
+    state.dtlsBuffer = [];
+    if (old) { try { old.close(); } catch (e) {} }
+
+    mediaTransport.stopTimers();
+    state.srtpSession = null;
+    state.srtpKeys = null;
+    state.srtpState = 'new';
+    state.negotiatedSrtpProfile = null;   // the new handshake negotiates it again
   }
 
   /**
@@ -2846,18 +3006,7 @@ function ConnectionManager(config) {
     // tag's set the live one, which then reports the new handshake.
     try { ev.emit('transport:moving', { from: change.from, to: change.to }); } catch (e) {}
 
-    var old = state.dtlsSession;
-    if (state._dtlsWatchdog) { clearTimeout(state._dtlsWatchdog); state._dtlsWatchdog = null; }
-    if (state._dtlsReconcileTimer) { clearInterval(state._dtlsReconcileTimer); state._dtlsReconcileTimer = null; }
-    state.dtlsSession = null;          // from here the old session's handlers are inert
-    state.dtlsBuffer = [];
-    if (old) { try { old.close(); } catch (e) {} }
-
-    mediaTransport.stopTimers();
-    state.srtpSession = null;
-    state.srtpKeys = null;
-    state.srtpState = 'new';
-    state.negotiatedSrtpProfile = null;   // the new handshake negotiates it again
+    _dropDtlsAssociation();
 
     // ICE: start checking afresh against the new transport's candidates
     // only (IceAgent.recheck — same credentials, no restart). The old
@@ -3093,6 +3242,129 @@ function ConnectionManager(config) {
     _flushCodecNegotiated();
   }
 
+  // The remote SSRCs of one m-section (a=ssrc, the FID / FEC-FR groups, the
+  // SIM group's rids) into remoteSsrcMap. onlyNew: a section whose receiver
+  // already exists — only SSRCs not mapped yet, the entries in use (and what
+  // the data plane learned on them) left alone.
+  function _mapRemoteSsrcs(m, transceiver, receiver, onlyNew) {
+    // Map SSRCs
+    var _fresh = {};   // the SSRCs this pass maps (onlyNew: the unmapped ones)
+    for (var s = 0; s < m.ssrcs.length; s++) {
+      if (onlyNew && state.remoteSsrcMap[m.ssrcs[s].id]) continue;
+      _fresh[m.ssrcs[s].id] = true;
+      state.remoteSsrcMap[m.ssrcs[s].id] = {
+        mid: m.mid, transceiver: transceiver, receiver: receiver,
+        isRtx: false,   // primary by default; RTX entries overwrite below
+        rid:   null,    // filled in below when simulcast is declared
+      };
+    }
+    for (var g = 0; g < m.ssrcGroups.length; g++) {
+      var group = m.ssrcGroups[g];
+      if (onlyNew && !_fresh[group.ssrcs[1]]) continue;
+      if (group.semantics === 'FID' && group.ssrcs.length >= 2) {
+        // Second SSRC in an FID group is the RTX (retransmission) stream.
+        // It carries the same video payload wrapped in RTP PT rtx (RFC 4588).
+        // We still map it so we can route RTX packets later (Phase 6),
+        // but mark it so RTCRtpReceiver doesn't pick it as the primary.
+        //
+        // primarySsrc is recorded directly from the FID group's first
+        // SSRC. The data plane (media_transport.js's _handleIncomingRtpInner)
+        // checks `_mapping.primarySsrc` first and only falls back to the
+        // findPrimaryForRtx scan if the field is null — so for any RTX
+        // stream declared via ssrc-group:FID in the offer, recovery is
+        // O(1) per packet. Without this stamp, non-simulcast RTX would
+        // route through findPrimaryForRtx which historically required
+        // rid != null and silently failed for plain (non-simulcast)
+        // Chrome offers; the fallback now handles non-simulcast too,
+        // but caching here is both faster and makes the data plane's
+        // intent explicit.
+        state.remoteSsrcMap[group.ssrcs[1]] = {
+          mid: m.mid, transceiver: transceiver, receiver: receiver,
+          isRtx: true,
+          rid:   null,
+          primarySsrc: group.ssrcs[0],
+        };
+      } else if (group.semantics === 'FEC-FR' && group.ssrcs.length >= 2) {
+        // Second SSRC in an FEC-FR group is the FlexFEC stream (flexfec-03
+        // / RFC 5956). Mapped above as a primary, like any a=ssrc, it was
+        // one: RTCRtpReceiver took the lowest-numbered "primary" of the
+        // mid, so whenever the FEC SSRC was the smaller number (5 runs in 8
+        // with Chrome's FlexFEC on) the receiver locked onto the FEC
+        // stream and never saw a frame; findPrimaryForRtx's "exactly one
+        // primary" fallback found two and gave up. FEC packets themselves
+        // are recognised by payload type in media_transport; this entry
+        // only says what the SSRC is, so nothing takes it for media.
+        state.remoteSsrcMap[group.ssrcs[1]] = {
+          mid: m.mid, transceiver: transceiver, receiver: receiver,
+          isRtx: false,
+          isFec: true,
+          rid:   null,
+          protectedSsrc: group.ssrcs[0],
+        };
+      }
+    }
+
+    // Simulcast SSRC→RID inference (RFC 8853 / Chrome-style SDP).
+    // Publisher's offer typically declares:
+    //   a=ssrc-group:SIM <s1> <s2> <s3>     — the primary SSRCs in simulcast order
+    //   a=simulcast:send l;m;h              — the RID list in the matching order
+    // We pair them by index: s1↔l, s2↔m, s3↔h. This lets the receiver
+    // pre-populate SSRC→RID on the map; packets also carry the RID in
+    // the rtp-stream-id extension at runtime so we could reconcile
+    // later if a mismatch is detected.
+    //
+    // If either SIM or simulcast is missing, we leave rid=null and
+    // fall back to the single-layer path (one primary SSRC per mid).
+    var simGroup = null;
+    for (var gi = 0; gi < m.ssrcGroups.length; gi++) {
+      if (m.ssrcGroups[gi].semantics === 'SIM') {
+        simGroup = m.ssrcGroups[gi];
+        break;
+      }
+    }
+    if (simGroup && m.simulcast) {
+      // Peer's direction in their offer is 'send'; in their answer they
+      // echo 'recv'. Either way the RID list ordering is the same.
+      var ridList = null;
+      if (m.simulcast.dir1 === 'send' || m.simulcast.dir1 === 'recv') {
+        ridList = m.simulcast.list1 || '';
+      } else if (m.simulcast.dir2 === 'send' || m.simulcast.dir2 === 'recv') {
+        ridList = m.simulcast.list2 || '';
+      } else {
+        ridList = '';
+      }
+      // Strip ~ (paused) prefix; split by ; (simulcast streams); ignore
+      // alternative groups (,) for RID inference.
+      var ridsInOrder = ridList.split(';').map(function (r) {
+        r = r.trim();
+        if (r.charAt(0) === '~') r = r.slice(1);
+        // Alternative groups use ',' — take the first alternative.
+        var comma = r.indexOf(',');
+        return comma >= 0 ? r.slice(0, comma).trim() : r;
+      }).filter(function (r) { return !!r; });
+
+      var simSsrcs = simGroup.ssrcs;
+      for (var si = 0; si < simSsrcs.length && si < ridsInOrder.length; si++) {
+        var primarySsrc = simSsrcs[si];
+        var rid = ridsInOrder[si];
+        if (state.remoteSsrcMap[primarySsrc] && (!onlyNew || _fresh[primarySsrc])) {
+          state.remoteSsrcMap[primarySsrc].rid = rid;
+        }
+        // Also tag the paired RTX SSRC so stats can attribute correctly.
+        for (var gi2 = 0; gi2 < m.ssrcGroups.length; gi2++) {
+          var fg = m.ssrcGroups[gi2];
+          if (fg.semantics !== 'FID') continue;
+          if (fg.ssrcs[0] === primarySsrc && fg.ssrcs.length >= 2) {
+            if (state.remoteSsrcMap[fg.ssrcs[1]] && (!onlyNew || _fresh[fg.ssrcs[1]])) {
+              state.remoteSsrcMap[fg.ssrcs[1]].rid = rid;
+            }
+          }
+        }
+      }
+    }
+
+  }
+
   function processRemoteMedia(parsed, descType) {
     try { _processRemoteMedia(parsed, descType); }
     finally { _flushCodecNegotiated(); }
@@ -3309,12 +3581,20 @@ function ConnectionManager(config) {
           // media on it — W3C 5.3 keeps a remote track muted until media
           // actually arrives. The unmute lives on the first-packet path
           // (see _unmuteReceiverForSsrc).
-          ev.emit('track:new', {
+          // TRACK EVENTS FOLLOW THE STATE EVENT (W3C 4.4.1.6): buffered
+          // while signalingstatechange is held, as the other track paths.
+          // Emitted inline, this one came before signalingstatechange.
+          var _upPayload = {
             mid: m.mid, kind: m.type,
             transceiver: existing,               // the handler REQUIRES this
             track: existing.receiver.track, stream: _upStream,
             streamsAnnounced: (_upAll.length > 1) ? _upAll : null,
-          });
+          };
+          if (state._holdSignalingEvent) {
+            (state._pendingTrackEvents = state._pendingTrackEvents || []).push(_upPayload);
+          } else {
+            ev.emit('track:new', _upPayload);
+          }
         } catch (eUp) {}
       }
 
@@ -3322,43 +3602,40 @@ function ConnectionManager(config) {
       // (fmtp apt=). Remember it for every m-section, so an incoming RTX
       // packet is unwrapped with the payload type it actually carries —
       // not whatever the primary stream's first packet happened to use.
-      if (Array.isArray(m.fmtp)) {
+      // (sdp.js puts the pairing on m.codecs: codec.rtxPayloadType is the
+      // RTX payload type whose apt= names codec.payloadType. The section has
+      // no fmtp / rtp arrays — reading those, this never ran.)
+      if (Array.isArray(m.codecs)) {
         if (!state.remoteRtxApt) state.remoteRtxApt = {};
-        for (var _af = 0; _af < m.fmtp.length; _af++) {
-          var _aptM = /(?:^|;)\s*apt=(\d+)/.exec(m.fmtp[_af].config || '');
-          if (_aptM) state.remoteRtxApt[m.fmtp[_af].payload] = parseInt(_aptM[1], 10);
+        for (var _af = 0; _af < m.codecs.length; _af++) {
+          var _ac = m.codecs[_af];
+          if (_ac && _ac.rtxPayloadType != null && _ac.payloadType != null) {
+            state.remoteRtxApt[_ac.rtxPayloadType] = _ac.payloadType;
+          }
         }
       }
 
       // Negotiated-RTX override (code-review finding: the birth-time
       // setRtxMapping assumes PT 96/97; the comment there promised "the
-      // remoteSDP parser overrides these" — this IS that override, which
-      // did not previously exist). Once the remote description names the
-      // actual apt pairing for this m-section, re-register every video
-      // layer's RTX mapping with the negotiated rtx payload type.
-      // Idempotent: runs on every SRD, so renegotiations stay correct.
-      // Falls through silently when no apt is found (keeps the default).
+      // remoteSDP parser overrides these" — this IS that override). Once the
+      // remote description names the actual apt pairing for this m-section,
+      // re-register every video layer's RTX mapping with the negotiated rtx
+      // payload type. Idempotent: runs on every SRD, so renegotiations stay
+      // correct. Falls through silently when no apt is found.
       if (existing && m.type === 'video' && existing.sender &&
-          existing.sender.layers && Array.isArray(m.rtp)) {
-        var _rtxPtByApt = {};
-        if (Array.isArray(m.fmtp)) {
-          for (var _fi = 0; _fi < m.fmtp.length; _fi++) {
-            var _am = /(?:^|;)\s*apt=(\d+)/.exec(m.fmtp[_fi].config || '');
-            if (_am) _rtxPtByApt[parseInt(_am[1], 10)] = m.fmtp[_fi].payload;
-          }
-        }
-        // Our sender's primary pt on this m-line: the remote's pt for our
-        // codec (offer/answer intersection — the wire pt follows the
-        // remote's numbering).
-        var _primaryPt = null;
-        for (var _ri = 0; _ri < m.rtp.length; _ri++) {
-          var _cn = (m.rtp[_ri].codec || '').toLowerCase();
+          existing.sender.layers && Array.isArray(m.codecs)) {
+        // Our sender's primary pt on this m-line: the remote's first video
+        // codec (the wire pt follows the remote's numbering), and the RTX
+        // payload type paired with it.
+        var _primaryPt = null, _negRtxPt = null;
+        for (var _ri = 0; _ri < m.codecs.length; _ri++) {
+          var _cn = (m.codecs[_ri].name || '').toLowerCase();
           if (_cn === 'vp8' || _cn === 'vp9' || _cn === 'h264' || _cn === 'h265' || _cn === 'av1') {
-            _primaryPt = m.rtp[_ri].payload;
+            _primaryPt = m.codecs[_ri].payloadType;
+            _negRtxPt = (m.codecs[_ri].rtxPayloadType != null) ? m.codecs[_ri].rtxPayloadType : null;
             break;   // first video codec in the remote's preference order
           }
         }
-        var _negRtxPt = (_primaryPt != null) ? _rtxPtByApt[_primaryPt] : null;
         if (_negRtxPt != null) {
           for (var _li = 0; _li < existing.sender.layers.length; _li++) {
             var _L = existing.sender.layers[_li];
@@ -3488,11 +3765,25 @@ function ConnectionManager(config) {
             // dispatching a second time.
             try { _uaRemoveTrack(_rmStream, _rmTrack); } catch (eRm) {}
           }
-          if (_rmTrack.muted !== true) {
+          // An ENDED track is not muted again (mediacapture-main "set a
+          // track's muted state": abort when readyState is 'ended'): a
+          // transceiver stopped here ended its track, and the peer's
+          // recvonly re-offer fired 'mute' on it.
+          if (_rmTrack.muted !== true && _rmTrack.readyState !== 'ended') {
             _rmTrack.muted = true;
             try { _rmTrack.dispatchEvent && _rmTrack.dispatchEvent({ type: 'mute' }); } catch (eMu) {}
           }
           existing._trackSurfaced = false;
+        }
+        // A NEW SENDER ON THE SECTION. The peer's SSRCs can change across a
+        // renegotiation — a handover to a new answerer (WPT protocol/
+        // handover-*: a new association and a new sender for the same mid),
+        // or a peer that replaced its sender — and the receiver must demux
+        // them (RFC 8843 §9.2: an SSRC the description declares belongs to
+        // its section). This path skipped the mapping, so the new SSRC was
+        // an unknown stream: no mid, its packets reported as 'video'.
+        if (_stillSends && m.port !== 0) {
+          _mapRemoteSsrcs(m, existing, state.mediaReceivers[m.mid] || null, true);
         }
         continue;
       }
@@ -3545,9 +3836,15 @@ function ConnectionManager(config) {
       var _recvCodecs = null;
       if (descType === 'offer' && (m.type === 'audio' || m.type === 'video') && m.codecs) {
         var _offerTc = findTransceiverByMid(m.mid);
-        var _ansCodecs = _primaryCodecs(SDP.answerCodecs(m,
+        // The direction our answer would have now (buildAnswer's inputs),
+        // for the codecs usable that way (codec_support.js).
+        var _ansDir = SDP.computeAnswerDirection(m.direction,
+          !!(_offerTc && _offerTc.sender && _offerTc.sender.track),
+          (_offerTc && _offerTc.direction) || null);
+        var _ansCodecs = _primaryCodecs(SDP.answerSection(m, _ansDir,
           m.type === 'audio' ? SDP.DEFAULT_AUDIO_CODECS : SDP.DEFAULT_VIDEO_CODECS,
-          (_offerTc && _offerTc._codecPreferences && _offerTc._codecPreferences.length) ? _offerTc._codecPreferences : null));
+          CodecSupport.answerTables(!!state.passthroughCodecs),
+          (_offerTc && _offerTc._codecPreferences && _offerTc._codecPreferences.length) ? _offerTc._codecPreferences : null).codecs);
         if (_ansCodecs.length) {
           _recvCodecs = _ansCodecs;                                      // our answer's order
           _senderCodecs = _inOrderOf(_primaryCodecs(_senderCodecs), _ansCodecs);   // the offer's
@@ -3837,117 +4134,7 @@ function ConnectionManager(config) {
         }
       }
 
-      // Map SSRCs
-      for (var s = 0; s < m.ssrcs.length; s++) {
-        state.remoteSsrcMap[m.ssrcs[s].id] = {
-          mid: m.mid, transceiver: transceiver, receiver: receiver,
-          isRtx: false,   // primary by default; RTX entries overwrite below
-          rid:   null,    // filled in below when simulcast is declared
-        };
-      }
-      for (var g = 0; g < m.ssrcGroups.length; g++) {
-        var group = m.ssrcGroups[g];
-        if (group.semantics === 'FID' && group.ssrcs.length >= 2) {
-          // Second SSRC in an FID group is the RTX (retransmission) stream.
-          // It carries the same video payload wrapped in RTP PT rtx (RFC 4588).
-          // We still map it so we can route RTX packets later (Phase 6),
-          // but mark it so RTCRtpReceiver doesn't pick it as the primary.
-          //
-          // primarySsrc is recorded directly from the FID group's first
-          // SSRC. The data plane (media_transport.js's _handleIncomingRtpInner)
-          // checks `_mapping.primarySsrc` first and only falls back to the
-          // findPrimaryForRtx scan if the field is null — so for any RTX
-          // stream declared via ssrc-group:FID in the offer, recovery is
-          // O(1) per packet. Without this stamp, non-simulcast RTX would
-          // route through findPrimaryForRtx which historically required
-          // rid != null and silently failed for plain (non-simulcast)
-          // Chrome offers; the fallback now handles non-simulcast too,
-          // but caching here is both faster and makes the data plane's
-          // intent explicit.
-          state.remoteSsrcMap[group.ssrcs[1]] = {
-            mid: m.mid, transceiver: transceiver, receiver: receiver,
-            isRtx: true,
-            rid:   null,
-            primarySsrc: group.ssrcs[0],
-          };
-        } else if (group.semantics === 'FEC-FR' && group.ssrcs.length >= 2) {
-          // Second SSRC in an FEC-FR group is the FlexFEC stream (flexfec-03
-          // / RFC 5956). Mapped above as a primary, like any a=ssrc, it was
-          // one: RTCRtpReceiver took the lowest-numbered "primary" of the
-          // mid, so whenever the FEC SSRC was the smaller number (5 runs in 8
-          // with Chrome's FlexFEC on) the receiver locked onto the FEC
-          // stream and never saw a frame; findPrimaryForRtx's "exactly one
-          // primary" fallback found two and gave up. FEC packets themselves
-          // are recognised by payload type in media_transport; this entry
-          // only says what the SSRC is, so nothing takes it for media.
-          state.remoteSsrcMap[group.ssrcs[1]] = {
-            mid: m.mid, transceiver: transceiver, receiver: receiver,
-            isRtx: false,
-            isFec: true,
-            rid:   null,
-            protectedSsrc: group.ssrcs[0],
-          };
-        }
-      }
-
-      // Simulcast SSRC→RID inference (RFC 8853 / Chrome-style SDP).
-      // Publisher's offer typically declares:
-      //   a=ssrc-group:SIM <s1> <s2> <s3>     — the primary SSRCs in simulcast order
-      //   a=simulcast:send l;m;h              — the RID list in the matching order
-      // We pair them by index: s1↔l, s2↔m, s3↔h. This lets the receiver
-      // pre-populate SSRC→RID on the map; packets also carry the RID in
-      // the rtp-stream-id extension at runtime so we could reconcile
-      // later if a mismatch is detected.
-      //
-      // If either SIM or simulcast is missing, we leave rid=null and
-      // fall back to the single-layer path (one primary SSRC per mid).
-      var simGroup = null;
-      for (var gi = 0; gi < m.ssrcGroups.length; gi++) {
-        if (m.ssrcGroups[gi].semantics === 'SIM') {
-          simGroup = m.ssrcGroups[gi];
-          break;
-        }
-      }
-      if (simGroup && m.simulcast) {
-        // Peer's direction in their offer is 'send'; in their answer they
-        // echo 'recv'. Either way the RID list ordering is the same.
-        var ridList = null;
-        if (m.simulcast.dir1 === 'send' || m.simulcast.dir1 === 'recv') {
-          ridList = m.simulcast.list1 || '';
-        } else if (m.simulcast.dir2 === 'send' || m.simulcast.dir2 === 'recv') {
-          ridList = m.simulcast.list2 || '';
-        } else {
-          ridList = '';
-        }
-        // Strip ~ (paused) prefix; split by ; (simulcast streams); ignore
-        // alternative groups (,) for RID inference.
-        var ridsInOrder = ridList.split(';').map(function (r) {
-          r = r.trim();
-          if (r.charAt(0) === '~') r = r.slice(1);
-          // Alternative groups use ',' — take the first alternative.
-          var comma = r.indexOf(',');
-          return comma >= 0 ? r.slice(0, comma).trim() : r;
-        }).filter(function (r) { return !!r; });
-
-        var simSsrcs = simGroup.ssrcs;
-        for (var si = 0; si < simSsrcs.length && si < ridsInOrder.length; si++) {
-          var primarySsrc = simSsrcs[si];
-          var rid = ridsInOrder[si];
-          if (state.remoteSsrcMap[primarySsrc]) {
-            state.remoteSsrcMap[primarySsrc].rid = rid;
-          }
-          // Also tag the paired RTX SSRC so stats can attribute correctly.
-          for (var gi2 = 0; gi2 < m.ssrcGroups.length; gi2++) {
-            var fg = m.ssrcGroups[gi2];
-            if (fg.semantics !== 'FID') continue;
-            if (fg.ssrcs[0] === primarySsrc && fg.ssrcs.length >= 2) {
-              if (state.remoteSsrcMap[fg.ssrcs[1]]) {
-                state.remoteSsrcMap[fg.ssrcs[1]].rid = rid;
-              }
-            }
-          }
-        }
-      }
+      _mapRemoteSsrcs(m, transceiver, receiver, false);
 
       // WPT: rejected m-sections (port 0) and non-receiving directions do
       // not surface tracks NOW — but a later renegotiation may UPGRADE the
@@ -3964,7 +4151,9 @@ function ConnectionManager(config) {
         continue;
       }
       // Create MediaStreamTrack + MediaStream
-      var track = (transceiver.receiver && transceiver.receiver.track) ||
+      // (the receiver's own track when api.js made one: W3C 5.3, the
+      // receiver's track never changes)
+      var track = (transceiver.receiver && (transceiver.receiver.track || transceiver.receiver._apiTrack)) ||
         new MediaStreamTrack({
           kind:  m.type,
           // WPT/browser parity: remote tracks are labeled 'remote <kind>'
@@ -4209,6 +4398,7 @@ function ConnectionManager(config) {
 
   function ensureFingerprint() {
     TransportController.ensureLocalFingerprint(state);
+    TransportController.ensureLocalTlsId(state);
   }
 
 
@@ -4467,7 +4657,9 @@ function ConnectionManager(config) {
     // initial offerer is controlling (JsepTransportController's
     // initial_offerer), and rolling the initial offer back undoes the
     // decision — the next offer, either side's, decides again (this.rollback).
-    if (!desc || desc.type !== 'offer' || !desc.sdp) return;  // answers never move roles
+    // (An offer with no sdp — the implicit setLocalDescription() — decides
+    // it too: it is the first offer all the same.)
+    if (!desc || desc.type !== 'offer') return;  // answers never move roles
     if (!state.iceRoleDecided) {
       state.iceRoleDecided = true;
       state.iceControlling = !!weAreOfferer;
@@ -4504,7 +4696,18 @@ function ConnectionManager(config) {
   }
 
   this.setLocalDescription = function (desc, cb) {
-    trackNegotiationRole(desc, true);
+    // The implicit form (no description, or no type) in stable /
+    // have-local-offer is an offer (W3C 4.4.1.5): it decides the role as an
+    // explicit one does. Skipped, an offerer that called setLocalDescription()
+    // left the role undecided, and the peer's later ICE-restart offer
+    // decided it — the offerer turned controlled (RFC 8445 7.3.1.1: roles
+    // persist across a restart).
+    var _roleDesc = desc;
+    if ((!desc || desc.type === undefined) &&
+        (state.signalingState === 'stable' || state.signalingState === 'have-local-offer')) {
+      _roleDesc = { type: 'offer', sdp: desc && desc.sdp };
+    }
+    trackNegotiationRole(_roleDesc, true);
     sdpOA.chainOperation(function (next) {
       sdpOA.setLocalDescription(desc, next);
     }, cb);
@@ -4649,6 +4852,24 @@ function ConnectionManager(config) {
   // in SdpOfferAnswer; this just forwards.
   this.updateNegotiationNeededFlag = updateNegotiationNeededFlag;
 
+  // setConfiguration's ICE members (W3C 4.4.1.6 "set a configuration"):
+  // stored for an agent not created yet, and handed to a running one for
+  // its next gathering phase (IceAgent.setConfiguration — nothing changes
+  // in the current phase; the restart is the caller's, RFC 9429 §4.1.18).
+  // Returns whether either value changed.
+  this.setIceConfiguration = function (cfg) {
+    var policy  = (cfg && cfg.iceTransportPolicy) || 'all';
+    var servers = (cfg && cfg.iceServers) || [];
+    var changed = policy !== (state.iceTransportPolicy || 'all') ||
+                  JSON.stringify(servers) !== JSON.stringify(state.iceServers || []);
+    state.iceTransportPolicy = policy;
+    state.iceServers = servers;
+    if (iceAgent && typeof iceAgent.setConfiguration === 'function') {
+      iceAgent.setConfiguration({ iceTransportPolicy: policy, iceServers: servers });
+    }
+    return changed;
+  };
+
   // ICE restart (W3C §4.4.1.6). Logic lives in SdpOfferAnswer.
   this.restartIce = function () {
     sdpOA.restartIce();
@@ -4701,6 +4922,28 @@ function ConnectionManager(config) {
     mediaTransport.unregisterOutboundStream(ssrc);
   };
 
+  // Rate control (RFC 8834 §7): api.js's RTCRtpSender registers the encoder
+  // it runs (media_transport.registerRateSender), re-runs the rates when its
+  // parameters change, and asks to send again after a circuit breaker.
+  this.registerRateSender = function (id, desc) {
+    mediaTransport.registerRateSender(id, desc);
+  };
+  this.unregisterRateSender = function (id) {
+    mediaTransport.unregisterRateSender(id);
+  };
+  this.updateRates = function () {
+    mediaTransport.updateRates();
+  };
+  this.resetCircuitBreakers = function (ssrcs) {
+    mediaTransport.resetCircuitBreakers(ssrcs);
+  };
+  this.getCircuitBreakerState = function (ssrc) {
+    return mediaTransport.getCircuitBreakerState(ssrc);
+  };
+  this.getQualityLimitation = function (ssrc, now) {
+    return mediaTransport.getQualityLimitation(ssrc, now);
+  };
+
   // Transceiver layer registration. api.js calls
   // unregisterTransceiverLayer when transceiver.stop() is invoked, so the
   // header-stamper drops its per-SSRC mapping for that layer.
@@ -4737,6 +4980,8 @@ function ConnectionManager(config) {
       iceCheckList:          iceAgent ? iceAgent.context.checkList : null,
       iceLocalCandidates:    iceAgent ? iceAgent.context.localCandidates : null,
       iceRemoteCandidates:   iceAgent ? iceAgent.context.remoteCandidates : null,
+      // The agent's role ('controlling' | 'controlled'): the transport's iceRole.
+      iceRole:               iceAgent ? iceAgent.role : null,
       remoteAddress:         state.remoteAddress || null,
       estimatedBandwidthBps: raw.estimatedBandwidthBps,
       remoteRembBps:         raw.remoteRembBps,

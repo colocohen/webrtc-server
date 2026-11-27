@@ -36,10 +36,30 @@ var CHUNK_I_DATA            = 0x40;
 var CHUNK_I_FORWARD_TSN     = 0xC2;
 var CHUNK_RECONFIG          = 130;
 
-// INIT parameter types
+// INIT / INIT ACK parameter types (RFC 9260 §3.3.2.1, §3.3.3.1; RFC 5061
+// §4.2.7; RFC 3758 §3.3.1). Any other type is unrecognized: handled as its
+// two highest bits say (§3.2.1, parseInitParams).
+var PARAM_IPV4_ADDRESS        = 5;
+var PARAM_IPV6_ADDRESS        = 6;
 var PARAM_STATE_COOKIE        = 7;
+var PARAM_UNRECOGNIZED        = 8;
+var PARAM_COOKIE_PRESERVATIVE = 9;
+var PARAM_HOST_NAME_ADDRESS   = 11;
+var PARAM_SUPPORTED_ADDR_TYPES = 12;
 var PARAM_SUPPORTED_EXTENSIONS = 0x8008;
 var PARAM_FORWARD_TSN         = 0xC000;
+
+// Error causes (RFC 9260 §3.3.10) the association sends by number.
+var CAUSE_INVALID_STREAM      = 1;
+var CAUSE_STALE_COOKIE        = 3;
+var CAUSE_UNRESOLVABLE_ADDRESS = 5;
+var CAUSE_INVALID_MANDATORY   = 7;
+var CAUSE_UNRECOGNIZED_PARAMS = 8;
+
+// The largest Cookie Preservative increment we honour (RFC 9260 §3.3.2.1.3:
+// the receiver MAY ignore it "for its own security reasons"): one default
+// cookie lifetime more. The cookie keeps it in 24 bits of ms (makeCookie).
+var MAX_COOKIE_PRESERVATIVE_MS = 60000;
 
 // RECONFIG parameter types — RFC 6525 §3.1, §4.1
 var PARAM_OUTGOING_SSN_RESET   = 0x000D;
@@ -115,7 +135,14 @@ var STATE_NAMES = [
 
 // Default values
 var DEFAULT_A_RWND    = 65535;
+// Our OS and MIS in the INIT / INIT ACK: RFC 8831 §6.2 — the number of
+// streams negotiated SHOULD be 65535. What is in use is the smaller of ours
+// and the peer's, per direction (RFC 9260 §5.1.1: outboundStreams /
+// inboundStreams); a peer's Add Outgoing Streams request may raise the
+// inbound count up to this (RFC 6525 §5.2.5).
 var DEFAULT_NUM_STREAMS = 65535;
+// RFC 9260 §3.3.2, §3.3.3: the least a_rwnd an INIT / INIT ACK may carry.
+var MIN_A_RWND = 1500;
 
 // SCTP-11: cookie lifetime per RFC 4960 §5.1.5 ("valid life of state cookie").
 // Cookies older than this are rejected on COOKIE-ECHO, defending against
@@ -143,6 +170,11 @@ var DEFAULT_DELAYED_ACK_MS = 200;
  *
  * HB.Interval is 30s of idle time (RFC 4960 §8.3); Path.Max.Retrans is the
  * heartbeat-failure budget before declaring path-down.
+ *
+ * RTO.Min is 400 ms, under RFC 9260 §16's 1 s (its values are only
+ * recommended; WebRTC runs over paths far shorter than the 1 s assumes, and
+ * libwebrtc uses less still). Each of these is a per-association option:
+ * config.rtoInitialMs / rtoMinMs / rtoMaxMs (checked: min <= initial <= max).
  */
 var RTO_INITIAL_MS      = 1000;
 var RTO_MIN_MS          = 400;
@@ -397,7 +429,10 @@ function SctpAssociation(config) {
 
   // Association state
   var state = STATE_CLOSED;
-  var localVerificationTag = randomBuffer(4).readUInt32BE(0);
+  // Never zero (RFC 9260 §3.3.2: the Initiate Tag MUST NOT be 0 — a peer
+  // refuses an INIT with one, and our tag-0 rules would take its packets
+  // for an INIT's): drawn as any 4 bytes, it was 0 once in 2^32.
+  var localVerificationTag = randomTag();
   var remoteVerificationTag = 0;
   var localTsn = randomBuffer(4).readUInt32BE(0);   // our next TSN to send
   var remoteTsn = 0;                                       // expected next TSN from peer
@@ -841,8 +876,9 @@ function SctpAssociation(config) {
   // like abandonedMidPerStream: a FORWARD-TSN sent again (its first was
   // lost) must carry the pairs again, or the peer's stream stays stuck.
   var abandonedSSNPerStream  = {};
-  // SCTP-14: I-FORWARD-TSN skip tracker — streamId+('o'|'u') → highest
-  // abandoned 32-bit MID in that stream's ordered/unordered space.
+  // SCTP-14: I-FORWARD-TSN skip tracker — streamId+('o'|'u') → the
+  // abandoned messages of that stream's ordered/unordered MID space,
+  // [{ mid, lo, hi }] (lo/hi as abandonedSSNPerStream's).
   var abandonedMidPerStream  = {};
 
   /* ─── SCTP-7: Stream Reset state (RFC 6525) ───
@@ -938,6 +974,21 @@ function SctpAssociation(config) {
   var curPacket = null;
   var restartPacket = null;
 
+  // The streams in use (RFC 9260 §5.1.1): outbound min(our OS, the peer's
+  // MIS), inbound min(our MIS, the peer's OS). 0 until the handshake. DATA
+  // on an inbound stream past the count is acknowledged and discarded with
+  // an Invalid Stream Identifier error (§6.5); send() refuses an outbound one.
+  var outboundStreams = 0;
+  var inboundStreams  = 0;
+
+  // A Stale Cookie error in COOKIE-ECHOED (RFC 9260 §5.2.6, option 3): a new
+  // INIT with a Cookie Preservative of the measured round trip (our last
+  // COOKIE ECHO to the ERROR) plus 1 s. Counted: past maxInitRetransmits the
+  // setup fails (option 2).
+  var cookieEchoSentAt     = 0;
+  var cookiePreservativeMs = 0;
+  var staleCookieRetries   = 0;
+
 
   /* ========================= Packet parsing ========================= */
 
@@ -972,15 +1023,63 @@ function SctpAssociation(config) {
     // our INIT ACK to its unexpected INIT (§5.2.2), not ours. handleCookieEcho
     // checks it against the cookie; nothing else in the packet is looked at
     // under that tag (see the loop).
+    //
+    // The other exceptions are RFC 9260 §8.5.1's: a packet with an INIT
+    // carries tag 0, and only such a packet may (A); an ABORT or a SHUTDOWN
+    // COMPLETE with the T bit carries the PEER's tag (B, C). Everything else
+    // under a tag that is not ours is discarded (§8.5). A packet under tag 0
+    // used to be taken whatever it held — an ABORT with tag 0 ended an
+    // established association — and before the handshake any tag was.
+    //
+    // Before any of that, the packets that belong to no association (§8.4,
+    // handleOutOfTheBlue): in CLOSED — no handshake of ours, and the peer's
+    // INIT answered without keeping state — everything but an INIT or a
+    // COOKIE ECHO; and in COOKIE-WAIT / COOKIE-ECHOED a packet with a
+    // SHUTDOWN ACK (§8.5.1 E: the peer's old association still closing).
+    // They were checked against our tag and dropped, or (under our tag)
+    // processed: an ABORT ended an association that had not begun.
     var foreignCookie = false;
-    if (vtag !== 0 && vtag !== localVerificationTag) {
-      if (state !== STATE_CLOSED && state !== STATE_COOKIE_WAIT) {
-        if (buf.length >= 16 && buf[12] === CHUNK_COOKIE_ECHO) {
-          foreignCookie = true;
-        } else {
-          try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
-          return;
-        }
+    var onlyFirst = false;
+    var firstType = buf.length >= 16 ? buf[12] : -1;
+    if (firstType === CHUNK_INIT || vtag === 0) {
+      if (firstType !== CHUNK_INIT) {
+        try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
+        return;
+      }
+      if (vtag !== 0) {
+        try { ev.emit('protocolViolation', { code: 'init-vtag-nonzero', received: vtag }); } catch (e) {}
+        return;
+      }
+      // §8.5.1 A: a packet under tag 0 holds the INIT alone (§6.10: an INIT
+      // is never bundled); anything with it was taken under tag 0.
+      var initLen = buf[14] << 8 | buf[15];
+      if (initLen < 4 || 12 + ((initLen + 3) & ~3) < buf.length) {
+        try { ev.emit('protocolViolation', { code: 'init-bundled', length: buf.length }); } catch (e) {}
+        return;
+      }
+    } else if ((state === STATE_CLOSED && firstType !== CHUNK_COOKIE_ECHO) ||
+               ((state === STATE_COOKIE_WAIT || state === STATE_COOKIE_ECHOED) &&
+                packetHasChunk(buf, CHUNK_SHUTDOWN_ACK))) {
+      handleOutOfTheBlue(buf, vtag, firstType);
+      return;
+    } else if (firstType === CHUNK_ABORT || firstType === CHUNK_SHUTDOWN_COMPLETE) {
+      // §8.5.1 B, C: our tag without the T bit, or the peer's own tag with
+      // it (the peer reflected ours back). The T bit under our tag was taken,
+      // and what followed the chunk under the peer's tag was read too.
+      if (!abortTagFits(buf[13], vtag)) {
+        try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
+        return;
+      }
+      onlyFirst = (buf[13] & 1) !== 0;
+    } else if (vtag !== localVerificationTag) {
+      if (firstType === CHUNK_COOKIE_ECHO) {
+        // checked against its cookie (handleCookieEcho); in CLOSED this is
+        // the association taking over a restart, whose cookie names a tag
+        // of its own
+        foreignCookie = true;
+      } else {
+        try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
+        return;
       }
     }
     pktVtag = vtag;
@@ -1009,13 +1108,33 @@ function SctpAssociation(config) {
 
         var chunkData = buf.subarray(offset + 4, offset + chunkLen);
 
-        handleChunk(chunkType, chunkFlags, chunkData);
+        if (offset > 12) {
+          // An INIT is never bundled (§6.10, §8.5.1 A); an ABORT or SHUTDOWN
+          // COMPLETE further on is held to the tag rules of the first (B, C).
+          if (chunkType === CHUNK_INIT) {
+            try { ev.emit('protocolViolation', { code: 'init-bundled', length: buf.length }); } catch (e) {}
+            break;
+          }
+          if ((chunkType === CHUNK_ABORT || chunkType === CHUNK_SHUTDOWN_COMPLETE) &&
+              !abortTagFits(chunkFlags, vtag)) {
+            try { ev.emit('protocolViolation', { code: 'vtag-mismatch', expected: localVerificationTag, received: vtag }); } catch (e) {}
+            break;
+          }
+        }
+
+        // false: the rest of the packet is not to be read (an unrecognized
+        // chunk type whose action says so, RFC 9260 §3.2)
+        if (handleChunk(chunkType, chunkFlags, chunkData) === false) break;
 
         // A COOKIE ECHO under a tag that is not ours: it either restarted the
         // association — and what is bundled after it belongs to the new one,
         // which gets the whole packet — or it was refused. Either way the rest
-        // is not this association's to read.
-        if (foreignCookie || restartPacket) break;
+        // is not this association's to read. (Unless it made the tag ours: an
+        // association in CLOSED taking over a restart, established by it.)
+        if (restartPacket || (foreignCookie && vtag !== localVerificationTag)) break;
+        // Taken by the T bit: the rest is under the peer's tag, not ours.
+        // (Nor is anything read after an ABORT that ended the association.)
+        if (onlyFirst || closed) break;
 
         // Pad to 4-byte boundary
         offset += chunkLen;
@@ -1035,7 +1154,17 @@ function SctpAssociation(config) {
         //   - Otherwise defer with a 200ms timer.
         // Still inside the packet: the SACK is queued with the other
         // replies, and may ride in this pass's first DATA packet.
-        if (sackPendingThisPacket) {
+        if (sackPendingThisPacket && state === STATE_SHUTDOWN_SENT) {
+          // RFC 9260 §9.2: in SHUTDOWN-SENT every packet with DATA is
+          // answered at once with a SHUTDOWN (its Cumulative TSN Ack), and
+          // T2-shutdown restarts; a SACK goes with it when it says more
+          // (gap blocks, duplicates). The DATA used to be dropped here.
+          sackPendingThisPacket = false;
+          if (receivedRanges.length > 0 || dupTsns.length > 0) sendSackAndReset();
+          else { sackUnackedPackets = 0; sackImmediateRequired = false; }
+          sendShutdown();
+          scheduleShutdownRetransmit();
+        } else if (sackPendingThisPacket) {
           sackPendingThisPacket = false;
           sackUnackedPackets++;
           if (sackImmediateRequired ||
@@ -1088,7 +1217,9 @@ function SctpAssociation(config) {
     delayedSackTimer = setTimeout(function() {
       delayedSackTimer = null;
       // Race guard: state may have changed between schedule and fire.
-      if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) return;
+      // (SHUTDOWN-PENDING still receives as ESTABLISHED does, RFC 9260 §9.2.)
+      if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_PENDING &&
+          state !== STATE_SHUTDOWN_RECEIVED) return;
       sendSackAndReset();
       // sendSack went via direct path (packetDepth=0 here), but it may
       // have queued chunks if we were inside another handlePacket — flush
@@ -1156,11 +1287,189 @@ function SctpAssociation(config) {
       handleAbort(data);                    // SCTP-10
     } else if (type === CHUNK_ERROR) {
       handleError(data);                    // SCTP-10
+    } else {
+      return handleUnrecognizedChunk(type, flags, data);
     }
-    // Unknown chunk types are silently ignored. RFC 4960 §3.2 actually
-    // says we should respond per the chunk's "Action if Unrecognized"
-    // bits encoded in its high two bits (silent drop / drop+report /
-    // skip / skip+report). For now we treat all as silent drop.
+    return true;
+  }
+
+  // RFC 9260 §3.2: a chunk type we do not know is handled as its two
+  // highest bits say — 00: stop, discard the packet; 01: the same, and
+  // report it in an ERROR (cause 6, Unrecognized Chunk Type); 10: skip the
+  // chunk; 11: skip it and report it. They were all skipped silently, so a
+  // packet the peer meant to be dropped with its chunk was read on. (AUTH,
+  // ASCONF and the rest we do not support count as unrecognized.) Returns
+  // false when the rest of the packet is not to be read.
+  function handleUnrecognizedChunk(type, flags, data) {
+    var action = type >> 6;
+    if ((action & 1) && remoteVerificationTag !== 0) {
+      var chunk = Buffer.alloc(4 + data.length);
+      chunk[0] = type; chunk[1] = flags; chunk.writeUInt16BE(4 + data.length, 2);
+      data.copy(chunk, 4);
+      sendError(6, chunk);
+    }
+    return (action & 2) !== 0;
+  }
+
+  // RFC 9260 §8.5.1 B, C: an ABORT or SHUTDOWN COMPLETE is taken under our
+  // own tag with the T bit clear, or under the peer's tag with it set.
+  function abortTagFits(flags, vtag) {
+    return (flags & 1) ? (remoteVerificationTag !== 0 && vtag === remoteVerificationTag)
+                       : vtag === localVerificationTag;
+  }
+
+  function packetHasChunk(buf, type) {
+    var off = 12;
+    while (off + 4 <= buf.length) {
+      var len = buf[off + 2] << 8 | buf[off + 3];
+      if (len < 4 || off + len > buf.length) return false;
+      if (buf[off] === type) return true;
+      off += (len + 3) & ~3;
+    }
+    return false;
+  }
+
+  // The causes of an ERROR / ABORT chunk's body: true if one has this code.
+  function hasErrorCause(body, code) {
+    return findErrorCause(body, code) !== null;
+  }
+
+  // The information of the first cause with this code (RFC 9260 §3.3.10),
+  // or null.
+  function findErrorCause(body, code) {
+    var off = 0;
+    while (off + 4 <= body.length) {
+      var c = body[off] << 8 | body[off + 1];
+      var len = body[off + 2] << 8 | body[off + 3];
+      if (len < 4 || off + len > body.length) return null;
+      if (c === code) return body.subarray(off + 4, off + len);
+      off += (len + 3) & ~3;
+    }
+    return null;
+  }
+
+  // An "Out of the Blue" packet (RFC 9260 §8.4): one no association of ours
+  // is there to take (see handlePacket). It is never processed; the answer
+  // goes under the packet's own tag, reflected (the T bit):
+  //   an ABORT in it: nothing (2);    a SHUTDOWN ACK: SHUTDOWN COMPLETE (5);
+  //   a SHUTDOWN COMPLETE, a COOKIE ACK or a Stale Cookie ERROR: nothing
+  //   (6, 7);                         anything else: ABORT (8).
+  // (An INIT, a COOKIE ECHO first — rules 3 and 4 — are not out of the
+  // blue: §5.1, handled as usual.)
+  function handleOutOfTheBlue(buf, vtag, firstType) {
+    var abort = false, shutdownAck = false, quiet = false;
+    var off = 12;
+    while (off + 4 <= buf.length) {
+      var t = buf[off], len = buf[off + 2] << 8 | buf[off + 3];
+      if (len < 4 || off + len > buf.length) break;
+      if (t === CHUNK_ABORT) abort = true;
+      else if (t === CHUNK_SHUTDOWN_ACK) shutdownAck = true;
+      else if (t === CHUNK_SHUTDOWN_COMPLETE || t === CHUNK_COOKIE_ACK ||
+               (t === CHUNK_ERROR && hasErrorCause(buf.subarray(off + 4, off + len), CAUSE_STALE_COOKIE))) quiet = true;
+      off += (len + 3) & ~3;
+    }
+    var info = { code: 'out-of-the-blue', received: vtag };
+    if (firstType >= 0) info.chunkType = firstType;   // (none: a packet with no chunk)
+    try { ev.emit('protocolViolation', info); } catch (e) {}
+    if (abort) return;
+    if (shutdownAck) emitOneChunk(CHUNK_SHUTDOWN_COMPLETE, 1, Buffer.alloc(0), vtag);
+    else if (!quiet) emitOneChunk(CHUNK_ABORT, 1, Buffer.alloc(0), vtag);
+  }
+
+  // The variable-length parameters of an INIT or INIT ACK (RFC 9260 §3.2.1),
+  // walked in order: what we use from them, and the ones we do not
+  // recognize, handled as the two highest bits of their type say — 00 stop
+  // (the parameters after it are not processed), 01 stop and report, 10
+  // skip, 11 skip and report. Recognized: the addresses and Supported
+  // Address Types (nothing to do over DTLS: the transport is the DTLS
+  // association's, RFC 8261), the State Cookie, Unrecognized Parameter,
+  // Cookie Preservative, Host Name Address (refused, see the callers),
+  // Supported Extensions and Forward-TSN-Supported. The first copy of each
+  // counts. They used to be looked up by type over the whole list, so a stop
+  // was not honoured and nothing was reported.
+  //
+  //   { extMask, cookie, preservativeMs, hostName, report: [TLV...] }
+  function parseInitParams(params) {
+    var out = { extMask: 0, cookie: null, preservativeMs: null, hostName: null, report: [] };
+    var ext = null, fwd = false;
+    var off = 0;
+    while (off + 4 <= params.length) {
+      var pType = params[off] << 8 | params[off + 1];
+      var pLen  = params[off + 2] << 8 | params[off + 3];
+      if (pLen < 4 || off + pLen > params.length) break;
+      var value = params.subarray(off + 4, off + pLen);
+      if (pType === PARAM_STATE_COOKIE) {
+        if (out.cookie === null) out.cookie = value;
+      } else if (pType === PARAM_SUPPORTED_EXTENSIONS) {
+        if (ext === null) ext = value;
+      } else if (pType === PARAM_FORWARD_TSN) {
+        fwd = true;
+      } else if (pType === PARAM_COOKIE_PRESERVATIVE) {
+        if (out.preservativeMs === null && value.length >= 4) out.preservativeMs = value.readUInt32BE(0);
+      } else if (pType === PARAM_HOST_NAME_ADDRESS) {
+        out.hostName = params.subarray(off, off + pLen);
+        break;
+      } else if (pType !== PARAM_IPV4_ADDRESS && pType !== PARAM_IPV6_ADDRESS &&
+                 pType !== PARAM_UNRECOGNIZED && pType !== PARAM_SUPPORTED_ADDR_TYPES) {
+        var action = pType >> 14;
+        if (action & 1) out.report.push(params.subarray(off, off + pLen));
+        if (!(action & 2)) break;
+      }
+      off += (pLen + 3) & ~3;
+    }
+    // RFC 3758 §3.3.1: PR-SCTP may also be offered by its own parameter.
+    var mask = fwd ? EXT_FORWARD_TSN : 0;
+    if (ext) {
+      for (var i = 0; i < ext.length; i++) {
+        if (ext[i] === CHUNK_FORWARD_TSN) mask |= EXT_FORWARD_TSN;
+        if (ext[i] === CHUNK_RECONFIG)    mask |= EXT_RECONFIG;
+        // RFC 8260: the peer telling us it can RECEIVE I-DATA — a peer that
+        // did not list it must never be sent I-DATA.
+        if (ext[i] === CHUNK_I_DATA)      mask |= EXT_I_DATA;
+        if (ext[i] === CHUNK_I_FORWARD_TSN) mask |= EXT_I_FORWARD_TSN;
+      }
+    }
+    out.extMask = mask;
+    return out;
+  }
+
+  // An ABORT for an INIT / INIT ACK we refuse (RFC 9260 §3.3.2, §3.3.3:
+  // under its Initiate Tag; tBit: under our own, reflected), sent at once and
+  // alone. One cause (no cause when causeCode is null).
+  function sendHandshakeAbort(vtag, tBit, causeCode, causeInfo) {
+    heldData.length = 0;
+    if (pendingOutChunks.length > 0) flushOutChunks();
+    emitOneChunk(CHUNK_ABORT, tBit ? 1 : 0, causeBody(causeCode, causeInfo), vtag);
+  }
+
+  // One error cause, padded (its length the unpadded one).
+  function causeBody(causeCode, causeInfo) {
+    if (causeCode == null) return Buffer.alloc(0);
+    var infoLen = causeInfo ? causeInfo.length : 0;
+    var body = Buffer.alloc((4 + infoLen + 3) & ~3);
+    body.writeUInt16BE(causeCode, 0);
+    body.writeUInt16BE(4 + infoLen, 2);
+    if (infoLen) causeInfo.copy(body, 4);
+    return body;
+  }
+
+  // The parameters an INIT ACK reports (RFC 9260 §3.2.2, §3.3.3.1.2): one
+  // Unrecognized Parameter each, as many as fit the PMTU beside the rest of
+  // the INIT ACK (`used` bytes of it).
+  function unrecognizedParams(report, used) {
+    var parts = [];
+    for (var i = 0; i < report.length; i++) {
+      var p = report[i];
+      var n = (4 + p.length + 3) & ~3;
+      if (used + n > pmtu) break;
+      var b = Buffer.alloc(n);
+      b.writeUInt16BE(PARAM_UNRECOGNIZED, 0);
+      b.writeUInt16BE(4 + p.length, 2);
+      p.copy(b, 4);
+      parts.push(b);
+      used += n;
+    }
+    return Buffer.concat(parts);
   }
 
 
@@ -1178,13 +1487,34 @@ function SctpAssociation(config) {
     var numInbound  = data[10] << 8 | data[11];
     var initialTsn  = (data[12] << 24 | data[13] << 16 | data[14] << 8 | data[15]) >>> 0;
 
-    // RFC 4960 §3.3.2: Initiate Tag MUST NOT be zero.
+    // RFC 9260 §3.3.2: an Initiate Tag of 0 — the packet is silently discarded.
     if (initiateTag === 0) {
       try { ev.emit('protocolViolation', { code: 'init-zero-tag' }); } catch (e) {}
       return;
     }
+    // §3.3.2: OS or MIS 0, or an a_rwnd under 1500 — the packet is
+    // discarded, an ABORT goes under the Initiate Tag, and no association
+    // changes. They were taken: an INIT with no inbound streams set up an
+    // association nothing could be sent on.
+    if (numOutbound === 0 || numInbound === 0 || aRwnd < MIN_A_RWND) {
+      try { ev.emit('protocolViolation', { code: 'init-invalid', received: initiateTag }); } catch (e) {}
+      sendHandshakeAbort(initiateTag, false, CAUSE_INVALID_MANDATORY, null);
+      return;
+    }
 
-    var extMask = supportedExtensionsMask(data.subarray(16));
+    var params = parseInitParams(data.subarray(16));
+    // §3.3.2.1.4: the receiver of an INIT with a Host Name Address MUST send
+    // an ABORT (with the Unresolvable Address cause, which MAY be there).
+    if (params.hostName) {
+      try { ev.emit('protocolViolation', { code: 'host-name-address', received: initiateTag }); } catch (e) {}
+      sendHandshakeAbort(initiateTag, false, CAUSE_UNRESOLVABLE_ADDRESS, params.hostName);
+      return;
+    }
+    var extMask = params.extMask;
+    // §3.3.2.1.3, §5.2.6: a Cookie Preservative asks for a longer cookie
+    // lifetime; honoured up to MAX_COOKIE_PRESERVATIVE_MS (the cookie
+    // carries it, handleCookieEcho reads it back).
+    var lifeIncMs = params.preservativeMs === null ? 0 : Math.min(params.preservativeMs, MAX_COOKIE_PRESERVATIVE_MS);
 
     // An INIT for an association that is up (RFC 4960 §5.2.2): the peer may
     // have restarted — lost its state and begun again — or the INIT is stale
@@ -1205,7 +1535,8 @@ function SctpAssociation(config) {
       var newTsn = randomBuffer(4).readUInt32BE(0);
       sendInitAck(initiateTag, newTag, newTsn,
                   makeCookie(initiateTag, newTag, newTsn, initialTsn, aRwnd, numOutbound, numInbound,
-                             remoteVerificationTag, localVerificationTag, extMask));
+                             remoteVerificationTag, localVerificationTag, extMask, lifeIncMs),
+                  params.report);
       return;
     }
     if (state === STATE_SHUTDOWN_ACK_SENT) {
@@ -1227,7 +1558,8 @@ function SctpAssociation(config) {
 
     sendInitAck(initiateTag, localVerificationTag, localTsn,
                 makeCookie(initiateTag, localVerificationTag, localTsn, initialTsn, aRwnd, numOutbound, numInbound,
-                           0, 0, extMask));
+                           0, 0, extMask, lifeIncMs),
+                params.report);
   }
 
   // A Verification Tag: random, never zero (RFC 4960 §5.3.1).
@@ -1242,16 +1574,18 @@ function SctpAssociation(config) {
   //
   //   0 peer's tag      4 our tag         8 our first TSN   12 peer's first TSN
   //  16 peer's a_rwnd  20 streams out/in  24 local port     28 time (epoch s)
-  //  32 Peer's-Tie-Tag 36 Local-Tie-Tag   40 peer's extensions (bit mask), 3 pad
+  //  32 Peer's-Tie-Tag 36 Local-Tie-Tag   40 peer's extensions (bit mask)
+  //  41 lifetime increment (ms, 24 bits: the peer's Cookie Preservative honoured)
   //  44 HMAC-SHA256 of bytes 0-43
   //
   // The timestamp is inside the HMAC (SCTP-11: lifetime check against replay).
   // The Tie-Tags are the tags in force when an INIT arrived for a running
   // association (§5.2.2), zero otherwise. The extensions are carried because
   // the association that accepts the cookie may not be the one that saw the
-  // INIT — after a restart it is a new one (see 'restart').
+  // INIT — after a restart it is a new one (see 'restart'). The streams are
+  // the peer's OS and MIS (§5.1.1, applied when the cookie establishes).
   function makeCookie(peerTag, myTag, myTsn, peerTsn, aRwnd, numOutbound, numInbound,
-                      peerTieTag, localTieTag, extMask) {
+                      peerTieTag, localTieTag, extMask, lifeIncMs) {
     var cookieData = Buffer.alloc(COOKIE_DATA_LEN);
     cookieData.writeUInt32BE(peerTag, 0);
     cookieData.writeUInt32BE(myTag, 4);
@@ -1265,13 +1599,22 @@ function SctpAssociation(config) {
     cookieData.writeUInt32BE(peerTieTag >>> 0, 32);
     cookieData.writeUInt32BE(localTieTag >>> 0, 36);
     cookieData[40] = extMask & 0xFF;
+    cookieData[41] = (lifeIncMs >>> 16) & 0xFF;
+    cookieData[42] = (lifeIncMs >>> 8) & 0xFF;
+    cookieData[43] = lifeIncMs & 0xFF;
 
     var mac = hmac_sync(sha256_sync, cookieSecret, cookieData);
     return Buffer.concat([cookieData, mac]);
   }
 
-  function sendInitAck(peerTag, myTag, myTsn, cookie) {
-    sendChunk(CHUNK_INIT_ACK, 0, initBody(myTag, myTsn, cookie), peerTag);
+  // `report`: the INIT's parameters to report as unrecognized (RFC 9260
+  // §3.2.2: in the INIT ACK).
+  function sendInitAck(peerTag, myTag, myTsn, cookie, report) {
+    var body = initBody(myTag, myTsn, cookie, null);
+    if (report.length > 0) {
+      body = Buffer.concat([body, unrecognizedParams(report, SCTP_HEADER_OVERHEAD + 4 + body.length)]);
+    }
+    sendChunk(CHUNK_INIT_ACK, 0, body, peerTag);
   }
 
   // The body of our INIT and INIT ACK (RFC 9260 §3.3.2-3): one builder, so
@@ -1284,8 +1627,12 @@ function SctpAssociation(config) {
   //   Supported Extensions (RFC 5061 §4.2.7): FORWARD-TSN, RECONFIG (RFC
   //   6525), I-DATA and I-FORWARD-TSN (RFC 8260);
   //   Forward-TSN-Supported (RFC 3758 §3.3.1), the older way to offer PR-SCTP.
-  function initBody(myTag, myTsn, cookie) {
+  // An INIT after a Stale Cookie error adds a Cookie Preservative
+  // (preservativeMs, RFC 9260 §3.3.2.1.3), after the rest.
+  function initBody(myTag, myTsn, cookie, preservativeMs) {
     var len = 16 + 12 + (cookie ? 4 + cookie.length : 0);
+    var pres = len;
+    len = ((len + 3) & ~3) + (preservativeMs ? 8 : 0);
     var body = Buffer.alloc((len + 3) & ~3);
     body.writeUInt32BE(myTag, 0);
     body.writeUInt32BE(myReceiverWindowCredit(), 4);
@@ -1305,6 +1652,11 @@ function SctpAssociation(config) {
       body.writeUInt16BE(4 + cookie.length, 30);
       cookie.copy(body, 32);
     }
+    if (preservativeMs) {
+      body.writeUInt16BE(PARAM_COOKIE_PRESERVATIVE, (pres + 3) & ~3);
+      body.writeUInt16BE(8, ((pres + 3) & ~3) + 2);
+      body.writeUInt32BE(preservativeMs >>> 0, ((pres + 3) & ~3) + 4);
+    }
     return body;
   }
 
@@ -1315,31 +1667,99 @@ function SctpAssociation(config) {
     if (state !== STATE_COOKIE_WAIT) return;
     if (data.length < 16) return;
 
-    remoteVerificationTag = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
-    var aRwnd      = (data[4] << 24 | data[5] << 16 | data[6] << 8 | data[7]) >>> 0;
-    var initialTsn = (data[12] << 24 | data[13] << 16 | data[14] << 8 | data[15]) >>> 0;
+    var initiateTag = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
+    var aRwnd       = (data[4] << 24 | data[5] << 16 | data[6] << 8 | data[7]) >>> 0;
+    var numOutbound = data[8] << 8 | data[9];
+    var numInbound  = data[10] << 8 | data[11];
+    var initialTsn  = (data[12] << 24 | data[13] << 16 | data[14] << 8 | data[15]) >>> 0;
 
+    // RFC 9260 §3.3.3: an Initiate Tag of 0, or OS / MIS 0 — the TCB is
+    // destroyed and an ABORT sent (with the T bit for tag 0: our own tag,
+    // reflected; the peer gave none). An a_rwnd under 1500 — the packet is
+    // discarded, an ABORT goes under the Initiate Tag, and nothing changes
+    // here (T1 still runs). All were taken: tag 0 became the peer's tag.
+    if (initiateTag === 0 || numOutbound === 0 || numInbound === 0) {
+      handshakeFailed({ code: 'init-ack-invalid', received: initiateTag },
+                      initiateTag === 0 ? localVerificationTag : initiateTag, initiateTag === 0,
+                      CAUSE_INVALID_MANDATORY, null);
+      return;
+    }
+    if (aRwnd < MIN_A_RWND) {
+      try { ev.emit('protocolViolation', { code: 'init-ack-invalid', received: initiateTag }); } catch (e) {}
+      sendHandshakeAbort(initiateTag, false, CAUSE_INVALID_MANDATORY, null);
+      return;
+    }
+    var params = parseInitParams(data.subarray(16));
+    // §3.3.3: the receiver of an INIT ACK with a Host Name Address MUST send
+    // an ABORT; the setup ends.
+    if (params.hostName) {
+      handshakeFailed({ code: 'host-name-address', received: initiateTag }, initiateTag, false,
+                      CAUSE_UNRESOLVABLE_ADDRESS, params.hostName);
+      return;
+    }
+
+    remoteVerificationTag = initiateTag;
     remoteTsn = initialTsn;
     lastCumulativeTsn = (initialTsn - 1) >>> 0;
     lastReconfigPeerReqSeen = lastCumulativeTsn;   // RFC 6525 §4.1: peer's first request = its initial TSN
     remoteRwnd = aRwnd; ssthresh = aRwnd; if (!peerInitialRwnd) peerInitialRwnd = remoteRwnd;
+    setStreams(numOutbound, numInbound);
 
     // SCTP-6: detect PR-SCTP support.
-    detectSupportedExtensions(data.subarray(16));
+    applyExtensionsMask(params.extMask);
 
-    // Extract State Cookie
-    var cookie = extractParam(data.subarray(16), PARAM_STATE_COOKIE);
+    // The State Cookie (a stop action before it leaves none: T1 resends the
+    // INIT).
+    var cookie = params.cookie;
     if (cookie) {
       state = STATE_COOKIE_ECHOED;
       var cookieCopy = Buffer.from(cookie);
       sendChunk(CHUNK_COOKIE_ECHO, 0, cookieCopy, remoteVerificationTag);
+      cookieEchoSentAt = Date.now();
+      // RFC 9260 §3.2.2: the INIT ACK's unrecognized parameters to report go
+      // in an ERROR (cause 8, all of them) bundled after the COOKIE ECHO.
+      if (params.report.length > 0) sendError(CAUSE_UNRECOGNIZED_PARAMS, unrecognizedCause(params.report));
       // T1-cookie (RFC 4960 §5.1 C): resend until the COOKIE-ACK arrives.
-      armT1(function () {
+      armT1(function (giveUp) {
         if (state !== STATE_COOKIE_ECHOED) return false;
-        sendChunk(CHUNK_COOKIE_ECHO, 0, cookieCopy, remoteVerificationTag);
+        if (!giveUp) {
+          sendChunk(CHUNK_COOKIE_ECHO, 0, cookieCopy, remoteVerificationTag);
+          cookieEchoSentAt = Date.now();
+        }
         return true;
       });
     }
+  }
+
+  // The Unrecognized Parameters cause's information (RFC 9260 §3.3.10.8):
+  // the parameters, each padded, as many as fit an ERROR chunk of one PMTU.
+  function unrecognizedCause(report) {
+    var parts = [], used = SCTP_HEADER_OVERHEAD + 8;
+    for (var i = 0; i < report.length; i++) {
+      var n = (report[i].length + 3) & ~3;
+      if (used + n > pmtu) break;
+      var b = Buffer.alloc(n);
+      report[i].copy(b, 0);
+      parts.push(b);
+      used += n;
+    }
+    return Buffer.concat(parts);
+  }
+
+  // The streams in use (RFC 9260 §5.1.1), from the peer's OS and MIS.
+  function setStreams(peerOs, peerMis) {
+    outboundStreams = Math.min(DEFAULT_NUM_STREAMS, peerMis);
+    inboundStreams  = Math.min(DEFAULT_NUM_STREAMS, peerOs);
+  }
+
+  // The setup fails on what the peer sent (RFC 9260 §3.3.3): reported, an
+  // ABORT under `vtag` (tBit: reflected), and the association is gone.
+  function handshakeFailed(info, vtag, tBit, causeCode, causeInfo) {
+    try { ev.emit('protocolViolation', info); } catch (e) {}
+    sctpStats.pathFailures++;
+    try { ev.emit('pathFailure', { source: 'protocol', cause: causeCode }); } catch (e) {}
+    sendHandshakeAbort(vtag, tBit, causeCode, causeInfo);
+    finalizeClose();
   }
 
 
@@ -1364,11 +1784,23 @@ function SctpAssociation(config) {
     // SCTP-11: cookie lifetime check. RFC 4960 §5.1.5 — reject cookies
     // older than the configured lifetime to defend against replay. The
     // timestamp is inside the MAC so it can't have been altered.
+    // The lifespan is ours plus what the peer's Cookie Preservative earned
+    // (RFC 9260 §5.1.5 step 4: "the lifespan carried in the State Cookie").
     var cookieAgeS = Math.floor(Date.now() / 1000) - cookieData.readUInt32BE(28);
-    if (cookieAgeS < 0 || cookieAgeS > cookieLifetimeS) {
+    var lifeS = cookieLifetimeS + (cookieData[41] << 16 | cookieData[42] << 8 | cookieData[43]) / 1000;
+    if (cookieAgeS < 0 || cookieAgeS > lifeS) {
       try { ev.emit('protocolViolation', { code: 'cookie-expired', ageSeconds: cookieAgeS }); } catch (e) {}
-      // RFC 4960 §5.1.5 says to send ERROR(Stale Cookie) with the
-      // measured staleness. We just drop — peer's INIT will retry.
+      // RFC 9260 §5.1.5 step 3: a stale cookie MUST be answered with an
+      // ERROR, cause 3 (Stale Cookie), its Measure of Staleness the time
+      // past the lifetime in microseconds — under the tag the peer gave in
+      // its INIT (the cookie's, signed). It was dropped without a word,
+      // leaving the peer to resend the same stale cookie until it gave up.
+      // (A timestamp in the future is not stale: dropped.)
+      if (cookieAgeS > lifeS) {
+        var stale = Buffer.alloc(4);
+        stale.writeUInt32BE(Math.min(0xFFFFFFFF, (cookieAgeS - lifeS) * 1000000) >>> 0, 0);
+        sendError(CAUSE_STALE_COOKIE, stale, cookieData.readUInt32BE(0));
+      }
       return;
     }
 
@@ -1435,6 +1867,7 @@ function SctpAssociation(config) {
     // restart never saw the INIT they came in (for the one that did, this
     // repeats what handleInit recorded).
     applyExtensionsMask(cookieData[40]);
+    setStreams(cookieData.readUInt16BE(20), cookieData.readUInt16BE(22));
 
     // Send COOKIE-ACK
     sendChunk(CHUNK_COOKIE_ACK, 0, Buffer.alloc(0), remoteVerificationTag);
@@ -1460,6 +1893,17 @@ function SctpAssociation(config) {
 
   /* ── DATA ── */
 
+  // The states DATA is taken in (RFC 9260 §9.2): ESTABLISHED, and the
+  // shutdown states until our SHUTDOWN ACK — SHUTDOWN-PENDING and
+  // SHUTDOWN-SENT receive as ESTABLISHED does (the peer may still be
+  // sending), SHUTDOWN-RECEIVED takes what was in flight. DATA was dropped in
+  // SHUTDOWN-PENDING and SHUTDOWN-SENT: a peer's message in flight when we
+  // closed was acknowledged by nobody and lost.
+  function receivingData() {
+    return state === STATE_ESTABLISHED || state === STATE_SHUTDOWN_PENDING ||
+           state === STATE_SHUTDOWN_SENT || state === STATE_SHUTDOWN_RECEIVED;
+  }
+
   /**
    * I-DATA (RFC 8260 2.1). Same job as handleData, different header:
    *
@@ -1475,7 +1919,7 @@ function SctpAssociation(config) {
    * interleaved on the wire.
    */
   function handleIData(flags, data) {
-    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) return;
+    if (!receivingData()) return;
     if (data.length < 16) return;
 
     var tsn      = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
@@ -1509,7 +1953,7 @@ function SctpAssociation(config) {
    * @param iFsn  fragment number within that message; null likewise.
    */
   function handleData(flags, data) {
-    if (state !== STATE_ESTABLISHED && state !== STATE_SHUTDOWN_RECEIVED) return;
+    if (!receivingData()) return;
     if (data.length < 12) return;
     _acceptDataFields(
       flags,
@@ -1540,6 +1984,16 @@ function SctpAssociation(config) {
     var isBegin     = !!(flags & DATA_FLAG_BEGIN);
     var isEnd       = !!(flags & DATA_FLAG_END);
     var isUnordered = !!(flags & DATA_FLAG_UNORDERED);
+
+    // RFC 9260 §6.2 (RFC 8260 §2.1 for I-DATA): a DATA chunk with no user
+    // data MUST be answered with an ABORT, cause 9 (No User Data) naming its
+    // TSN. It was taken, and delivered as an empty message.
+    if (payload.length === 0) {
+      var tsnInfo = Buffer.alloc(4);
+      tsnInfo.writeUInt32BE(tsn, 0);
+      abortProtocolViolation({ code: 'no-user-data', tsn: tsn }, 9, tsnInfo);
+      return;
+    }
 
     if (!admitChunk(tsn, streamId, payload.length, isBegin && isEnd, iMid, isUnordered)) return;
 
@@ -1577,6 +2031,17 @@ function SctpAssociation(config) {
     if (status !== 'new') {
       // Don't reassemble or deliver duplicates / overflowed chunks. The
       // SACK above already informed the peer.
+      return;
+    }
+
+    // RFC 9260 §6.5: a stream past the inbound streams in use (§5.1.1) —
+    // acknowledged as usual (above), an ERROR with Invalid Stream Identifier
+    // at once, and the chunk discarded. Such data used to be delivered.
+    if (streamId >= inboundStreams) {
+      var sidInfo = Buffer.alloc(4);
+      sidInfo.writeUInt16BE(streamId, 0);
+      try { ev.emit('protocolViolation', { code: 'invalid-stream', streamId: streamId, tsn: tsn }); } catch (e) {}
+      sendError(CAUSE_INVALID_STREAM, sidInfo);
       return;
     }
 
@@ -2173,9 +2638,9 @@ function SctpAssociation(config) {
     // the abandoned message, which can only happen after it processed the
     // forward covering that hole.
     for (var akey in abandonedMidPerStream) {
-      if (tsnGt(cumTsn, abandonedMidPerStream[akey].tsn)) {
-        delete abandonedMidPerStream[akey];
-      }
+      var aitems = abandonedMidPerStream[akey];
+      for (var ai2 = aitems.length - 1; ai2 >= 0; ai2--) if (tsnGt(cumTsn, aitems[ai2].hi)) aitems.splice(ai2, 1);
+      if (aitems.length === 0) delete abandonedMidPerStream[akey];
     }
     for (var skey in abandonedSSNPerStream) {
       var sitems = abandonedSSNPerStream[skey];
@@ -2560,7 +3025,13 @@ function SctpAssociation(config) {
     var peerCumTsn = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
     var now = Date.now();
     var dropCount = 0;
-    while (dropCount < sendQueue.length && tsnLeq(sendQueue[dropCount].tsn, peerCumTsn)) {
+    // As a SACK's (RFC 9260 §6.2.1 D): a Cumulative TSN Ack below one seen
+    // is stale, one past what we sent acknowledges nothing — neither drops a
+    // chunk (one never sent used to be dropped as acknowledged).
+    var cumOk = (sackCumSeen === null || !tsnLt(peerCumTsn, sackCumSeen)) &&
+                highestTsnSent !== null && !tsnGt(peerCumTsn, highestTsnSent);
+    if (cumOk) sackCumSeen = peerCumTsn;
+    while (cumOk && dropCount < sendQueue.length && tsnLeq(sendQueue[dropCount].tsn, peerCumTsn)) {
       var acked = sendQueue[dropCount];
       if (acked.retransmits === 0) {
         updateRtt(now - acked.sentAt);
@@ -2570,17 +3041,27 @@ function SctpAssociation(config) {
     }
     if (dropCount > 0) sendQueue.splice(0, dropCount);
     if (!t3Needed()) clearT3Timer();
+    else if (dropCount > 0) startT3Timer();
 
-    if (state === STATE_ESTABLISHED) {
-      // Standard passive shutdown path.
+    if (state === STATE_ESTABLISHED || state === STATE_SHUTDOWN_PENDING) {
+      // RFC 9260 §9.2: SHUTDOWN-RECEIVED — no new data from the user, and
+      // what it already gave us goes on being sent (and retransmitted)
+      // until the peer has acknowledged all of it; then SHUTDOWN ACK
+      // (attemptShutdownTransition). It used to answer SHUTDOWN ACK at once,
+      // and the data still queued — in flight, lost, or not sent yet — was
+      // never delivered: the peer completed the shutdown without it.
+      // SHUTDOWN-PENDING the same (the state diagram, §4): our own SHUTDOWN
+      // had not gone out yet.
       state = STATE_SHUTDOWN_RECEIVED;
-      // (Drain send queue — no-op until SCTP-1.)
-      state = STATE_SHUTDOWN_ACK_SENT;
-      shutdownRetries = 0;
-      sendShutdownAck();
-      scheduleShutdownRetransmit();
-    } else if (state === STATE_SHUTDOWN_PENDING ||
-               state === STATE_SHUTDOWN_SENT) {
+      flushTxJobs();
+      transmitPending();
+      attemptShutdownTransition();
+    } else if (state === STATE_SHUTDOWN_RECEIVED) {
+      // The peer's T2 resent its SHUTDOWN: its cumulative ack may have
+      // completed what we wait for.
+      transmitPending();
+      attemptShutdownTransition();
+    } else if (state === STATE_SHUTDOWN_SENT) {
       // Simultaneous close — both sides issued SHUTDOWN. RFC 4960 §9.2
       // says continue and respond with SHUTDOWN_ACK. The first peer to
       // get the ACK wins the race; whoever receives SHUTDOWN_ACK first
@@ -2595,9 +3076,7 @@ function SctpAssociation(config) {
       // still time-bound how long we hang around).
       sendShutdownAck();
     }
-    // STATE_SHUTDOWN_RECEIVED: redundant SHUTDOWN, ignore (we'll send
-    // SHUTDOWN_ACK shortly anyway). STATE_CLOSED / pre-established:
-    // ignore.
+    // STATE_CLOSED / pre-established: ignore.
   }
 
   function handleShutdownAck() {
@@ -2610,6 +3089,15 @@ function SctpAssociation(config) {
       // verification tag in this packet is wrong, we should still
       // send a SHUTDOWN_COMPLETE with T-bit set. We're not that
       // defensive yet; the vtag check in handlePacket already gates.
+      sendShutdownComplete();
+      finishGracefully();
+    } else if (state === STATE_SHUTDOWN_ACK_SENT) {
+      // A simultaneous close (RFC 9260 §9.2): both sides sent SHUTDOWN, then
+      // SHUTDOWN ACK. "If an endpoint is in the SHUTDOWN-ACK-SENT state and
+      // receives a SHUTDOWN ACK, it MUST stop the T2-shutdown timer, send a
+      // SHUTDOWN COMPLETE chunk to its peer, and remove all record of the
+      // association." It was ignored: both sides resent SHUTDOWN ACK until
+      // T2 gave up, half a minute later, with no 'close' in between.
       sendShutdownComplete();
       finishGracefully();
     }
@@ -2644,6 +3132,15 @@ function SctpAssociation(config) {
   // nothing if the queue is non-empty, so handleSack can call it
   // unconditionally on every ACK.
   function attemptShutdownTransition() {
+    if (state === STATE_SHUTDOWN_RECEIVED) {
+      // RFC 9260 §9.2: everything we sent acknowledged — SHUTDOWN ACK.
+      if (sendQueue.length > 0 || txJobs.length > 0) return;
+      state = STATE_SHUTDOWN_ACK_SENT;
+      shutdownRetries = 0;
+      sendShutdownAck();
+      scheduleShutdownRetransmit();
+      return;
+    }
     if (state !== STATE_SHUTDOWN_PENDING) return;
     if (sendQueue.length > 0) return;
     state = STATE_SHUTDOWN_SENT;
@@ -3165,7 +3662,11 @@ function SctpAssociation(config) {
       // (RFC 6525 §5.1.1) — retransmitted it with every later request stuck
       // behind it. §5.2.1: a request the endpoint does not wish to process
       // still gets a response: "Denied".
-      else if (pType === PARAM_SSN_TSN_RESET || pType === PARAM_ADD_OUT_STREAMS ||
+      else if (pType === PARAM_ADD_OUT_STREAMS)      handleAddOutgoingStreams(pBody);
+      // An Add Incoming Streams request (the peer asking us for more
+      // outgoing streams) MAY be denied (RFC 6525 §5.2.6): we use ours as
+      // negotiated.
+      else if (pType === PARAM_SSN_TSN_RESET ||
                pType === PARAM_ADD_IN_STREAMS)       denyReconfigRequest(pBody);
 
       off += pLen;
@@ -3195,6 +3696,24 @@ function SctpAssociation(config) {
     lastReconfigPeerReqSeen    = reqSeq;
     lastReconfigResponseResult = result;
     sendReconfigResponse(reqSeq, result);
+  }
+
+  // The peer adds outgoing streams — our inbound ones (RFC 6525 §5.2.5):
+  // performed while the total stays within our MIS (65535, the most there
+  // can be), denied past it. A peer that opens with few streams and adds
+  // more as it needs them (Firefox's usrsctp) was always denied, and its
+  // channels past the first streams could not open.
+  function handleAddOutgoingStreams(body) {
+    if (body.length < 8) { denyReconfigRequest(body); return; }   // too short to read: as an unknown request
+    var reqSeq = (body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0;
+    var count  = body[4] << 8 | body[5];
+    if (!acceptPeerRequest(reqSeq)) return;
+    if (inboundStreams + count > DEFAULT_NUM_STREAMS) {
+      answerPeerRequest(reqSeq, RECONFIG_RESULT_DENIED);
+      return;
+    }
+    inboundStreams += count;
+    answerPeerRequest(reqSeq, RECONFIG_RESULT_SUCCESS_PERFORMED);
   }
 
   // A request type we do not implement (every request parameter starts with
@@ -3673,6 +4192,34 @@ function SctpAssociation(config) {
   function handleError(data) {
     var cause = parseFirstErrorCauseCode(data);
     try { ev.emit('protocolError', { cause: cause }); } catch (e) {}
+    // RFC 9260 §5.2.6: a Stale Cookie error matters only in COOKIE-ECHOED
+    // (elsewhere it is discarded). It was ignored there too: T1 resent the
+    // same stale cookie until the setup gave up.
+    if (state === STATE_COOKIE_ECHOED && findErrorCause(data, CAUSE_STALE_COOKIE) !== null) {
+      retryAfterStaleCookie();
+    }
+  }
+
+  // §5.2.6 option 3: a new INIT with a Cookie Preservative asking for the
+  // measured round trip (our last COOKIE ECHO to this ERROR) plus 1 s — "no
+  // more than 1 second beyond the measured RTT". A peer that keeps finding
+  // our cookies stale ends the setup after maxInitRetransmits (option 2).
+  function retryAfterStaleCookie() {
+    clearT1Timer();
+    if (staleCookieRetries >= maxInitRetransmits) {
+      sctpStats.pathFailures++;
+      try { ev.emit('pathFailure', { source: 'handshake', reason: 'stale-cookie', retries: staleCookieRetries }); } catch (e) {}
+      finalizeClose();
+      return;
+    }
+    staleCookieRetries++;
+    cookiePreservativeMs = Math.min(0xFFFFFFFF, Math.max(0, Date.now() - cookieEchoSentAt) + 1000);
+    sendInit();
+    armT1(function (giveUp) {
+      if (state !== STATE_COOKIE_WAIT) return false;
+      if (!giveUp) sendInit();
+      return true;
+    });
   }
 
   // Both ABORT and ERROR carry a list of "error cause" TLVs. We extract
@@ -3701,20 +4248,24 @@ function SctpAssociation(config) {
    * RFC-valid and matches libwebrtc's path-failure ABORT.
    */
   // The peer broke the protocol: ABORT with cause 13, Protocol Violation.
-  function abortProtocolViolation(info) {
+  // (Or another cause: 9, No User Data, with the TSN as its information.)
+  function abortProtocolViolation(info, causeCode, causeInfo) {
+    var cause = causeCode != null ? causeCode : 13;
     try { ev.emit('protocolViolation', info); } catch (e) {}
     sctpStats.pathFailures++;
-    try { ev.emit('pathFailure', { source: 'protocol', cause: 13 }); } catch (e) {}
-    sendAbort(13);
+    try { ev.emit('pathFailure', { source: 'protocol', cause: cause }); } catch (e) {}
+    sendAbort(cause, causeInfo);
     finalizeClose();
   }
 
-  function sendAbort(causeCode) {
+  function sendAbort(causeCode, causeInfo) {
     var body = Buffer.alloc(0);
     if (causeCode != null) {
-      body = Buffer.alloc(4);
+      var infoLen = causeInfo ? causeInfo.length : 0;
+      body = Buffer.alloc((4 + infoLen + 3) & ~3);
       body.writeUInt16BE(causeCode, 0);
-      body.writeUInt16BE(4, 2);    // length-only error cause (no info)
+      body.writeUInt16BE(4 + infoLen, 2);    // the cause's length, its information unpadded
+      if (infoLen) causeInfo.copy(body, 4);
     }
     // Bypass the bundling path so ABORT goes out alone; DATA held for this
     // pass is not sent after it.
@@ -3735,7 +4286,7 @@ function SctpAssociation(config) {
    * may share a packet with DATA per RFC §6.10 (only INIT/INIT_ACK/
    * SHUTDOWN_COMPLETE require sole-occupancy).
    */
-  function sendError(causeCode, causeInfo) {
+  function sendError(causeCode, causeInfo, vtag) {
     var info = causeInfo ? Buffer.from(causeInfo) : Buffer.alloc(0);
     var causeLen = 4 + info.length;
     // Pad cause-info to 4-byte boundary per RFC §3.2.1
@@ -3744,7 +4295,7 @@ function SctpAssociation(config) {
     body.writeUInt16BE(causeCode, 0);
     body.writeUInt16BE(causeLen, 2);
     if (info.length) info.copy(body, 4);
-    sendChunk(CHUNK_ERROR, 0, body, remoteVerificationTag);
+    sendChunk(CHUNK_ERROR, 0, body, vtag !== undefined ? vtag : remoteVerificationTag);
   }
 
 
@@ -3913,8 +4464,20 @@ function SctpAssociation(config) {
         streamId < 0 || streamId > 0xFFFF) {
       throw new TypeError('SctpAssociation.send: streamId must be integer in [0, 65535]');
     }
+    // RFC 9260 §5.1.1: the outbound stream identifiers in use are 0 to
+    // min(our OS, the peer's MIS) - 1.
+    if (streamId >= outboundStreams) {
+      throw new RangeError('SctpAssociation.send: streamId ' + streamId + ' is past the ' +
+                           outboundStreams + ' outbound streams negotiated');
+    }
     if (!Buffer.isBuffer(payload)) {
       throw new TypeError('SctpAssociation.send: payload must be a Buffer');
+    }
+    // A DATA chunk carries user data (RFC 9260 §6.2: the peer ABORTs one
+    // without). An empty data channel message is one byte under PPID 56 / 57
+    // (RFC 8831 §6.6), which the data channel layer sends.
+    if (payload.length === 0) {
+      throw new TypeError('SctpAssociation.send: payload must not be empty (RFC 9260 §6.2)');
     }
 
     var ppid           = (opts && opts.ppid != null) ? opts.ppid : 0;
@@ -5064,7 +5627,7 @@ function SctpAssociation(config) {
                     15:'AUTH', 64:'I_DATA', 128:'ASCONF_ACK', 130:'RE_CONFIG',
                     131:'PAD', 192:'FORWARD_TSN', 193:'ASCONF', 194:'I_FORWARD_TSN' };
       var PPIDS = { 50:'DCEP', 51:'STRING', 52:'BINARY_PARTIAL', 53:'BINARY',
-                    56:'STRING_PARTIAL', 57:'STRING_EMPTY', 58:'BINARY_EMPTY' };
+                    54:'STRING_PARTIAL', 56:'STRING_EMPTY', 57:'BINARY_EMPTY' };   // RFC 8831 §8
       var parts = [];
       var off = 12;
       while (off + 4 <= pkt.length) {
@@ -5285,9 +5848,12 @@ function SctpAssociation(config) {
     // State guard: the association may have torn down between when the
     // timer was scheduled and when it fired (e.g., close() during the
     // timeout window). Don't retransmit on a closed/closing channel.
+    // (SHUTDOWN-RECEIVED too: our data goes on until acknowledged, RFC
+    // 9260 §9.2.)
     if (state !== STATE_ESTABLISHED &&
         state !== STATE_SHUTDOWN_PENDING &&
-        state !== STATE_SHUTDOWN_SENT) {
+        state !== STATE_SHUTDOWN_SENT &&
+        state !== STATE_SHUTDOWN_RECEIVED) {
       return;
     }
     // Nothing outstanding → no T3 work. Chunks never sent are not covered
@@ -5534,12 +6100,16 @@ function SctpAssociation(config) {
           // exist for UNORDERED messages too (their MID space also has a
           // hole the receiver must be told to not wait on). Keyed by
           // sid + U-bit, since the two MID spaces are independent.
+          // One item per message, as for classic FORWARD-TSN: the skip a
+          // forward names must be a message it passes (sendForwardTsn).
           var iKey = entry.streamId + (entry.unordered ? 'u' : 'o');
-          var iPrev = abandonedMidPerStream[iKey];
-          if (iPrev === undefined || tsnGt(entry.mid, iPrev.mid)) {
-            abandonedMidPerStream[iKey] = { mid: entry.mid, tsn: entry.tsn };
-          } else if (entry.mid === iPrev.mid && tsnGt(entry.tsn, iPrev.tsn)) {
-            iPrev.tsn = entry.tsn;   // same message, later fragment: track its highest TSN
+          var ilist = abandonedMidPerStream[iKey] || (abandonedMidPerStream[iKey] = []);
+          var iItem = null;
+          for (var bi = ilist.length - 1; bi >= 0 && !iItem; bi--) if (ilist[bi].mid === entry.mid) iItem = ilist[bi];
+          if (!iItem) ilist.push({ mid: entry.mid, lo: entry.tsn, hi: entry.tsn });
+          else {
+            if (tsnLt(entry.tsn, iItem.lo)) iItem.lo = entry.tsn;
+            if (tsnGt(entry.tsn, iItem.hi)) iItem.hi = entry.tsn;
           }
         } else if (!entry.unordered) {
           var list = abandonedSSNPerStream[entry.streamId] || (abandonedSSNPerStream[entry.streamId] = []);
@@ -5666,17 +6236,31 @@ function SctpAssociation(config) {
       // Sending the classic chunk here would hand the peer a 16-bit SSN
       // where it expects a 32-bit MID — a silent interop break with any
       // compliant receiver (and our own receive side, once it complies).
-      var iKeys   = Object.keys(abandonedMidPerStream);
-      var iBody   = Buffer.alloc(4 + iKeys.length * 8);
+      //
+      // Per stream, the highest abandoned MID this forward skips: a message
+      // with an abandoned TSN at or below newCumTsn (RFC 3758 §3.5 C4, as
+      // the classic pairs below). The highest abandoned MID of the stream
+      // was named, a message wholly above newCumTsn too: the peer (usrsctp
+      // does) then dropped the stream's earlier, live messages still in
+      // flight or waiting for their turn.
+      var iEntries = [];
+      for (var key in abandonedMidPerStream) {
+        var its = abandonedMidPerStream[key], ibest = null;
+        for (var ij = 0; ij < its.length; ij++) {
+          if (tsnLeq(its[ij].lo, newCumTsn) && (ibest === null || tsnGt(its[ij].mid, ibest))) ibest = its[ij].mid;
+        }
+        if (ibest !== null) iEntries.push([key, ibest]);
+      }
+      var iBody   = Buffer.alloc(4 + iEntries.length * 8);
       iBody.writeUInt32BE(newCumTsn, 0);
-      for (var k = 0; k < iKeys.length; k++) {
-        var key   = iKeys[k];
-        var isU   = key.charAt(key.length - 1) === 'u';
-        var sidN  = parseInt(key.slice(0, -1), 10);
+      for (var k = 0; k < iEntries.length; k++) {
+        var key2  = iEntries[k][0];
+        var isU   = key2.charAt(key2.length - 1) === 'u';
+        var sidN  = parseInt(key2.slice(0, -1), 10);
         var off   = 4 + k * 8;
         iBody.writeUInt16BE(sidN & 0xFFFF, off);
         iBody.writeUInt16BE(isU ? 1 : 0,   off + 2);
-        iBody.writeUInt32BE(abandonedMidPerStream[key].mid >>> 0, off + 4);
+        iBody.writeUInt32BE(iEntries[k][1] >>> 0, off + 4);
       }
       sendChunk(CHUNK_I_FORWARD_TSN, 0, iBody, remoteVerificationTag);
       lastForwardTsnSent = newCumTsn;
@@ -5877,9 +6461,9 @@ function SctpAssociation(config) {
       // us on. It was sent once: a lost INIT left only the peer's own INIT
       // to complete the handshake, and a lost COOKIE-ECHO or COOKIE-ACK
       // nothing at all — the association stayed half-open for good.
-      armT1(function () {
+      armT1(function (giveUp) {
         if (state !== STATE_COOKIE_WAIT) return false;
-        sendInit();
+        if (!giveUp) sendInit();
         return true;
       });
     }
@@ -5887,7 +6471,7 @@ function SctpAssociation(config) {
 
   // T1 (RFC 4960 §5.1, §6.3): one timer for whichever handshake chunk we
   // are waiting on. `resend` sends it again and returns false when it is no
-  // longer needed. Backs off from rtoInitialMs, doubling up to rtoMaxMs,
+  // longer needed (resend(true): only whether it still is — the last expiry). Backs off from rtoInitialMs, doubling up to rtoMaxMs,
   // and gives up after maxInitRetransmits (Max.Init.Retransmits, RFC 4960
   // §15: 8).
   var t1Timer = null;
@@ -5897,7 +6481,19 @@ function SctpAssociation(config) {
     var timeout = rtoInitialMs;
     var fire = function () {
       t1Timer = null;
-      if (closed || attempts >= maxInitRetransmits) return;
+      if (closed) return;
+      // RFC 9260 §5.1 A / C: past Max.Init.Retransmits the endpoint MUST
+      // abort the initialization and report it to the user. The timer used
+      // to stop, leaving the association in COOKIE-WAIT / COOKIE-ECHOED for
+      // good: no 'close', and connect()'s callback never called.
+      if (attempts >= maxInitRetransmits) {
+        if (resend(true)) {
+          sctpStats.pathFailures++;
+          try { ev.emit('pathFailure', { source: 'handshake', retransmits: attempts }); } catch (e) {}
+          finalizeClose();
+        }
+        return;
+      }
       if (!resend()) return;
       attempts++;
       timeout = Math.min(timeout * 2, rtoMaxMs);
@@ -5915,7 +6511,7 @@ function SctpAssociation(config) {
   // the client side. Pre-rename this was the public `initiate()` method.
   function sendInit() {
     state = STATE_COOKIE_WAIT;
-    sendChunk(CHUNK_INIT, 0, initBody(localVerificationTag, localTsn, null), 0);  // INIT always has vtag=0
+    sendChunk(CHUNK_INIT, 0, initBody(localVerificationTag, localTsn, null, cookiePreservativeMs), 0);  // INIT always has vtag=0
   }
 
 
@@ -6252,67 +6848,13 @@ function SctpAssociation(config) {
     // peer-side bug.)
   }
 
-  // Extract parameter from INIT/INIT-ACK optional data
-  /* extractParam — find a TLV parameter of the given type in data.
-   *
-   * SCTP-11 N12 hardening: bound-check pLen against remaining buffer.
-   * A malicious peer could send pLen=0xFFFF in an INIT param to trick
-   * us into returning a subarray that promises more bytes than exist.
-   * subarray clamps silently, so callers might read uninitialised bytes
-   * from later in the parsing flow. We clamp pLen explicitly and refuse
-   * to recurse if pLen exceeds the remaining buffer.
-   */
-  function extractParam(data, paramType) {
-    var off = 0;
-    while (off + 4 <= data.length) {
-      var pType = data[off] << 8 | data[off + 1];
-      var pLen  = data[off + 2] << 8 | data[off + 3];
-      if (pLen < 4) break;
-      if (off + pLen > data.length) break;   // N12: param claims to extend past buffer
-
-      if (pType === paramType) {
-        return data.subarray(off + 4, off + pLen);
-      }
-
-      off += pLen;
-      if (off % 4 !== 0) off += 4 - (off % 4);
-    }
-    return null;
-  }
-
-  // RFC 5061 §4.2.7 — PARAM_SUPPORTED_EXTENSIONS carries a list of chunk-type
-  // bytes the peer supports. We're interested in two extensions:
-  //
-  //   • CHUNK_FORWARD_TSN (0xC0) — enables PR-SCTP send-side abandonment
-  //     (RFC 3758). Without it we silently keep all sends fully reliable
-  //     per RFC 8831 §6.6.
-  //   • CHUNK_RECONFIG (130 / 0x82) — enables stream-reset (RFC 6525) so
-  //     dc.close() actually tears the stream down at the peer. Without it
-  //     resetStreams() is a no-op and dc.close() leaves the peer's view
-  //     of the channel open.
-  function detectSupportedExtensions(paramsBuf) {
-    applyExtensionsMask(supportedExtensionsMask(paramsBuf));
-  }
-
-  // The peer's Supported Extensions parameter as a bit mask — the form the
-  // State Cookie carries it in (see makeCookie).
-  function supportedExtensionsMask(paramsBuf) {
-    var ext = extractParam(paramsBuf, PARAM_SUPPORTED_EXTENSIONS);
-    // RFC 3758 §3.3.1: PR-SCTP may also be offered by its own parameter.
-    var mask = extractParam(paramsBuf, PARAM_FORWARD_TSN) ? EXT_FORWARD_TSN : 0;
-    if (!ext) return mask;
-    for (var i = 0; i < ext.length; i++) {
-      if (ext[i] === CHUNK_FORWARD_TSN) mask |= EXT_FORWARD_TSN;
-      if (ext[i] === CHUNK_RECONFIG)    mask |= EXT_RECONFIG;
-      // RFC 8260: the peer telling us it can RECEIVE I-DATA. Recorded now so
-      // stage 2b can gate sending on it — a peer that did not advertise must
-      // never be sent I-DATA, since it has no parser for the chunk type.
-      if (ext[i] === CHUNK_I_DATA)      mask |= EXT_I_DATA;
-      if (ext[i] === CHUNK_I_FORWARD_TSN) mask |= EXT_I_FORWARD_TSN;
-    }
-    return mask;
-  }
-
+  // The peer's extensions, as the bit mask parseInitParams makes of its
+  // Supported Extensions list (RFC 5061 §4.2.7) and Forward-TSN-Supported
+  // (RFC 3758 §3.3.1) — the form the State Cookie carries it in:
+  //   FORWARD-TSN (0xC0) — PR-SCTP (RFC 3758); without it sends stay fully
+  //   reliable (RFC 8831 §6.6).
+  //   RECONFIG (130) — stream reset (RFC 6525), dc.close() at the peer.
+  //   I-DATA, I-FORWARD-TSN — interleaving (RFC 8260).
   function applyExtensionsMask(mask) {
     if (mask & EXT_FORWARD_TSN) peerSupportsForwardTsn = true;
     if (mask & EXT_RECONFIG)    peerSupportsReconfig    = true;
@@ -6417,6 +6959,12 @@ function SctpAssociation(config) {
   // SCTP-7: like peerSupportsForwardTsn but for stream reset. False until
   // handshake completes; cm.js checks this before issuing dc.close() resets.
   Object.defineProperty(this, 'peerSupportsReconfig',   { get: function() { return peerSupportsReconfig; } });
+  // The streams in use per direction (RFC 9260 §5.1.1), 0 until the
+  // handshake: send() takes stream ids below outboundStreams; the data
+  // channel layer's maxChannels is the smaller of the two (W3C webrtc-pc,
+  // RTCSctpTransport connected procedure).
+  Object.defineProperty(this, 'outboundStreams', { get: function() { return outboundStreams; } });
+  Object.defineProperty(this, 'inboundStreams',  { get: function() { return inboundStreams; } });
   // SCTP-1 stats. Returns a snapshot copy — consumer can't mutate
   // internal counters. Field set will grow as SCTP-8/9/11 land
   // (rwnd accounting, congestion stats, byte counts).

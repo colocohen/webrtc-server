@@ -35,6 +35,8 @@
 
 import * as SDP from './sdp.js';
 import * as RtpManager from './rtp_transmission_manager.js';
+import * as TransportController from './transport_controller.js';
+import * as CodecSupport from './codec_support.js';
 
 
 /* ========================= Per-transceiver spec ========================= */
@@ -58,73 +60,6 @@ import * as RtpManager from './rtp_transmission_manager.js';
  * @returns {Object}           media-section spec
  */
 function buildMediaForTransceiver(state, t) {
-  var codecs;
-  if (t.kind === 'audio') {
-    codecs = SDP.DEFAULT_AUDIO_CODECS.map(function(c, idx) {
-      return {
-        // STATIC payload types win (RFC 3551: PCMU=0, PCMA=8, G722=9).
-        // They are not ours to allocate — a peer that sees PCMA on a
-        // dynamic PT may still decode it, but any endpoint following the
-        // static table (SIP gateways, PSTN bridges) will not.
-        payloadType: (c.pt != null) ? c.pt : (111 + idx),
-        name:        c.name,
-        clockRate:   c.clockRate,
-        channels:    c.channels,
-        fmtp:        c.fmtp,
-        feedback:    c.feedback,
-        // RED (RFC 2198): offered alongside opus at PT 63, mirroring
-        // Chrome's default audio offer. The answer side attaches this
-        // from the remote offer instead (extractCodecs pass 2b).
-        redPayloadType: (c.name === 'opus') ? 63 : undefined,
-      };
-    });
-  } else {
-    codecs = SDP.DEFAULT_VIDEO_CODECS.map(function(c, idx) {
-      return {
-        payloadType:    96 + idx * 2,
-        name:           c.name,
-        clockRate:      c.clockRate,
-        fmtp:           c.fmtp,
-        feedback:       c.feedback,
-        rtxPayloadType: c.rtx ? (97 + idx * 2) : undefined,
-        // FlexFEC (flexfec-03) is NOT offered by default. A PT 118 used to
-        // sit here, but the offer writer ignored it, so it never reached the
-        // wire; now that the writer emits FlexFEC, keeping it would start
-        // offering FEC on every call. It is offered only when negotiated
-        // before — the re-offer keeps the previous section's codecs, which
-        // carry the peer's flexfecPayloadType (see reconcileOfferCodecs).
-      };
-    });
-  }
-
-  // W3C §5.4.3.8 — transceiver.setCodecPreferences. When the app provides
-  // an ordered codec list, the m-section MUST be reordered to match, and
-  // any codec absent from preferences MUST be excluded.
-  //   • Preference mimeType format: "video/VP8", "audio/opus"
-  //   • Match on codec name + clockRate (+ channels for audio)
-  //   • PTs stay stable (keep the assignment above); reorder happens by
-  //     reshuffling the codecs array before PT-dependent code sees it.
-  // Empty array means "reset" per spec (api.js setCodecPreferences).
-  if (t._codecPreferences && t._codecPreferences.length) {
-    var reordered = [];
-    for (var pi = 0; pi < t._codecPreferences.length; pi++) {
-      var pref = t._codecPreferences[pi];
-      if (!pref || !pref.mimeType) continue;
-      var slash = pref.mimeType.indexOf('/');
-      var prefName = (slash >= 0 ? pref.mimeType.slice(slash + 1) : pref.mimeType);
-      for (var ci = 0; ci < codecs.length; ci++) {
-        var c = codecs[ci];
-        if (c.name.toLowerCase() !== prefName.toLowerCase()) continue;
-        if (pref.clockRate && pref.clockRate !== c.clockRate) continue;
-        if (t.kind === 'audio' && pref.channels && pref.channels !== c.channels) continue;
-        reordered.push(c);
-        codecs.splice(ci, 1);
-        break;
-      }
-    }
-    codecs = reordered;
-  }
-
   // Transceivers without a sender SSRC (auto-created from peer-added
   // tracks) advertise recvonly without a=ssrc to keep Chrome happy.
   // A TRACK counts as "something to send" even before an SSRC has been
@@ -166,6 +101,85 @@ function buildMediaForTransceiver(state, t) {
     resolvedDir = 'recvonly';
   }
 
+  var codecs;
+  if (t.kind === 'audio') {
+    codecs = SDP.DEFAULT_AUDIO_CODECS.map(function(c, idx) {
+      return {
+        // STATIC payload types win (RFC 3551: PCMU=0, PCMA=8, G722=9).
+        // They are not ours to allocate — a peer that sees PCMA on a
+        // dynamic PT may still decode it, but any endpoint following the
+        // static table (SIP gateways, PSTN bridges) will not.
+        payloadType: (c.pt != null) ? c.pt : (111 + idx),
+        name:        c.name,
+        clockRate:   c.clockRate,
+        channels:    c.channels,
+        fmtp:        c.fmtp,
+        feedback:    c.feedback,
+        // RED (RFC 2198): offered alongside opus at PT 63, mirroring
+        // Chrome's default audio offer. The answer side attaches this
+        // from the remote offer instead (extractCodecs pass 2b).
+        redPayloadType: (c.name === 'opus') ? 63 : undefined,
+      };
+    });
+  } else {
+    codecs = SDP.DEFAULT_VIDEO_CODECS.map(function(c, idx) {
+      return {
+        payloadType:    96 + idx * 2,
+        name:           c.name,
+        clockRate:      c.clockRate,
+        fmtp:           c.fmtp,
+        feedback:       c.feedback,
+        rtxPayloadType: c.rtx ? (97 + idx * 2) : undefined,
+        // FlexFEC (flexfec-03) is NOT offered by default. A PT 118 used to
+        // sit here, but the offer writer ignored it, so it never reached the
+        // wire; now that the writer emits FlexFEC, keeping it would start
+        // offering FEC on every call. It is offered only when negotiated
+        // before — the re-offer keeps the previous section's codecs, which
+        // carry the peer's flexfecPayloadType (see reconcileOfferCodecs).
+      };
+    });
+  }
+
+  // Only the codecs usable in the section's direction (codec_support.js:
+  // RFC 3264 §5.1 / JSEP 5.2.1 — an offer lists what we are willing to
+  // receive, and for sendrecv / sendonly also to send; W3C createOffer
+  // filters the codec preferences the same way). The PTs above stay the
+  // registry position's, so a codec keeps its PT across a direction
+  // change.
+  codecs = CodecSupport.forOffer(t.kind, codecs, resolvedDir, !!state.passthroughCodecs);
+
+  // W3C §5.4.3.8 — transceiver.setCodecPreferences. When the app provides
+  // an ordered codec list, the m-section MUST be reordered to match, and
+  // any codec absent from preferences MUST be excluded.
+  //   • Preference mimeType format: "video/VP8", "audio/opus"
+  //   • Match on codec name + clockRate (+ channels for audio)
+  //   • PTs stay stable (keep the assignment above); reorder happens by
+  //     reshuffling the codecs array before PT-dependent code sees it.
+  // Empty array means "reset" per spec (api.js setCodecPreferences).
+  if (t._codecPreferences && t._codecPreferences.length) {
+    var reordered = [];
+    for (var pi = 0; pi < t._codecPreferences.length; pi++) {
+      var pref = t._codecPreferences[pi];
+      if (!pref || !pref.mimeType) continue;
+      var slash = pref.mimeType.indexOf('/');
+      var prefName = (slash >= 0 ? pref.mimeType.slice(slash + 1) : pref.mimeType);
+      for (var ci = 0; ci < codecs.length; ci++) {
+        var c = codecs[ci];
+        if (c.name.toLowerCase() !== prefName.toLowerCase()) continue;
+        if (pref.clockRate && pref.clockRate !== c.clockRate) continue;
+        if (t.kind === 'audio' && pref.channels && pref.channels !== c.channels) continue;
+        reordered.push(c);
+        codecs.splice(ci, 1);
+        break;
+      }
+    }
+    // W3C createOffer: the preferences filtered by direction, "unset" when
+    // that leaves nothing — the default list then (it was an m-line with
+    // no format at all). Not reached before: the preferences came from
+    // getCapabilities, and the offer listed the whole registry.
+    if (reordered.length) codecs = reordered;
+  }
+
   var spec = {
     type:      t.kind,
     mid:       t.mid,
@@ -202,12 +216,17 @@ function buildMediaForTransceiver(state, t) {
   };
 
   if (hasLocalSsrc) {
+    // The msid appdata is the sender's MediaStreamTrack id (RFC 8830 §2,
+    // RFC 9429 §5.2.1), what the answer (sdp.js, from localSsrcs) writes
+    // too. This read `t.track`, which a transceiver never has (the track is
+    // the sender's), so an offer always said kind + mid: the peer's track
+    // id differed from ours. kind + mid only for a sender with no track.
+    var trackId = (t.sender && t.sender.track && t.sender.track.id) || (t.kind + t.mid);
     spec.ssrc = {
       id:    t.sender.ssrc,
       rtxId: t.sender.rtxSsrc,
       cname: state.localCname,
-      msid:  (((t.streamIds && t.streamIds[0]) || '-')) + ' ' +
-             ((t.track && t.track.id) || (t.kind + t.mid)),
+      msid:  (((t.streamIds && t.streamIds[0]) || '-')) + ' ' + trackId,
       // MULTI-STREAM (W3C: addTrack(track, s1, s2)): a sender may belong
       // to SEVERAL MediaStreams, and each one needs its own msid token —
       // we only ever emitted the first, so the receiving side could never
@@ -215,7 +234,7 @@ function buildMediaForTransceiver(state, t) {
       // writer emits one a=msid line per entry.
       msids: (t.streamIds && t.streamIds.length > 1)
         ? t.streamIds.map(function (sid) {
-            return sid + ' ' + ((t.track && t.track.id) || (t.kind + t.mid));
+            return sid + ' ' + trackId;
           })
         : null,
       layers: (t.sender.layers || []).map(function (L) {
@@ -340,6 +359,13 @@ function reconcileOfferCodecs(t, wanted, negotiated) {
  * retired mid; getNextMid alone only sees the current descriptions and the
  * live transceivers, so a mid recycled out of both was handed out again.
  */
+// A video sender with a scalabilityMode on any of its encodings.
+function _hasScalabilityMode(t) {
+  var encs = (t && t.sender && t.sender.encodings) || [];
+  for (var i = 0; i < encs.length; i++) if (encs[i] && encs[i].scalabilityMode) return true;
+  return false;
+}
+
 function _freshMid(state, existingMids) {
   var mid = parseInt(RtpManager.getNextMid(state), 10);
   var used = state.usedMids || {};
@@ -369,7 +395,7 @@ function _freshMid(state, existingMids) {
  *
  * @param {Object} state
  * @param {Object} options
- * @param {string} options.setup            DTLS setup attribute ('actpass' or pinned role)
+ * @param {string} options.setup            DTLS setup attribute (always 'actpass': JSEP 5.2.1)
  * @param {Object[]|null} options.liteCandidates  iceAgent.localCandidates in lite mode, else null
  * @returns {string}                       the offer SDP
  */
@@ -434,8 +460,26 @@ function buildOffer(state, options) {
   //      If found: assign that transceiver to this slot. If not: emit
   //      with port=0 per JSEP §5.2.2 ("rejected" m-section).
   //   3. m=application (DataChannel) → preserve unconditionally.
-  if (state.parsedCurrentLocalSdp && Array.isArray(state.parsedCurrentLocalSdp.media)) {
-    var existingParsed = state.parsedCurrentLocalSdp;
+  //
+  // EXCEPT FOR THE LAYOUT OF A RE-OFFER IN have-local-offer. RFC 9429 5.2.2:
+  // an offer made while the previous one waits for its answer follows "the
+  // steps in the "stable" state above, along with these exceptions", among
+  // them "Each "a=mid" line MUST stay the same" — the m-sections of that
+  // pending offer keep their place and their mids. Built from the current
+  // description alone, a re-offer before the first answer (no current
+  // description at all) laid the sections out afresh: the data section came
+  // back after the transceivers added since, under a new mid (Chrome 158
+  // keeps it: application mid 0, then the new video mid 1; we offered video
+  // 1, application 2). The answer then committed that new layout, and a peer
+  // that kept the first offer's mids moved the BUNDLE tag — a new DTLS
+  // association (the mediasoup demo on sfu-server: every producer's
+  // transport torn down after its handshake). The per-section adjustments
+  // below still read the current remote description, as the "stable" steps
+  // do; only the sections of the pending offer change the base.
+  var existingParsed = (state.signalingState === 'have-local-offer' && state.parsedLocalSdp &&
+                        Array.isArray(state.parsedLocalSdp.media))
+    ? state.parsedLocalSdp : state.parsedCurrentLocalSdp;
+  if (existingParsed && Array.isArray(existingParsed.media)) {
     // Every mid that has a section in the description, known up front: the
     // recycle pass below must not take a transceiver that owns a section
     // LATER in this same loop (see there).
@@ -486,7 +530,11 @@ function buildOffer(state, options) {
         existingMids[em.mid] = true;
         var spec = buildMediaForTransceiver(state, tr);
         if (em.extensions && em.extensions.length) spec.extensions = em.extensions;
-        spec.codecs = reconcileOfferCodecs(tr, spec.codecs, em.codecs);
+        // The negotiated codecs still usable in the section's direction now
+        // (a recvonly section that turns sendrecv drops a codec we can
+        // decode but not encode).
+        spec.codecs = reconcileOfferCodecs(tr, spec.codecs,
+          CodecSupport.filter(tr.kind, em.codecs, spec.direction, !!state.passthroughCodecs));
         // Keep RECEIVING the simulcast the peer negotiated on this section
         // (RFC 8853): its rids, as recv, in its order. Without them our
         // re-offer read as "no simulcast here" and Chrome paused every layer
@@ -594,7 +642,8 @@ function buildOffer(state, options) {
         // side has no extension-ID/codec-PT churn across the recycle —
         // Chrome rejects extmap reassignment.
         if (em.extensions && em.extensions.length) rspec.extensions = em.extensions;
-        rspec.codecs = reconcileOfferCodecs(recycle, rspec.codecs, em.codecs);
+        rspec.codecs = reconcileOfferCodecs(recycle, rspec.codecs,
+          CodecSupport.filter(recycle.kind, em.codecs, rspec.direction, !!state.passthroughCodecs));
         mediaSections.push(rspec);
         if (em.extensions) {
           for (var ex2 = 0; ex2 < em.extensions.length; ex2++) {
@@ -666,6 +715,14 @@ function buildOffer(state, options) {
       var defaults = (t.kind === 'audio')
         ? SDP.DEFAULT_AUDIO_EXTENSIONS
         : SDP.DEFAULT_VIDEO_EXTENSIONS;
+      // The Dependency Descriptor for a sender with a scalabilityMode, as
+      // Chrome offers it (its default offer has none; one with
+      // sendEncodings [{ scalabilityMode: 'L1T3' }] adds it). The AV1 RTP
+      // spec makes it no one's obligation (Appendix A has no MUST to use
+      // it); a peer that sends a scalable stream to an SFU needs it there.
+      if (t.kind === 'video' && _hasScalabilityMode(t)) {
+        defaults = defaults.concat([SDP.DEPENDENCY_DESCRIPTOR_EXTENSION]);
+      }
       newSpec.extensions = SDP.assignExtensionIds(defaults, bundleExtmap);
       for (var ne = 0; ne < newSpec.extensions.length; ne++) {
         bundleExtmap[newSpec.extensions[ne].id] = newSpec.extensions[ne].uri;
@@ -716,7 +773,10 @@ function buildOffer(state, options) {
     sessionId:       state.localSessionId,
     sessionVersion:  state.localSdpVersion,
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
-    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup },
+    // a=tls-id in every offer (RFC 8842 §5.2 / §5.5): the value in use, so
+    // the association continues (we never ask for a new one as offerer).
+    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup,
+                       tlsId: state.localTlsId },
     media:           mediaSections,
     cname:           state.localCname,
     mode:            state.mode,
@@ -736,6 +796,16 @@ function buildOffer(state, options) {
 
 
 /* ========================= Answer ========================= */
+
+// The a=tls-id of an answer (RFC 8842 §5.3): none when the offer's transport
+// section has none; the new value when the offer asks for a new DTLS
+// association (state.pendingLocalTlsId, set as the offer was applied); else
+// the one in use.
+function _answerTlsId(state) {
+  var sec = TransportController.transportSection(state.parsedRemoteSdp);
+  if (!sec || !sec.tlsId) return null;
+  return state.pendingLocalTlsId || state.localTlsId;
+}
 
 /**
  * Build an answer SDP string.
@@ -812,6 +882,8 @@ function buildAnswer(state, options) {
     sessionId:       state.localSessionId,
     sessionVersion: state.localSdpVersion,
     hasTracks:       hasTrack,
+    // Our codecs per direction (codec_support.js; null: the default tables)
+    localCodecsByDirection: CodecSupport.answerTables(!!state.passthroughCodecs),
     // per-mid preference lists, for the answer's codec filtering
     codecPreferences: (function () {
       var out = {};
@@ -824,7 +896,13 @@ function buildAnswer(state, options) {
       return out;
     })(),
     ice:             { ufrag: state.localIceUfrag, pwd: state.localIcePwd },
-    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup },
+    // a=tls-id only when the offer has one (RFC 8842 §5.3: "If the answerer
+    // receives an offer that does not contain an SDP tls-id attribute, the
+    // answerer MUST NOT insert a tls-id attribute in the answer"): a new
+    // value when the offer asks for a new DTLS association, else the one in
+    // use (JSEP 5.3.2).
+    dtls:            { fingerprint: state.localFingerprint, fingerprints: state.localFingerprints, setup: options.setup,
+                       tlsId: _answerTlsId(state) },
     ssrcs:           ssrcs,
     directions:      directions,
     cname:           state.localCname,

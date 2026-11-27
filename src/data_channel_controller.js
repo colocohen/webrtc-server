@@ -186,6 +186,9 @@ class RTCDataChannel {
       messagesReceived: 0,
       bytesReceived:    0,
     };
+    // Set at the transition to 'open' (RTCPeerConnectionStats counts the
+    // channels that were ever open).
+    this._everOpened = false;
   }
 
   /**
@@ -317,8 +320,10 @@ class RTCDataChannel {
   /**
    * Close the channel. Idempotent.
    *
-   * W3C §6.2.5: close() must transition through 'closing' before 'closed',
-   * firing 'closing' in between. Spec runs the actual SCTP stream reset
+   * W3C §6.2.5: close() sets readyState to 'closing' and fires NO event:
+   * the 'closing' event belongs to the closing procedure the PEER starts
+   * ("announce closing" runs only when the close was not initiated by
+   * close()); the closer sees only 'close'. Spec runs the actual SCTP stream reset
    * "in parallel" — we kick off RFC 6525 stream reset (RECONFIG
    * outgoing-reset) and defer the 'closed' transition + event until peer
    * responds (or immediately if peer doesn't advertise RECONFIG support).
@@ -329,7 +334,6 @@ class RTCDataChannel {
   close() {
     if (this.readyState === 'closed' || this.readyState === 'closing') return;
     this.readyState = 'closing';
-    try { this._ev.emit('closing'); } catch (e) {}
 
     var self = this;
     var sctp = this._controller._sctp;
@@ -340,12 +344,16 @@ class RTCDataChannel {
       self._controller._forgetChannel(self);
     };
 
+    // Kept until the channel is closed: a reset still in flight when the
+    // association is replaced (a transport move) goes out again on the new
+    // one (_requeueResets).
+    this._finalizeClose = finalize;
+
     if (this._controller._awaitingTransport && this.id != null) {
       // The transport is moving: the stream reset goes out on the new
       // association, after any message this channel queued meanwhile
       // (send(); close(); still delivers). Closing locally only would
       // leave the peer's channel open for good.
-      this._finalizeClose = finalize;
       this._controller._pendingResets.push(this);
       return;
     }
@@ -434,6 +442,15 @@ class DataChannelController extends EventEmitter {
     this._dataChannels = [];
     this._dataChannelMap = {};
     this._nextDataChannelId = null;
+    // Streams with no channel whose peer side may still carry data: a
+    // channel closed by our stream reset (the peer resets its own side
+    // next, RFC 8831 §6.7), or a stream we reset ourselves (a refused
+    // DATA_CHANNEL_OPEN, user data on an unused stream). sid → the
+    // association it was on; gone when the peer resets its outgoing stream.
+    // User data there is the peer's still in flight: dropped. On any other
+    // stream with no channel it is an error (RFC 8832 §6): the stream is
+    // reset (see 'data').
+    this._closingStreams = {};
   }
 
 
@@ -455,6 +472,14 @@ class DataChannelController extends EventEmitter {
    * @returns {Object}  RTCDataChannel-shaped
    */
   createDataChannel(label, options) {
+    // W3C webrtc-pc createDataChannel: an id at or past the transport's
+    // maxChannels, once it is connected, is an OperationError.
+    var maxCh = this._maxChannels();
+    if (options && options.id != null && maxCh !== null && options.id >= maxCh) {
+      var mErr = new Error('RTCDataChannel: id ' + options.id + ' is not below maxChannels (' + maxCh + ')');
+      mErr.name = 'OperationError';
+      throw mErr;
+    }
     var dc = this._createInternal(label, options);
 
     if (this._sctpState === 'connected' && this._sctp) {
@@ -465,6 +490,7 @@ class DataChannelController extends EventEmitter {
         queueMicrotask(function () {
           if (dc.readyState === 'connecting') {
             dc.readyState = 'open';
+            dc._everOpened = true;
             try { dc._ev.emit('open'); } catch (e) {}
           }
         });
@@ -548,6 +574,7 @@ class DataChannelController extends EventEmitter {
       try { old.destroy(); } catch (e) {}
       this._recountBuffered();
     }
+    this._requeueResets();
     this._parkedFailure = null;
     this._sctpEndedAbruptly = false;
     this._sctpFailure = null;
@@ -740,7 +767,19 @@ class DataChannelController extends EventEmitter {
   // (The channel stays in _dataChannels: getStats() reports closed channels
   // and lifetime counters from that list.)
   _forgetChannel(dc) {
-    if (dc.id != null && this._dataChannelMap[dc.id] === dc) delete this._dataChannelMap[dc.id];
+    if (dc.id != null && this._dataChannelMap[dc.id] === dc) {
+      delete this._dataChannelMap[dc.id];
+      if (this._sctp) this._closingStreams[dc.id] = this._sctp;
+    }
+  }
+
+  // W3C webrtc-pc, the RTCSctpTransport connected procedure: [[MaxChannels]]
+  // is the smaller of the inbound and outbound streams negotiated (RFC 9260
+  // §5.1.1). null while no association is up.
+  _maxChannels() {
+    var sctp = this._sctp;
+    if (!sctp || this._sctpState !== 'connected' || typeof sctp.outboundStreams !== 'number') return null;
+    return Math.min(sctp.outboundStreams, sctp.inboundStreams);
   }
 
   _allocStreamId() {
@@ -759,13 +798,17 @@ class DataChannelController extends EventEmitter {
     // is not handed out again while its reset may still be in flight; past
     // the last stream id, start over from the lowest free one (closed
     // channels leave the map).
+    // Below maxChannels once the association is up (W3C: an id past it
+    // cannot carry a channel).
     var map = this._dataChannelMap;
+    var maxCh = this._maxChannels();
+    var last = maxCh === null ? 65534 : Math.min(65534, maxCh - 1);
     var id = this._nextDataChannelId;
-    while (id <= 65534 && map[id]) id += 2;
-    if (id > 65534) {
+    while (id <= last && map[id]) id += 2;
+    if (id > last) {
       id = this._nextDataChannelId % 2;
-      while (id <= 65534 && map[id]) id += 2;
-      if (id > 65534) throw new Error('RTCDataChannel: no free stream id');
+      while (id <= last && map[id]) id += 2;
+      if (id > last) throw new Error('RTCDataChannel: no free stream id');
     }
     this._nextDataChannelId = id + 2;
     return id;
@@ -868,6 +911,8 @@ class DataChannelController extends EventEmitter {
         ' len=' + (data && data.length));
       if (ppid === PPID_DCEP) {
         self._handleDcep(streamId, data);
+      } else if (!self._dataChannelMap[streamId]) {
+        self._dataOnUnusedStream(sctp, streamId);
       } else if (ppid === PPID_STRING || ppid === PPID_STRING_EMPTY) {
         var dc = self._dataChannelMap[streamId];
         if (dc) {
@@ -899,19 +944,33 @@ class DataChannelController extends EventEmitter {
       // RFC 8832 §5 — negotiated (out-of-band) DataChannels skip DCEP
       // entirely. They become 'open' as soon as the SCTP association is
       // up. Non-negotiated channels need DCEP_OPEN sent NOW.
+      // W3C webrtc-pc, RTCSctpTransport connected procedure: a channel
+      // whose id is not below maxChannels (the streams negotiated, RFC 9260
+      // §5.1.1), or that no id could be found for, is closed due to a
+      // failure ('error' data-channel-failure, then 'close').
+      var maxCh = self._maxChannels();
       for (var i = 0; i < self._dataChannels.length; i++) {
         var dc = self._dataChannels[i];
         if (dc.readyState !== 'connecting') continue;
-        if (dc.negotiated) {
-          // Deferred-ID safety net: a negotiated channel created before
-          // the DTLS role was known could still carry id=null (an app
-          // that omitted the out-of-band id). Assign one now that the
-          // role is fixed, and register it so incoming data routes.
-          if (dc.id == null) {
+        if (dc.id == null) {
+          // Deferred-ID safety net: a channel created before the DTLS role
+          // was known carries id=null. Assign one now that the role is
+          // fixed, and register it so incoming data routes.
+          try {
             dc.id = self._allocStreamId();
             self._dataChannelMap[dc.id] = dc;
+          } catch (e) {
+            self._failChannel(dc, 'no stream id is free below maxChannels (' + maxCh + ')');
+            continue;
           }
+        }
+        if (maxCh !== null && dc.id >= maxCh) {
+          self._failChannel(dc, 'id ' + dc.id + ' is not below maxChannels (' + maxCh + ')');
+          continue;
+        }
+        if (dc.negotiated) {
           dc.readyState = 'open';
+          dc._everOpened = true;
           dc._ev.emit('open');
         } else {
           self._sendDcepOpen(dc);
@@ -1000,6 +1059,11 @@ class DataChannelController extends EventEmitter {
         if (info.incoming && sctp.peerSupportsReconfig) {
           sctp.resetStreams([sid]);
         }
+      }
+      // The peer's side of these streams is closed: nothing more of its can
+      // arrive on them, and they are unused again.
+      if (info.incoming) {
+        for (var k = 0; k < info.streamIds.length; k++) delete self._closingStreams[info.streamIds[k]];
       }
     });
 
@@ -1139,6 +1203,7 @@ class DataChannelController extends EventEmitter {
     this._sctpEndedAbruptly = false;
     this._sctpFailure = null;
     this._awaitingTransport = true;
+    this._requeueResets();
     this._recountBuffered();
     this._setSctpState('connecting');
     return true;
@@ -1170,6 +1235,21 @@ class DataChannelController extends EventEmitter {
     if (salvaged.length) {
       this._diag('transport moved — ' + salvaged.length + ' unsent message(s) go out on the new association');
       this._pendingSends = salvaged.concat(this._pendingSends);
+    }
+  }
+
+  // Channels closed while the old association was still there: their stream
+  // reset went with it (destroyed, or ABORTed: its callback never fires),
+  // and they stayed 'closing' for good while the peer's channel stayed open
+  // (RFC 8831 §6.7: closing a data channel resets its stream). The reset
+  // goes out again on the new association, as for a channel closed during
+  // the move.
+  _requeueResets() {
+    for (var i = 0; i < this._dataChannels.length; i++) {
+      var dc = this._dataChannels[i];
+      if (!dc || dc.readyState !== 'closing' || dc.id == null || typeof dc._finalizeClose !== 'function') continue;
+      if (this._pendingResets.indexOf(dc) >= 0) continue;
+      this._pendingResets.push(dc);
     }
   }
 
@@ -1226,8 +1306,8 @@ class DataChannelController extends EventEmitter {
     for (var j = 0; j < resets.length; j++) {
       var dc = resets[j];
       var fin = dc._finalizeClose;
-      dc._finalizeClose = null;
-      if (typeof fin !== 'function') continue;
+      // (kept: one more move before the answer sends it again)
+      if (typeof fin !== 'function' || dc.readyState !== 'closing') continue;
       if (sctp.peerSupportsReconfig) sctp.resetStreams([dc.id], fin);
       else queueMicrotask(fin);
     }
@@ -1265,7 +1345,63 @@ class DataChannelController extends EventEmitter {
       this._sctp.send(dc.id, msg, { ppid: PPID_DCEP });
     } catch (sendErr) {
       this._diag('DCEP_OPEN send failed: ' + (sendErr && sendErr.message || sendErr));
+      // The channel cannot be announced (a label and protocol over the
+      // association's message size): it failed — 'error' then 'close' (W3C
+      // §6.2, announcing a data channel as closed). It used to stay
+      // 'connecting' for good, with no event. A microtask: createDataChannel
+      // returns first, so the application's listeners see it.
+      var self = this;
+      var why = sendErr && sendErr.message || sendErr;
+      queueMicrotask(function () {
+        if (dc.readyState !== 'connecting') return;
+        dc.readyState = 'closed';
+        self._forgetChannel(dc);
+        try {
+          dc._ev.emit('error', { type: 'error', error: { name: 'OperationError',
+            message: 'RTCDataChannel: DATA_CHANNEL_OPEN could not be sent: ' + why,
+            errorDetail: 'data-channel-failure' } });
+        } catch (e) {}
+        try { dc._ev.emit('close'); } catch (e) {}
+      });
     }
+  }
+
+  // User data on a stream with no channel (RFC 8832 §6): "receiving a
+  // message containing user data on an unused stream indicates an error. In
+  // that case, the corresponding data channel MUST be closed, as described
+  // in [RFC8831]" — its outgoing stream reset (RFC 8831 §6.7), once; the
+  // peer's channel on it closes. The message is dropped. It used to be
+  // dropped and nothing more, leaving the peer's channel open, its messages
+  // going nowhere. Not on a stream whose closing is under way (see
+  // _closingStreams): there the peer's last messages may still be on their
+  // way. (A negotiated channel the peer uses before our application has
+  // created it lands here too: RFC 8832 §6 has no exception for it.)
+  _dataOnUnusedStream(sctp, streamId) {
+    if (this._closingStreams[streamId] === sctp) {
+      this._diag('data on streamId=' + streamId + ' while its closing completes (dropped)');
+      return;
+    }
+    this._diag('user data on unused streamId=' + streamId + ' — the stream is reset (RFC 8832 §6)');
+    if (!sctp.peerSupportsReconfig) return;
+    this._closingStreams[streamId] = sctp;
+    sctp.resetStreams([streamId]);
+  }
+
+  // A channel whose underlying data transport cannot be created (W3C
+  // webrtc-pc, "Error on creating data channels"): 'closed', then 'error'
+  // (data-channel-failure) and 'close', a microtask later like the other
+  // announcements.
+  _failChannel(dc, why) {
+    var self = this;
+    dc.readyState = 'closed';
+    if (dc.id != null && self._dataChannelMap[dc.id] === dc) delete self._dataChannelMap[dc.id];
+    queueMicrotask(function () {
+      try {
+        dc._ev.emit('error', { type: 'error', error: { name: 'OperationError',
+          message: 'RTCDataChannel: ' + why, errorDetail: 'data-channel-failure' } });
+      } catch (e) {}
+      try { dc._ev.emit('close'); } catch (e) {}
+    });
   }
 
   _handleDcep(streamId, payload) {
@@ -1283,32 +1419,62 @@ class DataChannelController extends EventEmitter {
       var labelLen    = payload[8] << 8 | payload[9];
       var protocolLen = payload[10] << 8 | payload[11];
 
-      var label = '';
-      var protocol = '';
-      var off = 12;
-      if (labelLen > 0 && off + labelLen <= payload.length) {
-        label = payload.subarray(off, off + labelLen).toString('utf-8');
-        off += labelLen;
+      // RFC 8832 §6: the OPEN is answered with an ACK only when it arrives on
+      // an unused stream, its stream id has the peer's parity (the DTLS
+      // client opens on even ids, the server on odd), and it is well formed
+      // with valid parameters. Otherwise no ACK, and the data channel is
+      // closed (RFC 8831 §6.7: its stream reset). Every OPEN used to be
+      // ACKed: one on the wrong parity opened a channel, and one on a
+      // stream our own channel held opened OURS (taken for its ACK).
+      var role = this._deps.getDtlsRole();
+      var parityOk = role == null || (streamId % 2) === (role === 'client' ? 1 : 0);
+      var typeOk = (channelType & 0x7F) <= 0x02;
+      var wellFormed = 12 + labelLen + protocolLen <= payload.length;
+      var used = this._dataChannelMap[streamId];
+      // A transport move (moveToNewTransport) keeps the channels but not the
+      // association: a channel the peer announced on the old one, whose ACK
+      // the move lost, is announced again on the new one (the peer's 'open'
+      // sends a DCEP_OPEN for every channel still 'connecting'). On this
+      // association its stream is unused: the same channel, ACKed again.
+      if (used && parityOk && typeOk && wellFormed && used._openedOn && used._openedOn !== this._sctp &&
+          used.readyState === 'open') {
+        this._diag('DCEP_OPEN again on streamId=' + streamId + ' after a transport move — ACKed');
+        used._openedOn = this._sctp;
+        this._sctp.send(streamId, Buffer.from([DCEP_ACK]), { ppid: PPID_DCEP });
+        return;
       }
-      if (protocolLen > 0 && off + protocolLen <= payload.length) {
-        protocol = payload.subarray(off, off + protocolLen).toString('utf-8');
+      if (!parityOk || !typeOk || !wellFormed || used) {
+        this._diag('DCEP_OPEN refused on streamId=' + streamId + ' (' +
+          (!parityOk ? 'wrong parity' : !typeOk ? 'channel type 0x' + channelType.toString(16) :
+           !wellFormed ? 'malformed' : 'stream in use') + ')');
+        if (used) {
+          // Not the application's close(): the channel is told ('closing',
+          // W3C 6.2 announce closing), then closed.
+          used.close();
+          try { used._ev.emit('closing'); } catch (e) {}
+        }
+        else if (this._sctp.peerSupportsReconfig) {
+          this._sctp.resetStreams([streamId]);
+          this._closingStreams[streamId] = this._sctp;
+        }
+        return;
       }
+
+      var label = payload.subarray(12, 12 + labelLen).toString('utf-8');
+      var protocol = payload.subarray(12 + labelLen, 12 + labelLen + protocolLen).toString('utf-8');
 
       // Send DCEP ACK back to peer.
       this._sctp.send(streamId, Buffer.from([DCEP_ACK]), { ppid: PPID_DCEP });
 
-      // Create or find DataChannel.
-      var dc = this._dataChannelMap[streamId];
-      var isNewChannel = !dc;
-      if (!dc) {
-        dc = this._createInternal(label, {
-          id: streamId,
-          protocol: protocol,
-          ordered: !(channelType & 0x80),
-          maxRetransmits: (channelType & 0x01) ? reliability : null,
-          maxPacketLifeTime: (channelType & 0x02) ? reliability : null,
-        });
-      }
+      // A new DataChannel (the stream was unused).
+      var isNewChannel = true;
+      var dc = this._createInternal(label, {
+        id: streamId,
+        protocol: protocol,
+        ordered: !(channelType & 0x80),
+        maxRetransmits: (channelType & 0x01) ? reliability : null,
+        maxPacketLifeTime: (channelType & 0x02) ? reliability : null,
+      });
       // ORDER MATTERS:
       // 1. emit 'datachannel' first so the API layer wraps the channel and
       //    user code gets a chance to register 'open'/'message' listeners.
@@ -1317,13 +1483,14 @@ class DataChannelController extends EventEmitter {
       // Gating on isNewChannel is critical: a duplicate DCEP_OPEN (peer
       // retransmit, or our own loop-back when a misbehaving peer echoes
       // our DCEP_OPEN) MUST NOT re-emit 'datachannel'.
+      dc._openedOn = this._sctp;   // the association its OPEN came on (see above)
       var _wasConnecting = dc.readyState === 'connecting';
       if (isNewChannel) {
         // W3C 6.2.3: the announced channel is ALREADY 'open' when the
         // datachannel event fires (send() inside the handler must work),
         // and a DCEP-announced channel is by definition NOT negotiated.
         dc.negotiated = false;
-        if (_wasConnecting) dc.readyState = 'open';
+        if (_wasConnecting) { dc.readyState = 'open'; dc._everOpened = true; }
         this.emit('datachannel', { channel: dc });
       }
       // Only transition connecting→open (and fire 'open') on the FIRST
@@ -1340,6 +1507,7 @@ class DataChannelController extends EventEmitter {
       // had a chance to act.
       if (_wasConnecting && dc.readyState !== 'closing' && dc.readyState !== 'closed') {
         dc.readyState = 'open';
+        dc._everOpened = true;
         // The app's datachannel handler runs at the END of an async hop
         // chain (dcc -> cm -> api wrapper -> pc.ondatachannel) — defer
         // the open decision past it and RE-CHECK at fire time: a handler
@@ -1356,6 +1524,7 @@ class DataChannelController extends EventEmitter {
       var dc2 = this._dataChannelMap[streamId];
       if (dc2 && dc2.readyState === 'connecting') {
         dc2.readyState = 'open';
+        dc2._everOpened = true;
         dc2._ev.emit('open');
       }
     }

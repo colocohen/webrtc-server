@@ -407,14 +407,20 @@ function createTransceiver(state, kind, init) {
   // single MediaStream (one <video> ever renders). Accepts W3C
   // MediaStream objects (init.streams) or plain ids (init.streamIds —
   // the Node-stack convenience, no stream object needed server-side).
+  // Each id once, in first-seen order (W3C 5.2: "add stream.id to
+  // [[AssociatedMediaStreamIds]] if it's not already there"): the same
+  // stream given twice wrote two identical a=msid lines.
   var streamIds = null;
   if (Array.isArray(init.streamIds) && init.streamIds.length) {
-    streamIds = init.streamIds.map(String);
+    streamIds = [];
+    for (var sii = 0; sii < init.streamIds.length; sii++) {
+      if (streamIds.indexOf(String(init.streamIds[sii])) === -1) streamIds.push(String(init.streamIds[sii]));
+    }
   } else if (Array.isArray(init.streams) && init.streams.length) {
     streamIds = [];
     for (var sti = 0; sti < init.streams.length; sti++) {
       var st = init.streams[sti];
-      if (st && st.id) streamIds.push(String(st.id));
+      if (st && st.id && streamIds.indexOf(String(st.id)) === -1) streamIds.push(String(st.id));
     }
     if (!streamIds.length) streamIds = null;
   }
@@ -879,6 +885,32 @@ function _proposedDirection(state, mid) {
 }
 
 
+// W3C 4.7.3 (check if negotiation is needed), the ANSWER side: when our
+// current local description is an answer, its m= section direction is
+// compared with transceiver.[[Direction]] INTERSECTED with the offered
+// direction (JSEP 5.3.1) — not with [[Direction]] itself. An answerer that
+// wants sendrecv but was offered recvonly answers sendonly, and that is
+// settled: there is nothing to renegotiate. Compared with [[Direction]],
+// negotiationneeded fired after every such answer (an ICE restart the peer
+// offered included).
+function _answerMatchesDirection(state, t) {
+  if (state.pendingLocalDescription || !state.currentLocalDescription ||
+      state.currentLocalDescription.type !== 'answer') return false;
+  var loc = state.parsedLocalSdp, rem = state.parsedRemoteSdp;
+  if (!loc || !loc.media || !rem || !rem.media) return false;
+  var lm = null, rm = null, i;
+  for (i = 0; i < loc.media.length; i++) if (loc.media[i] && String(loc.media[i].mid) === String(t.mid)) { lm = loc.media[i]; break; }
+  for (i = 0; i < rem.media.length; i++) if (rem.media[i] && String(rem.media[i].mid) === String(t.mid)) { rm = rem.media[i]; break; }
+  if (!lm || !rm) return false;
+  var offered = rm.direction || 'sendrecv';
+  var send = (t.direction === 'sendrecv' || t.direction === 'sendonly') &&
+             (offered === 'sendrecv' || offered === 'recvonly');
+  var recv = (t.direction === 'sendrecv' || t.direction === 'recvonly') &&
+             (offered === 'sendrecv' || offered === 'sendonly');
+  var want = send ? (recv ? 'sendrecv' : 'sendonly') : (recv ? 'recvonly' : 'inactive');
+  return (lm.direction || 'sendrecv') === want;
+}
+
 /**
  * Has the msid for this transceiver's m-section drifted from what our last
  * local description declared? setStreams() is the way that happens.
@@ -1016,7 +1048,7 @@ function checkIfNegotiationIsNeeded(state) {
     // renegotiate.
     if (t.direction !== t.currentDirection) {
       var _proposed = _proposedDirection(state, t.mid);
-      if (_proposed !== t.direction) return true;
+      if (_proposed !== t.direction && !_answerMatchesDirection(state, t)) return true;
     }
 
     // The msid in our last description must still match the streams the
